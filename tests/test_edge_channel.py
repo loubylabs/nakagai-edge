@@ -9,10 +9,10 @@ import pytest
 
 pytest.importorskip("mcp")
 fastapi = pytest.importorskip("fastapi")
-pytest.importorskip("nakagai")
+pytest.importorskip("nakagai_platform")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from nakagai.api.app import create_app  # noqa: E402
+from nakagai_platform.api.app import create_app  # noqa: E402
 from nakagai_edge.edge.audit import EdgeAudit  # noqa: E402
 from nakagai_edge.edge.client import PlatformClient  # noqa: E402
 from nakagai_edge.edge.runtime import build_hub, create_edge_mcp  # noqa: E402

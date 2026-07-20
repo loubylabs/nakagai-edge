@@ -15,9 +15,9 @@ import httpx
 import pytest
 
 pytest.importorskip("mcp")
-pytest.importorskip("nakagai")
+pytest.importorskip("nakagai_platform")
 
-from nakagai.api.agent_routes import ConnectorReport
+from nakagai_platform.api.agent_routes import ConnectorReport
 from nakagai_edge.edge.audit import EdgeAudit
 from nakagai_edge.edge.client import PlatformClient
 from nakagai_edge.edge.runtime import _loops, build_hub

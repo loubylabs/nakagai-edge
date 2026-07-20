@@ -16,10 +16,10 @@ import pytest
 
 pytest.importorskip("mcp")
 fastapi = pytest.importorskip("fastapi")
-pytest.importorskip("nakagai")
+pytest.importorskip("nakagai_platform")
 from fastapi.testclient import TestClient  # noqa: E402
 
-from nakagai.api.app import create_app  # noqa: E402
+from nakagai_platform.api.app import create_app  # noqa: E402
 from nakagai_edge.edge.audit import EdgeAudit  # noqa: E402
 from nakagai_edge.edge.client import PlatformClient  # noqa: E402
 from nakagai_edge.edge.runtime import build_hub, create_edge_mcp  # noqa: E402
@@ -106,7 +106,7 @@ async def test_edge_checkin_lands_where_the_platform_can_read_it(
     mandate.latest_equity_report() on the platform - exactly like a direct
     MCP agent's report already was before this fix, and was NOT for an edge
     agent (the defect this branch closes)."""
-    from nakagai import mandate as m
+    from nakagai_platform import mandate as m
 
     token = _enroll(platform_app)
     platform_client = _bridged_platform_client(platform_app, token)
@@ -135,7 +135,7 @@ async def test_edge_checkin_discards_half_an_equity_report(
         tmp_path, platform_root, platform_app):
     """Both fields or nothing, over the edge path too: equity alone has no
     baseline and would read as a flat day."""
-    from nakagai import mandate as m
+    from nakagai_platform import mandate as m
 
     token = _enroll(platform_app)
     platform_client = _bridged_platform_client(platform_app, token)
@@ -157,7 +157,7 @@ async def test_edge_agent_can_arm_autopilot_after_checking_in_with_equity(
     fix, an edge owner had no way to ever clear the 422 short of zeroing the
     dial - precisely the failure this branch exists to eliminate.
     """
-    from nakagai import mandate as m
+    from nakagai_platform import mandate as m
 
     owner = TestClient(platform_app)
     owner_headers = {"Authorization": "Bearer api-secret"}
