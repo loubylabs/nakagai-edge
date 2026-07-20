@@ -6,9 +6,9 @@ import time
 import pytest
 import yaml
 
-pytest.importorskip("nakagai")
+pytest.importorskip("nakagai_platform")
 
-from nakagai.cli import main as platform_main  # noqa: E402
+from nakagai_platform.cli import main as platform_main  # noqa: E402
 from nakagai_edge.cli import main as edge_main  # noqa: E402
 
 

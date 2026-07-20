@@ -283,7 +283,7 @@ async def test_full_edge_autopilot_loop_closes(tmp_path, monkeypatch):
     The mandate decides (`decided_by == "mandate:autopilot"`); the edge only
     executes an artifact it verified; the agent's token never grants its order.
     """
-    pytest.importorskip("nakagai")
+    pytest.importorskip("nakagai_platform")
 
     import contextlib
 
@@ -295,10 +295,10 @@ async def test_full_edge_autopilot_loop_closes(tmp_path, monkeypatch):
     from mcp.server.fastmcp import FastMCP
     from mcp.shared.memory import create_connected_server_and_client_session
 
-    from nakagai.api.app import create_app
+    from nakagai_platform.api.app import create_app
     from nakagai_edge.hub import ConnectorHub
     from nakagai_edge.signing import generate_keypair, public_key_for
-    from nakagai.scan.signal import append_signals
+    from nakagai_platform.scan.signal import append_signals
 
     NOW = pd.Timestamp("2026-07-13T15:00:00+00:00")   # Monday 08:00 LA, inside RTH
     monkeypatch.setattr(pd.Timestamp, "now", staticmethod(lambda tz=None: NOW))
@@ -410,7 +410,7 @@ async def test_full_edge_autopilot_loop_closes(tmp_path, monkeypatch):
     assert intents(state) == {}                 # nothing left to re-execute
 
     # the platform's own record: decided by the mandate, then executed by the edge
-    from nakagai.gateway import get_hub
+    from nakagai_platform.gateway import get_hub
     plat_rec = get_hub(plat).approvals.get(rec.id)
     assert plat_rec.decided_by == "mandate:autopilot"
     assert plat_rec.status == "executed"
