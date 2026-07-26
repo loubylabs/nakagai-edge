@@ -123,3 +123,15 @@ def test_market_args_may_still_overwrite_the_entrys_own_order_type():
     result = exit_order_args(shape, args, 40.0)
     assert result is not None
     assert result["order_type"] == "market"
+
+
+def test_a_stale_symbol_alias_is_stripped_not_left_beside_the_canonical_one():
+    # symbol_keys is a list precisely so a connector can declare aliases. A
+    # stale one left in the entry payload must not ride along beside the
+    # canonical value, leaving the broker two conflicting instruments.
+    shape = SHAPE.model_copy(update={"symbol_keys": ["symbol", "ticker"]})
+    args = dict(ENTRY)
+    args["ticker"] = "MSFT"
+    result = exit_order_args(shape, args, 40.0)
+    assert result["symbol"] == "AAPL"
+    assert "ticker" not in result

@@ -184,18 +184,21 @@ def exit_order_args(shape, entry_args: dict, qty: float) -> dict | None:
                | set(shape.quantity_keys))
     if aliases & set(shape.market_order_args):
         return None
+    symbol_key = _at(entry_args, shape.symbol_keys)
     side_key = _at(entry_args, shape.side_keys)
     qty_key = _at(entry_args, shape.quantity_keys)
-    # Strip EVERY side and quantity alias, not just the one `_at` picked: an
-    # unused alias sitting in the entry payload would otherwise ride along
-    # beside the flipped one and leave the broker two answers. Symbol is NOT
-    # in this drop set: unlike side and quantity it is never rewritten below,
-    # so stripping it here would delete it from the exit with nothing to
-    # put it back.
-    drop = (set(shape.price_keys) | set(shape.stop_keys)
-            | set(shape.side_keys) | set(shape.quantity_keys))
+    # Strip EVERY symbol, side, and quantity alias, not just the one `_at`
+    # picked: an unused alias sitting in the entry payload would otherwise
+    # ride along beside the canonical one and leave the broker two answers.
+    # `aliases` is now safe to reuse for `drop` because every field it names
+    # gets written back below, unlike round 2's version of this set.
+    drop = set(shape.price_keys) | set(shape.stop_keys) | aliases
     args = {k: v for k, v in entry_args.items() if k not in drop}
     args.update(shape.market_order_args)
+    # The RAW value, not entry["symbol"]: read_entry uppercases for
+    # comparison, but the exit reuses the payload the broker already
+    # accepted, so a lowercase ticker on the way in stays lowercase here.
+    args[symbol_key] = entry_args[symbol_key]
     args[side_key] = side
     args[qty_key] = float(qty)
     return args
