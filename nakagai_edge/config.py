@@ -128,6 +128,12 @@ class OrderShape(BaseModel):
     sell_values: list[str] = Field(
         default_factory=lambda: ["sell", "sell_to_open", "sell_short"])
 
+    # How this connector expresses "market order". Merged into a derived exit
+    # after every price and stop key is stripped. Undeclared means the brake
+    # cannot build an exit here, and the position records as unguarded: the
+    # same posture as an undeclared order_shape, for the same reason.
+    market_order_args: dict = Field(default_factory=dict)
+
     @property
     def configured(self) -> bool:
         # `stock_tools` is deliberately NOT here. An order_shape without it is

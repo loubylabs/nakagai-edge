@@ -106,3 +106,79 @@ def authorizes(public_key: str, warrant: dict, exit_order: dict, *,
     if qty > held:
         return "exit quantity exceeds the position held"
     return ""
+
+
+# ---- reading an entry, deriving its exit --------------------------------
+#
+# One boundary governs both functions: the order fields must sit at the TOP
+# level of `args`. The platform's envelope walks one level down to READ an
+# order, but constructing one INTO a nested payload is a different problem and
+# guessing wrong places a real trade. A nested entry is declined here and the
+# position records as unguarded.
+
+
+def _at(args: dict, keys: list[str]) -> str:
+    """The first of `keys` present in `args` with a scalar value, or ""."""
+    for key in keys:
+        if key in args:
+            value = args[key]
+            if value is not None and not isinstance(value, (dict, list)):
+                return key
+    return ""
+
+
+def read_entry(shape, args: dict) -> dict | None:
+    """The five fields the ledger needs, or None if this entry cannot be
+    supervised. A missing stop is disqualifying here (unlike the envelope,
+    which reports it and lets policy decide): with no stop there is no level,
+    and with no level there is nothing to watch."""
+    if not shape.configured or not isinstance(args, dict):
+        return None
+    keys = {name: _at(args, getattr(shape, f"{name}_keys"))
+            for name in ("symbol", "side", "quantity", "price", "stop")}
+    if not all(keys.values()):
+        return None
+    try:
+        return {"symbol": str(args[keys["symbol"]]).upper(),
+                "side": str(args[keys["side"]]).lower(),
+                "qty": float(args[keys["quantity"]]),
+                "price": float(args[keys["price"]]),
+                "stop": float(args[keys["stop"]])}
+    except (TypeError, ValueError):
+        return None
+
+
+def closing_side(shape, entry_side: str) -> str:
+    """The side that reduces a position opened on `entry_side`, or "" when the
+    connector never declared one."""
+    entry = str(entry_side).lower()
+    if entry in [v.lower() for v in shape.buy_values]:
+        return shape.sell_values[0] if shape.sell_values else ""
+    if entry in [v.lower() for v in shape.sell_values]:
+        return shape.buy_values[0] if shape.buy_values else ""
+    return ""
+
+
+def exit_order_args(shape, entry_args: dict, qty: float) -> dict | None:
+    """The market exit for a position opened by `entry_args`, or None.
+
+    Derived from the payload the broker already accepted rather than built from
+    scratch, so account ids and any broker-required extras carry over without
+    this module needing to know they exist.
+    """
+    if not shape.market_order_args:
+        return None
+    entry = read_entry(shape, entry_args)
+    if entry is None:
+        return None
+    side = closing_side(shape, entry["side"])
+    if not side:
+        return None
+    side_key = _at(entry_args, shape.side_keys)
+    qty_key = _at(entry_args, shape.quantity_keys)
+    drop = set(shape.price_keys) | set(shape.stop_keys)
+    args = {k: v for k, v in entry_args.items() if k not in drop}
+    args[side_key] = side
+    args[qty_key] = float(qty)
+    args.update(shape.market_order_args)
+    return args
