@@ -2,6 +2,7 @@
 the LOCAL copy of the intent, execute at the broker, report back. Verification
 is fail-closed: any mismatch reports an error and never touches the broker."""
 
+import logging
 import time
 
 import httpx
@@ -16,6 +17,8 @@ from nakagai_edge.signing import verify_artifact
 from nakagai_edge.warrant import read_entry
 
 DEAD_STATUSES = ("denied", "expired", "error", "executed")
+
+log = logging.getLogger("nakagai.edge")
 
 
 def _verify(state: EdgeState, approval_id: str, intent: dict, artifact) -> str:
@@ -97,14 +100,21 @@ def supervise(hub, state: EdgeState, approval_id: str, intent: dict,
         sells = [v.lower() for v in shape.sell_values]
         direction = ("long" if entry["side"] in buys
                      else "short" if entry["side"] in sells else "")
-        # A side we cannot classify or an account we cannot name leaves a
-        # position we can SEE but must never act on: the direction decides how
-        # reconcile reads the broker's sign, and the account is what the warrant
-        # is scoped to. Recording it unguarded keeps it visible; recording a
-        # guess would put a wrong R multiple on the owner's screen beside a
-        # `guarded: True` that is not true.
-        blocked = "" if (direction and account) else (
-            "unclassifiable order side" if not direction else "no account on the order")
+        # Anything on this list leaves a position we can SEE but must never act
+        # on: the direction decides how reconcile reads the broker's sign, the
+        # account is what the warrant is scoped to and the only thing the
+        # broker can be asked about, and with no market_order_args declared
+        # there is no exit order to build at all (spec section 9). Recording
+        # those unguarded keeps them visible; recording a guess would put a
+        # wrong R multiple on the owner's screen beside a `guarded: True` that
+        # is not true. Every reason is named rather than just the first: the
+        # anomaly is where the owner reads what to fix, and one hidden behind
+        # another costs a second cycle with a live position unprotected.
+        blocked = "; ".join(why for why, ok in (
+            ("unclassifiable order side", direction),
+            ("no account on the order", account),
+            ("connector declares no market_order_args", shape.market_order_args),
+        ) if not ok)
         rec = {
             "position_id": approval_id,
             "connector_id": intent["connector_id"],
@@ -123,8 +133,12 @@ def supervise(hub, state: EdgeState, approval_id: str, intent: dict,
         if blocked:
             rec["anomaly"] = blocked
         record_position(state, rec)
-    except Exception:  # noqa: BLE001 (bookkeeping must never break execution)
-        pass
+    except Exception as e:  # noqa: BLE001 (bookkeeping must never break execution)
+        # The swallow is deliberate and the log is not decoration: the broker
+        # already executed, so raising would relabel a real trade, but a lost
+        # record means a LIVE position nothing is watching and no trace of why.
+        log.warning("a just-executed entry was not recorded for supervision, "
+                    "so %s is unsupervised: %s", approval_id, e)
 
 
 async def poll_once(hub, state: EdgeState, client: PlatformClient,

@@ -320,6 +320,21 @@ class Brake:
         if rec.get("state") != "armed":
             return f"position {pid} is already {rec.get('state')}"
 
+        if not rec.get("account"):
+            # Asking a broker about account "" is not a degraded read, it is a
+            # different question, and the answer is dangerous: a readable list
+            # that does not name our symbol reads as 0.0 held, and _held_now's
+            # caller marks a fully-held position `released`, which is TERMINAL.
+            # supervise() already records such a position `unguarded`; this is
+            # the last line of that same rule, for a record that reached
+            # `armed` some other way.
+            why_not = "the record names no account, so no broker can be asked"
+            self.audit.record("denial", rec["connector_id"], "brake",
+                              {"position_id": pid, "reason": why_not})
+            self._notify(f"The brake cannot exit {rec['symbol']}: {why_not}. "
+                         f"That position is unguarded.")
+            return why_not
+
         held = await self._held_now(rec)
         if held is None:
             # Over-refusal here is real harm, not caution: the stop was just

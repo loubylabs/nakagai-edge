@@ -231,11 +231,15 @@ def reconcile(state: EdgeState, portfolio_doc: dict) -> dict:
 def renewal_request(state: EdgeState) -> list[dict]:
     """What the platform needs to re-sign this edge's live warrants.
 
-    Excludes any record whose direction is not exactly "long" or "short": that
-    shape means the entry side (or account) could not be classified, so the
-    edge can never safely act on it regardless of what warrant it holds.
-    Asking the platform to re-sign a warrant that can never be used is
-    pointless traffic.
+    Excludes any record the edge could never act on no matter what warrant came
+    back: a direction that is not exactly "long" or "short" (the entry side
+    could not be classified), or an empty account. Both halves matter, and the
+    account half is the sharper one: `brake.fire()` asks the broker about
+    `rec["account"]`, and a broker asked about account "" can answer with a
+    readable list that does not name the symbol, which reads as "flat" and
+    releases a fully-held position. Asking the platform to re-sign a warrant
+    that can never be used is pointless traffic; PROMOTING a record on the
+    answer is a live position reported as guarded.
     """
     return [{"position_id": rec["position_id"],
              "connector_id": rec["connector_id"], "account": rec["account"],
@@ -244,7 +248,8 @@ def renewal_request(state: EdgeState) -> list[dict]:
              "signal_id": rec.get("signal_id", "")}
             for rec in load(state).values()
             if rec.get("state") in ("armed", "unguarded")
-            and rec.get("direction") in ("long", "short")]
+            and rec.get("direction") in ("long", "short")
+            and rec.get("account")]
 
 
 def apply_renewals(state: EdgeState, warrants: dict) -> dict:
@@ -265,13 +270,14 @@ def apply_renewals(state: EdgeState, warrants: dict) -> dict:
         rec = doc.get(position_id)
         if rec is None or rec.get("state") in TERMINAL:
             continue
-        if rec.get("direction") not in ("long", "short"):
+        if rec.get("direction") not in ("long", "short") or not rec.get("account"):
             # Unguarded because the edge cannot act on this record at all (see
             # renewal_request above), not because a warrant was missing: no
             # warrant, however well-formed, makes closing_side() stop
-            # returning "" for an unclassifiable side. Promoting it to
-            # "armed" would make open_risk report guarded: True for a
-            # position that can never actually be exited.
+            # returning "" for an unclassifiable side, or makes account "" a
+            # question a broker can answer. Promoting it to "armed" would make
+            # open_risk report guarded: True for a position that can never
+            # actually be exited.
             continue
         if not isinstance(warrant, dict):
             continue          # one malformed entry must cost only itself

@@ -89,6 +89,28 @@ def test_an_unclassifiable_position_is_absent_from_the_renewal_request(tmp_path)
     assert renewal_request(state) == []
 
 
+def test_an_account_less_position_is_absent_from_the_renewal_request(tmp_path):
+    # Task 4 disqualified the account-less record for the same reason as the
+    # side-less one, and the renewal path has to honour BOTH halves of that
+    # rule: an empty account is what fire() would ask the broker about, and no
+    # warrant makes that question correct.
+    state = EdgeState(tmp_path)
+    record(state, _rec(account="", warrant=None, state="unguarded",
+                       anomaly="no account on the order"))
+    assert renewal_request(state) == []
+
+
+def test_apply_renewals_refuses_to_arm_an_account_less_position(tmp_path):
+    state = EdgeState(tmp_path)
+    record(state, _rec(account="", warrant=None, state="unguarded",
+                       anomaly="no account on the order"))
+    apply_renewals(state, {"ap_1": {"grant_id": "wr_2", "max_qty": 100.0,
+                                    "expires_at": 99999.0}})
+    row = load(state)["ap_1"]
+    assert row["state"] == "unguarded"
+    assert row["warrant"] is None
+
+
 def test_apply_renewals_refuses_to_arm_an_unclassifiable_position(tmp_path):
     # Even handed a warrant that would otherwise be perfectly valid (within
     # the entry ceiling, well-formed), a record the edge cannot act on must

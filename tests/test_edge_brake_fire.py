@@ -107,6 +107,24 @@ class NoMarketExitHub(FakeHub):
             guardrails=GuardrailsConfig(order_shape=NO_MARKET_SHAPE))
 
 
+class OtherSymbolsHub(FakeHub):
+    """A perfectly readable position list that simply does not name our symbol.
+
+    This is what a broker plausibly answers when asked about account "": the
+    real position is in a real account, so `_held_now` reads 0.0 and the record
+    is marked `released`, which is TERMINAL and unrecoverable.
+    """
+
+    async def call(self, connector_id, tool, args, **kw):
+        self.calls.append((tool, args, kw))
+        if tool == "get_equity_positions":
+            return {"data": {"positions": [
+                {"symbol": "MSFT", "quantity": "5"}]}}
+        if self.fail is not None:
+            raise self.fail
+        return {"is_error": False, "data": {"order_id": "42"}}
+
+
 class RacingHub(FakeHub):
     """FakeHub's call() never actually suspends, so two gathered coroutines
     calling it run fully sequentially -- no interleaving, no race, whether or
@@ -382,6 +400,26 @@ async def test_the_owner_hears_when_the_connector_cannot_express_an_exit(tmp_pat
     assert client.messages, "the owner must hear the position is unguarded"
     kinds = [e["kind"] for e in brake.audit.pending()]
     assert "denial" in kinds
+
+
+# ---- final round: an account-less record is never a broker question -------
+#
+# Task 4's rule: a record whose account cannot be named must never be acted
+# on. Asking a broker about account "" is not a degraded read, it is a
+# different question, and a broker that answers it with a list not containing
+# the symbol turns a fully-held position into `released`, which is TERMINAL.
+
+
+async def test_fire_refuses_an_account_less_record_without_asking_the_broker(tmp_path):
+    hub = OtherSymbolsHub()
+    state, client, brake = _brake(tmp_path, hub)
+    record(state, _rec(account=""))
+    reason = await brake.fire(load(state)["ap_1"])
+    assert "account" in reason
+    assert hub.calls == [], "the broker must never be asked about account ''"
+    assert load(state)["ap_1"]["state"] == "armed"
+    assert client.messages, "the owner must hear the position is unguarded"
+    assert "denial" in [e["kind"] for e in brake.audit.pending()]
 
 
 # ---- the tick: observation to firing --------------------------------------

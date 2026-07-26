@@ -1,6 +1,8 @@
 """An executed entry becomes a supervised position. A platform that sends no
 warrant must still leave a truthful record: unguarded, never invisible."""
 
+import logging
+
 import pytest
 
 pytest.importorskip("cryptography")
@@ -15,6 +17,11 @@ SHAPE = OrderShape(
     price_keys=["limit_price"], stop_keys=["stop_price"],
     stock_tools=["place_equity_order"],
     market_order_args={"order_type": "market"})
+
+NO_MARKET_SHAPE = OrderShape(
+    symbol_keys=["symbol"], side_keys=["side"], quantity_keys=["quantity"],
+    price_keys=["limit_price"], stop_keys=["stop_price"],
+    stock_tools=["place_equity_order"])   # no market_order_args declared
 
 ENTRY_ARGS = {"account_number": "463605220", "symbol": "AAPL", "side": "buy",
               "quantity": 100, "limit_price": 47.55, "stop_price": 46.20}
@@ -149,3 +156,49 @@ def test_an_entry_with_no_recognizable_account_records_unguarded(tmp_path):
     assert rec["state"] == "unguarded"
     assert rec["warrant"] is None
     assert rec["anomaly"] == "no account on the order"
+
+
+# ---- final round: the disqualifications must compose, and be complete -----
+
+
+def test_both_an_unclassifiable_side_and_a_missing_account_are_reported(tmp_path):
+    # Reporting only the side sends the owner to fix one thing and leaves the
+    # other waiting behind it. The anomaly is the only place either problem is
+    # ever named, so it has to name both.
+    state = EdgeState(tmp_path)
+    intent = _intent()
+    intent["args"]["side"] = "transfer"
+    del intent["args"]["account_number"]
+    supervise(FakeHub(), state, "ap_1", intent, _record({"grant_id": "wr_1"}), {})
+    rec = load(state)["ap_1"]
+    assert rec["state"] == "unguarded"
+    assert "unclassifiable order side" in rec["anomaly"]
+    assert "no account on the order" in rec["anomaly"]
+
+
+def test_a_connector_with_no_market_order_args_records_unguarded(tmp_path):
+    # Spec section 9: no order_shape OR no market_order_args means this
+    # connector's positions cannot be supervised. The platform mints the
+    # warrant from the entry order and cannot see an edge-side connector
+    # field, so nothing but this check keeps the record out of `armed`, and
+    # `armed` here would report guarded: true for a brake that can never
+    # build an exit.
+    state = EdgeState(tmp_path)
+    supervise(FakeHub(NO_MARKET_SHAPE), state, "ap_1", _intent(),
+              _record({"grant_id": "wr_1"}), {})
+    rec = load(state)["ap_1"]
+    assert rec["state"] == "unguarded"
+    assert rec["warrant"] is None
+    assert "market_order_args" in rec["anomaly"]
+
+
+def test_a_swallowed_bookkeeping_failure_says_so_in_the_log(tmp_path, caplog):
+    # The swallow stays: it must never relabel a genuinely executed trade. But
+    # a silent swallow leaves a LIVE position with no ledger record and no
+    # trace of why, which is the one outcome nobody can debug after the fact.
+    state = EdgeState(tmp_path)
+    with caplog.at_level(logging.WARNING, logger="nakagai.edge"):
+        supervise(RaisingHub(), state, "ap_1", _intent(),
+                  _record({"grant_id": "wr_1"}), {"data": {"order_id": "42"}})
+    assert load(state) == {}
+    assert "registry unavailable" in caplog.text
