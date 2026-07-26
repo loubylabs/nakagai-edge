@@ -38,11 +38,13 @@ def _num(payload: dict, keys) -> float | None:
     return None
 
 
-def normalize_quote(payload) -> dict | None:
+def normalize_quote(payload, received_at: float) -> dict | None:
     """A broker's quote payload as {price, bid, ask, ts}, or None.
 
-    `ts` is left to the caller: brokers rarely stamp a quote, and inventing a
-    timestamp here would defeat the freshness check that reads it.
+    `received_at` is required, and it is the moment WE got this payload rather
+    than any timestamp the broker supplied: brokers rarely stamp a quote, and a
+    default here would hand `usable()` a value that silently disables its own
+    freshness check.
     """
     if not isinstance(payload, dict):
         return None
@@ -50,7 +52,7 @@ def normalize_quote(payload) -> dict | None:
     if price is None:
         return None
     return {"price": price, "bid": _num(payload, _BID_KEYS),
-            "ask": _num(payload, _ASK_KEYS), "ts": 0.0}
+            "ask": _num(payload, _ASK_KEYS), "ts": float(received_at)}
 
 
 def usable(quote: dict, prior_price, now: float, *,
@@ -69,14 +71,23 @@ def usable(quote: dict, prior_price, now: float, *,
         return "unreadable quote"
     if not price > 0:
         return "price is not positive"
-    if ts and (now - ts) > max_age_s:
+    if not ts > 0:
+        return "unstamped quote"
+    if (now - ts) > max_age_s:
         return f"stale quote ({round(now - ts)}s old)"
     bid, ask = quote.get("bid"), quote.get("ask")
-    if bid and ask:
+    if bid is not None and ask is not None:
         mid = (float(bid) + float(ask)) / 2
-        if mid > 0 and ((float(ask) - float(bid)) / mid) * 100 > max_spread_pct:
+        if not mid > 0:
+            return "book is unusable (non-positive mid)"
+        if ((float(ask) - float(bid)) / mid) * 100 > max_spread_pct:
             return "spread is too wide to price an exit"
-    if prior_price:
+    # Only None means "no prior observation". A non-positive prior cannot come
+    # from this function (it refuses such prices above), so if a caller ever
+    # supplies one it means their state was never populated: treat it as absent
+    # and say so here, because the alternative is a jump check that silently
+    # never runs.
+    if prior_price is not None and float(prior_price) > 0:
         move = abs(price - float(prior_price)) / float(prior_price) * 100
         if move > max_jump_pct:
             return f"implausible jump ({round(move)}%) from the prior quote"

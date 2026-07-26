@@ -61,9 +61,30 @@ def test_confirmation_needs_two_consecutive_breaches_by_default():
 def test_a_quote_payload_is_normalized_from_common_broker_shapes():
     assert normalize_quote(
         {"last_trade_price": "46.10", "bid_price": "46.09",
-         "ask_price": "46.11"})["price"] == 46.10
+         "ask_price": "46.11"}, NOW)["price"] == 46.10
 
 
 def test_an_unreadable_quote_payload_normalizes_to_nothing():
-    assert normalize_quote({"nope": 1}) is None
-    assert normalize_quote(None) is None
+    assert normalize_quote({"nope": 1}, NOW) is None
+    assert normalize_quote(None, NOW) is None
+
+
+def test_a_quote_straight_out_of_normalize_quote_with_stale_received_at_is_refused():
+    normalized = normalize_quote(
+        {"price": "46.10", "bid": "46.09", "ask": "46.11"}, NOW - 120.0)
+    assert "stale" in usable(normalized, 46.50, NOW)
+
+
+def test_a_quote_with_missing_ts_is_refused_as_unstamped():
+    quote = {"price": 46.10, "bid": 46.09, "ask": 46.11}
+    assert "unstamped" in usable(quote, 46.50, NOW)
+
+
+def test_bid_zero_and_ask_ten_is_refused_for_spread():
+    assert "spread" in usable(_q(bid=0.0, ask=10.0), 46.50, NOW)
+
+
+def test_prior_price_of_zero_behaves_as_no_prior():
+    # prior_price=0.0 should be treated as no prior, so an otherwise sane
+    # quote is usable, and the jump check does not run.
+    assert usable(_q(), 0.0, NOW) == ""
