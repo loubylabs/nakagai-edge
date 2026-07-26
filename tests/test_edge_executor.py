@@ -298,7 +298,12 @@ async def test_full_edge_autopilot_loop_closes(tmp_path, monkeypatch):
     from nakagai_platform.api.app import create_app
     from nakagai_edge.hub import ConnectorHub
     from nakagai_edge.signing import generate_keypair, public_key_for
-    from nakagai_platform.scan.signal import append_signals
+    # The store seam, not scan.signal.append_signals: the platform moved signal
+    # writes behind get_signal_store so the file and Postgres backends share one
+    # door, and this test resolves its signal through whichever door the platform
+    # is actually using. Passing the platform ROOT, not root/"signals";
+    # FileSignalStore appends that segment itself.
+    from nakagai_platform.api.signal_store import get_signal_store
 
     NOW = pd.Timestamp("2026-07-13T15:00:00+00:00")   # Monday 08:00 LA, inside RTH
     monkeypatch.setattr(pd.Timestamp, "now", staticmethod(lambda tz=None: NOW))
@@ -339,7 +344,7 @@ async def test_full_edge_autopilot_loop_closes(tmp_path, monkeypatch):
         "guardrails": {"allow_writes": True, "read_only_tools": ["get_*"],
                        "approvals": {"require_for": ["place_*"], "ttl_s": 900},
                        "order_shape": order_shape}}]}))
-    append_signals(plat / "signals", [{
+    get_signal_store(plat, None).append([{
         "id": "abc123", "bar_ts": "2026-07-13T14:55:00+00:00",
         "detected_ts": "2026-07-13T14:55:00+00:00", "symbol": "NVDA",
         "strategy": "ict", "direction": "LONG", "entry": 118.4, "stop": 116.1,
