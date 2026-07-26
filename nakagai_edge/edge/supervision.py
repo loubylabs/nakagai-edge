@@ -92,6 +92,9 @@ def held_quantities(portfolio_doc: dict) -> dict:
 
     A connector or account carrying an error contributes nothing rather than
     contributing zeros. See the module docstring: zeros would read as "closed".
+    A row whose quantity does not parse is likewise left OUT of this mapping
+    rather than folded in as 0.0; see `unreadable()`, whose whole job is to
+    keep that distinction visible to `reconcile`.
     """
     out: dict = {}
     for entry in (portfolio_doc or {}).get("connectors") or []:
@@ -106,12 +109,13 @@ def held_quantities(portfolio_doc: dict) -> dict:
                 if not isinstance(row, dict):
                     continue
                 symbol = _scalar(row, _SYMBOL_KEYS).upper()
-                try:
-                    qty = float(_scalar(row, _QUANTITY_KEYS) or 0.0)
-                except (TypeError, ValueError):
+                if not symbol:
                     continue
-                if symbol:
-                    out[(cid, number, symbol)] = qty
+                try:
+                    qty = float(_scalar(row, _QUANTITY_KEYS))
+                except (TypeError, ValueError):
+                    continue              # unreadable(), not zero
+                out[(cid, number, symbol)] = qty
     return out
 
 
@@ -129,11 +133,42 @@ def answered(portfolio_doc: dict) -> set:
     return out
 
 
+def unreadable(portfolio_doc: dict) -> set:
+    """(connector, account, symbol) triples that appeared in a SUCCESSFUL
+    snapshot but whose quantity could not be parsed.
+
+    A row we cannot read is not a row reporting zero. Treating it as zero
+    releases the position and disarms the brake: the same mistake as trusting a
+    failed snapshot, arriving through a different door.
+    """
+    out = set()
+    for entry in (portfolio_doc or {}).get("connectors") or []:
+        if entry.get("error"):
+            continue
+        cid = entry.get("id", "")
+        for account in entry.get("accounts") or []:
+            if account.get("error"):
+                continue
+            number = str(account.get("account_number", ""))
+            for row in account.get("positions") or []:
+                if not isinstance(row, dict):
+                    continue
+                symbol = _scalar(row, _SYMBOL_KEYS).upper()
+                if not symbol:
+                    continue
+                try:
+                    float(_scalar(row, _QUANTITY_KEYS))
+                except (TypeError, ValueError):
+                    out.add((cid, number, symbol))
+    return out
+
+
 def reconcile(state: EdgeState, portfolio_doc: dict) -> dict:
     """Fold broker truth into the ledger. Returns the updated ledger."""
     doc = load(state)
     held = held_quantities(portfolio_doc)
     seen = answered(portfolio_doc)
+    unread = unreadable(portfolio_doc)
     now = time.time()
     for rec in doc.values():
         if rec.get("state") in TERMINAL:
@@ -141,13 +176,26 @@ def reconcile(state: EdgeState, portfolio_doc: dict) -> dict:
         key = (rec["connector_id"], rec["account"], rec["symbol"])
         if key[:2] not in seen:
             continue                      # this account did not answer
-        actual = held.get(key, 0.0)
+        if key in unread:
+            continue                      # quantity present but unparseable, not a release
+        raw = held.get(key, 0.0)
+        expected = 1.0 if rec.get("direction", "long") == "long" else -1.0
         rec["last_confirmed_at"] = now
-        if actual <= 0:
+        if raw == 0:
+            # Absent from a successful snapshot, or genuinely flat: closed.
             rec["state"] = "released"
             rec["confirmed_qty"] = 0.0
             rec["unguarded_qty"] = 0.0
             continue
+        if raw * expected < 0:
+            # The broker reports the OPPOSITE direction to what we recorded, so
+            # the position we would exit is not the position we are watching.
+            # Exiting on the warrant's side would ADD exposure, which is the one
+            # thing a reduce-only brake may never do. Leave it alone and say so.
+            rec["anomaly"] = (f"broker reports {raw:g} against a recorded "
+                              f"{rec.get('direction', 'long')} position")
+            continue
+        actual = abs(raw)
         ceiling = float(rec["entry_qty"])
         rec["confirmed_qty"] = min(actual, ceiling)
         rec["unguarded_qty"] = max(0.0, actual - ceiling)
