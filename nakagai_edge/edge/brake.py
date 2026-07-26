@@ -15,6 +15,7 @@ print sells a good position at a fictional number, so the judgment about when a
 price may be believed lives here where it can be tested exhaustively.
 """
 
+import asyncio
 import json
 import logging
 import math
@@ -254,7 +255,7 @@ class Brake:
                 continue
             quote = quotes.get(rec["symbol"])
             if quote is None:
-                self._note_blind_tick(rec, "no quote came back for it")
+                await self._note_blind_tick(rec, "no quote came back for it")
                 continue
             why_not = usable(quote, self._prior.get(pid), now)
             if why_not:
@@ -262,7 +263,7 @@ class Brake:
                 # brake nor reset a run already underway.
                 log.warning("brake discarded a quote for %s: %s",
                             rec["symbol"], why_not)
-                self._note_blind_tick(rec, why_not)
+                await self._note_blind_tick(rec, why_not)
                 continue
             self._dry.pop(pid, None)          # sighted again
             price = quote["price"]
@@ -277,7 +278,7 @@ class Brake:
                     fired.append(pid)
         return fired
 
-    def _note_blind_tick(self, rec: dict, why: str) -> None:
+    async def _note_blind_tick(self, rec: dict, why: str) -> None:
         """Count a tick that produced no usable observation, and say so once.
 
         A quote read the edge's own guardrails deny (get_quotes classified as a
@@ -300,7 +301,7 @@ class Brake:
         # The connector's quote tool is named in runtime.QUOTE_TOOL, which this
         # module cannot import (runtime imports this one), so the message says
         # what to look at rather than quoting the name.
-        self._notify(
+        await self._notify(
             f"The brake has had no usable price for {rec['symbol']} in "
             f"{blind_s}s ({dry} passes): {why}. Nothing is watching that stop "
             f"until quotes resume. If it persists, check that the quote tool "
@@ -350,13 +351,25 @@ class Brake:
             return None
         return 0.0
 
-    def _notify(self, text: str) -> None:
+    async def _notify(self, text: str) -> None:
+        # PlatformClient is synchronous on purpose (see client.py) and every
+        # other async caller wraps it. Called straight from a coroutine, a dark
+        # platform stalls this loop AND the four other background loops AND the
+        # MCP server for the client's whole timeout, which is exactly the
+        # scenario the brake exists to survive.
         try:
-            self.client.send_message(text)
+            await asyncio.to_thread(self.client.send_message, text)
         except Exception:  # noqa: BLE001 (never let a message failure matter)
             pass
 
-    def _tell_owner(self, rec: dict, reason: str, text: str, now: float) -> None:
+    async def _report(self, position_id: str, **kw) -> None:
+        try:
+            await asyncio.to_thread(self.client.report_execution, position_id, **kw)
+        except Exception:  # noqa: BLE001 (never re-arm a brake over a report)
+            pass
+
+    async def _tell_owner(self, rec: dict, reason: str, text: str,
+                          now: float) -> None:
         """Send `text` unless the owner already heard this same complaint.
 
         An unfireable position is retried on every 15-second pass forever, so
@@ -375,14 +388,14 @@ class Brake:
         if told is not None and told[1] == state and now - told[0] < NOTIFY_BACKOFF_S:
             return
         self._told[(pid, reason)] = (now, state)
-        self._notify(text)
+        await self._notify(text)
 
-    def _refuse(self, rec: dict, why_not: str, owner_text: str,
-                now: float) -> str:
+    async def _refuse(self, rec: dict, why_not: str, owner_text: str,
+                      now: float) -> str:
         """Journal a refusal, tell the owner if they have not just heard it."""
         self.audit.record("denial", rec["connector_id"], "brake",
                           {"position_id": rec["position_id"], "reason": why_not})
-        self._tell_owner(rec, why_not, owner_text, now)
+        await self._tell_owner(rec, why_not, owner_text, now)
         return why_not
 
     def _forget_refusals(self, position_id: str) -> None:
@@ -410,7 +423,7 @@ class Brake:
             # supervise() already records such a position `unguarded`; this is
             # the last line of that same rule, for a record that reached
             # `armed` some other way.
-            return self._refuse(
+            return await self._refuse(
                 rec, "the record names no account, so no broker can be asked",
                 f"The brake cannot exit {rec['symbol']}: the ledger record "
                 f"names no account, so no broker can be asked about it. That "
@@ -421,7 +434,7 @@ class Brake:
             # Over-refusal here is real harm, not caution: the stop was just
             # touched and the brake is declining to act on it, so the owner
             # must hear that exactly as loudly as any other unguarded moment.
-            return self._refuse(
+            return await self._refuse(
                 rec, "the broker would not confirm the position; not firing blind",
                 f"The brake could not confirm {rec['symbol']} with the broker "
                 f"and did NOT fire. That position is unguarded until a pass "
@@ -446,7 +459,7 @@ class Brake:
             # refusing here, before a size is even computed, names the exact
             # reason instead of failing later on a mismatch this didn't cause.
             why_not = "warrant ceiling is not a usable number"
-            return self._refuse(
+            return await self._refuse(
                 rec, why_not,
                 f"The brake could not exit {rec['symbol']}: {why_not}. That "
                 f"position is unguarded.", now)
@@ -455,7 +468,7 @@ class Brake:
                                rec.get("entry_args") or {}, qty)
         if args is None:
             why_not = "this connector cannot express a market exit"
-            return self._refuse(
+            return await self._refuse(
                 rec, why_not,
                 f"The brake could not build an exit for {rec['symbol']}: "
                 f"{why_not}. That position is unguarded.", now)
@@ -481,7 +494,7 @@ class Brake:
             public_key(self.state), warrant, sent,
             agent_id=agent.get("agent_id"), held_qty=held, spent=False)
         if why_not:
-            return self._refuse(
+            return await self._refuse(
                 rec, why_not,
                 f"The brake could not exit {rec['symbol']}: {why_not}. That "
                 f"position is unguarded.", now)
@@ -509,30 +522,25 @@ class Brake:
                 # every pass, so the owner message is throttled like the
                 # refusals above; the journal above still gets every attempt.
                 mark(self.state, pid, "armed")
-                self._tell_owner(
+                await self._tell_owner(
                     rec, str(e),
                     f"The brake was refused on {rec['symbol']}: {e}. Nothing "
                     f"was placed and the position is unguarded.", now)
             else:
                 mark(self.state, pid, "outcome_unknown", error=str(e))
-                self._notify(
+                await self._notify(
                     f"The brake tried to exit {rec['symbol']} and the outcome is "
                     f"UNKNOWN: {e}. Check the broker directly; it will not retry.")
-                try:
-                    self.client.report_execution(pid, ok=False, error=str(e),
-                                                 outcome_unknown=True)
-                except Exception:  # noqa: BLE001
-                    pass
+                await self._report(pid, ok=False, error=str(e),
+                                   outcome_unknown=True)
             return str(e)
 
         mark(self.state, pid, "fired", fired_qty=qty)
         self._forget_refusals(pid)
         self.audit.record("execution", rec["connector_id"], "brake",
                           {"position_id": pid, "qty": qty, "ok": True})
-        try:
-            self.client.report_execution(pid, ok=True, result=result)
-        except Exception:  # noqa: BLE001 (never re-arm a fired brake)
-            pass
-        self._notify(f"The brake exited {rec['symbol']}: {qty:g} at the market, "
-                     f"its stop of {rec['stop']:g} was touched.")
+        await self._report(pid, ok=True, result=result)
+        await self._notify(
+            f"The brake exited {rec['symbol']}: {qty:g} at the market, "
+            f"its stop of {rec['stop']:g} was touched.")
         return ""

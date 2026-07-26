@@ -8,6 +8,7 @@ is the safe direction.
 """
 
 import asyncio
+import threading
 
 import pytest
 
@@ -172,7 +173,23 @@ def _rec(warrant=None, **over):
     return rec
 
 
-def _brake(tmp_path, hub, *, stale=False):
+class ThreadRecordingClient(FakeClient):
+    """Records which thread each platform call ran on."""
+
+    def __init__(self):
+        super().__init__()
+        self.threads = []
+
+    def send_message(self, text):
+        self.threads.append(threading.get_ident())
+        return super().send_message(text)
+
+    def report_execution(self, approval_id, **kw):
+        self.threads.append(threading.get_ident())
+        return super().report_execution(approval_id, **kw)
+
+
+def _brake(tmp_path, hub, *, stale=False, client=None):
     state = EdgeState(tmp_path)
     state.save_agent("https://api.test", "ag1", "nk_agent_t")
     apply_bundle(state, {"bundle_version": "v1",
@@ -181,7 +198,7 @@ def _brake(tmp_path, hub, *, stale=False):
                          "signing_public_key": PUB}, "v1")
     if stale:
         state.meta_path.write_text('{"etag": "v1", "fetched_at": 1.0}')
-    client = FakeClient()
+    client = FakeClient() if client is None else client
     return state, client, Brake(state, hub, client, EdgeAudit(state))
 
 
@@ -467,6 +484,27 @@ async def test_a_second_distinct_reason_on_one_position_still_reaches_the_owner(
     monkeypatch.setattr(brake_module, "exit_order_args", lambda *a: None)
     await brake.fire(load(state)["ap_1"], now=1015.0)
     assert len(client.messages) == 2
+
+
+async def test_the_platform_is_never_called_on_the_event_loop(tmp_path):
+    # PlatformClient is synchronous on purpose (see client.py), and every other
+    # async caller wraps it in asyncio.to_thread. Not wrapping it here stalls
+    # all five background loops AND the MCP server for up to the client
+    # timeout, in precisely the scenario the brake exists for: a dark platform.
+    hub = FakeHub()
+    state, client, brake = _brake(tmp_path, hub, client=ThreadRecordingClient())
+    record(state, _rec())
+    assert await brake.fire(load(state)["ap_1"]) == ""
+    assert len(client.threads) == 2, "report_execution and send_message both ran"
+    assert threading.get_ident() not in client.threads
+
+
+async def test_a_refusal_message_is_also_kept_off_the_event_loop(tmp_path):
+    hub = MalformedPositionsHub()
+    state, client, brake = _brake(tmp_path, hub, client=ThreadRecordingClient())
+    record(state, _rec())
+    await brake.fire(load(state)["ap_1"])
+    assert client.threads and threading.get_ident() not in client.threads
 
 
 async def test_two_positions_failing_the_same_way_are_both_reported(tmp_path):
