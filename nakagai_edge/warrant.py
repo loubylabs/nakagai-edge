@@ -174,18 +174,26 @@ def exit_order_args(shape, entry_args: dict, qty: float) -> dict | None:
     side = closing_side(shape, entry["side"])
     if not side:
         return None
-    # A connector whose market declaration collides with its own side or
-    # quantity field is misconfigured. Resolving that collision either way
-    # would be a guess about an order bound for a real brokerage, so refuse.
-    aliases = set(shape.side_keys) | set(shape.quantity_keys)
+    # A market declaration may not touch the fields that identify or size the
+    # position: symbol, side, and quantity. A connector that declares one of
+    # those is misconfigured, and resolving the collision either way would be
+    # a guess about an order bound for a real brokerage, so refuse. Price and
+    # stop keys are deliberately excluded from this set: they are already
+    # stripped below, so a collision there is expected and harmless.
+    aliases = (set(shape.symbol_keys) | set(shape.side_keys)
+               | set(shape.quantity_keys))
     if aliases & set(shape.market_order_args):
         return None
     side_key = _at(entry_args, shape.side_keys)
     qty_key = _at(entry_args, shape.quantity_keys)
     # Strip EVERY side and quantity alias, not just the one `_at` picked: an
     # unused alias sitting in the entry payload would otherwise ride along
-    # beside the flipped one and leave the broker two answers.
-    drop = set(shape.price_keys) | set(shape.stop_keys) | aliases
+    # beside the flipped one and leave the broker two answers. Symbol is NOT
+    # in this drop set: unlike side and quantity it is never rewritten below,
+    # so stripping it here would delete it from the exit with nothing to
+    # put it back.
+    drop = (set(shape.price_keys) | set(shape.stop_keys)
+            | set(shape.side_keys) | set(shape.quantity_keys))
     args = {k: v for k, v in entry_args.items() if k not in drop}
     args.update(shape.market_order_args)
     args[side_key] = side

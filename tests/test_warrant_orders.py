@@ -100,3 +100,26 @@ def test_every_quantity_alias_is_replaced_not_just_the_one_read():
     result = exit_order_args(shape, args, 40.0)
     assert result["qty"] == 40.0
     assert "quantity" not in result
+
+
+def test_the_exit_is_none_when_market_args_collide_with_a_symbol_key():
+    # A market declaration that names its own "symbol" key would silently
+    # route the exit to a different instrument than the position being
+    # closed. Same posture as the side/quantity collision: refuse.
+    shape = SHAPE.model_copy(update={"market_order_args": {
+        "order_type": "market", "symbol": "SPY"}})
+    assert exit_order_args(shape, ENTRY, 40.0) is None
+
+
+def test_market_args_may_still_overwrite_the_entrys_own_order_type():
+    # The guard refuses collisions on fields that identify or size the
+    # position (symbol, side, quantity). It must NOT refuse an ordinary
+    # overwrite of a field like order_type: replacing a limit entry's order
+    # type with "market" is the entire purpose of market_order_args.
+    shape = SHAPE.model_copy(update={"market_order_args": {
+        "order_type": "market", "time_in_force": "day"}})
+    args = dict(ENTRY)
+    args["order_type"] = "limit"
+    result = exit_order_args(shape, args, 40.0)
+    assert result is not None
+    assert result["order_type"] == "market"
