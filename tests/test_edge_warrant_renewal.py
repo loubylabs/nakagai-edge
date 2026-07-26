@@ -180,7 +180,7 @@ def test_a_warrants_batch_that_is_a_list_is_survived_without_raising(tmp_path):
 def test_a_terminal_position_refuses_an_unsolicited_renewal(tmp_path, terminal_state):
     # renewal_request already keeps the edge from ASKING about a terminal
     # position (covered above); this is the second, independent line of
-    # defense -- against a buggy or compromised platform answering for a
+    # defense, against a buggy or compromised platform answering for a
     # position it was never asked about.
     state = EdgeState(tmp_path)
     record(state, _rec(state=terminal_state))

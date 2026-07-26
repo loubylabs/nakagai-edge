@@ -128,7 +128,7 @@ class OtherSymbolsHub(FakeHub):
 
 class RacingHub(FakeHub):
     """FakeHub's call() never actually suspends, so two gathered coroutines
-    calling it run fully sequentially -- no interleaving, no race, whether or
+    calling it run fully sequentially: no interleaving, no race, whether or
     not the one-shot guard is atomic. A real await point here is what forces
     genuine interleaving between two concurrent fire() calls, which is what
     the one-shot claim must survive."""
@@ -300,7 +300,7 @@ async def test_a_successful_fire_tells_the_owner_and_the_platform(tmp_path):
 
 async def test_a_forged_symbol_in_the_sent_payload_is_caught(tmp_path, monkeypatch):
     # exit_order_args is what actually decides the bytes reaching the broker.
-    # If IT names the wrong symbol, verification must catch that -- checking
+    # If IT names the wrong symbol, verification must catch that. Checking
     # against rec["symbol"] instead would let a construction bug sail through,
     # because the warrant would be checked against our own assumption rather
     # than the payload about to be sent.
@@ -346,7 +346,7 @@ async def test_a_symbol_row_with_no_recognizable_quantity_key_does_not_release(t
 
 async def test_two_concurrent_fires_place_only_one_order(tmp_path):
     # Two coroutines, each holding its OWN independently-loaded snapshot of
-    # the same armed record -- exactly the shape a future runtime loop and a
+    # the same armed record, exactly the shape a future runtime loop and a
     # manually-triggered pass could produce together. Only an atomic claim on
     # the disk state (not the in-memory `armed` each coroutine already read)
     # can stop the second one from also reaching the broker.

@@ -242,11 +242,11 @@ class Brake:
 
         `quotes` maps symbol to the FULL normalized quote `normalize_quote`
         produced (price, bid, ask, ts), never a bare price. usable() needs the
-        real receipt time and the book to judge freshness and spread; an
-        observation restated by its consumer -- re-stamped with this
-        function's own `now`, stripped of its book -- is an observation whose
-        provenance has been erased, and a reused or stale quote would then
-        look fresh every time. This is the same mistake already found and
+        real receipt time and the book to judge freshness and spread. An
+        observation restated by its consumer (re-stamped with this function's
+        own `now`, stripped of its book) is an observation whose provenance has
+        been erased, and a reused or stale quote would then look fresh every
+        time. This is the same mistake already found and
         fixed in Brake.fire(), where verification checked a restatement of
         the ledger instead of the payload actually being sent.
         """
