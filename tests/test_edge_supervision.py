@@ -1,11 +1,18 @@
 """The ledger of supervised positions. Broker truth always wins, and every
 drift case must resolve toward a SMALLER exit than before."""
 
+import pytest
+
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.supervision import (
-    claim, held_quantities, is_guarded, load, mark, open_risk,
+    TERMINAL, claim, held_quantities, is_guarded, load, mark, open_risk,
     recover_interrupted, reconcile, record, unreadable,
 )
+
+# A real warrant carries an epoch float (see warrant.build_warrant_payload),
+# and `guarded` now reads it, so the fixture has to carry a real one too.
+EXPIRY = 4_102_444_800.0            # 2100-01-01
+BEFORE_EXPIRY = EXPIRY - 3600.0
 
 
 def _rec(**over):
@@ -14,7 +21,8 @@ def _rec(**over):
            "signal_id": "sig_1", "entry_args": {"symbol": "AAPL"},
            "entry_qty": 100.0, "entry_price": 47.55, "stop": 46.20,
            "confirmed_qty": 100.0, "last_confirmed_at": 0.0,
-           "unguarded_qty": 0.0, "warrant": {"grant_id": "wr_1"},
+           "unguarded_qty": 0.0,
+           "warrant": {"grant_id": "wr_1", "expires_at": EXPIRY},
            "state": "armed", "opened_at": 1.0}
     rec.update(over)
     return rec
@@ -206,6 +214,57 @@ def test_open_risk_reports_unguarded_for_a_disarmed_position(tmp_path):
     record(state, _rec())
     row = open_risk(state, {"AAPL": 48.90}, disarmed={"ap_1"})[0]
     assert row["guarded"] is False
+
+
+# --- final round: `guarded` must also read the warrant's clock, and must not
+# survive the deletion of its own state check. ---
+
+
+def test_is_guarded_false_once_the_warrant_has_expired():
+    # 24 hours with the platform dark and every renewal failing: nothing will
+    # exit any of these positions, and this field is where the owner finds out.
+    assert is_guarded(_rec(), brake_armed=True, disarmed=frozenset(),
+                      now=EXPIRY + 1) is False
+
+
+def test_is_guarded_true_while_the_warrant_is_still_live():
+    assert is_guarded(_rec(), brake_armed=True, disarmed=frozenset(),
+                      now=BEFORE_EXPIRY) is True
+
+
+def test_is_guarded_false_when_the_expiry_cannot_be_read():
+    # warrant.authorizes() treats an absent or unparseable expires_at as
+    # expired, so such a warrant can never fire. Reporting it guarded would be
+    # exactly the lie this check exists to end.
+    rec = _rec(warrant={"grant_id": "wr_1", "expires_at": "next Tuesday"})
+    assert is_guarded(rec, brake_armed=True, disarmed=frozenset(),
+                      now=BEFORE_EXPIRY) is False
+
+
+def test_is_guarded_without_a_clock_keeps_the_permissive_default():
+    # A caller that never passes `now` must not suddenly report everything
+    # unguarded; both real callers do pass one.
+    rec = _rec(warrant={"grant_id": "wr_1"})
+    assert is_guarded(rec, brake_armed=True, disarmed=frozenset()) is True
+
+
+def test_open_risk_reports_unguarded_on_an_expired_warrant(tmp_path):
+    state = EdgeState(tmp_path)
+    record(state, _rec())
+    assert open_risk(state, {}, now=EXPIRY + 1)[0]["guarded"] is False
+    assert open_risk(state, {}, now=BEFORE_EXPIRY)[0]["guarded"] is True
+
+
+@pytest.mark.parametrize("terminal_state", TERMINAL)
+def test_is_guarded_false_for_a_terminal_record_that_still_holds_its_warrant(
+        terminal_state):
+    # `fired` is the sharpest case: mark() leaves the warrant on the record,
+    # so warrant-plus-switches alone still looks guarded. Only the state check
+    # says otherwise, and this pins it: deleting `state == "armed"` from
+    # is_guarded must fail here.
+    rec = _rec(state=terminal_state)
+    assert is_guarded(rec, brake_armed=True, disarmed=frozenset(),
+                      now=BEFORE_EXPIRY) is False
 
 
 # --- Fix round 1: an unreadable quantity or a sign that contradicts the

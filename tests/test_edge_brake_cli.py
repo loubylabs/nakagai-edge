@@ -50,7 +50,8 @@ def test_brake_status_shows_guarded_false_after_brake_off(tmp_path, monkeypatch,
         "account": "123", "direction": "long", "entry_price": 100.0,
         "stop": 95.0, "entry_qty": 10.0, "confirmed_qty": 10.0,
         "state": "armed", "warrant": {"trigger": {"type": "price_below",
-                                                   "level": 95.0}}})
+                                                   "level": 95.0},
+                                      "expires_at": 4_102_444_800.0}})
 
     assert main(["brake", "off"]) == 0
     capsys.readouterr()

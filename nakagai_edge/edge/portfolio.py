@@ -97,7 +97,7 @@ async def connector_snapshot(hub, spec) -> dict:
 
 
 def mark_guarded(state, connectors: list[dict], *, brake_armed: bool = True,
-                disarmed=frozenset()) -> list[dict]:
+                disarmed=frozenset(), now: float | None = None) -> list[dict]:
     """Tag each position with whether the brake is watching it.
 
     Display state only, exactly like every other figure in this document: no
@@ -106,12 +106,16 @@ def mark_guarded(state, connectors: list[dict], *, brake_armed: bool = True,
 
     `brake_armed`/`disarmed` default permissive so a caller that has not been
     updated to pass the live disarm state behaves as it always did, rather
-    than reporting every position unguarded.
+    than reporting every position unguarded. `now` is what warrant expiry is
+    judged against, and it is read here rather than left to the caller so no
+    display path can silently skip that check.
     """
     from nakagai_edge.edge.supervision import is_guarded, load
+    now = time.time() if now is None else now
     guarded = {(r["connector_id"], r["account"], r["symbol"])
                for r in load(state).values()
-               if is_guarded(r, brake_armed=brake_armed, disarmed=disarmed)}
+               if is_guarded(r, brake_armed=brake_armed, disarmed=disarmed,
+                             now=now)}
     for entry in connectors:
         for account in entry.get("accounts") or []:
             for row in account.get("positions") or []:

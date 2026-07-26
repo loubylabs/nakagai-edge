@@ -184,12 +184,15 @@ async def test_write_tool_edge_client_error_returns_is_error_json(tmp_path):
 
 
 def _supervised_position(**over) -> dict:
+    # expires_at is an epoch float, the way warrant.build_warrant_payload
+    # writes it, because `guarded` reads it now: an ISO string is not a clock
+    # anything in the edge can compare against.
     rec = {"position_id": "ap_1", "symbol": "AAPL", "connector_id": "demo",
            "account": "123", "direction": "long", "entry_price": 100.0,
            "stop": 95.0, "entry_qty": 10.0, "confirmed_qty": 10.0,
            "state": "armed",
            "warrant": {"trigger": {"type": "price_below", "level": 95.0},
-                      "expires_at": "2026-08-01T00:00:00Z"}}
+                      "expires_at": 4_102_444_800.0}}
     rec.update(over)
     return rec
 

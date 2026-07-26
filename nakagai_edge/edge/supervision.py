@@ -301,29 +301,57 @@ def apply_renewals(state: EdgeState, warrants: dict) -> dict:
     return doc
 
 
-def is_guarded(rec: dict, *, brake_armed: bool, disarmed) -> bool:
+def _warrant_expired(expires_at, now: float) -> bool:
+    """True unless `expires_at` is a readable moment still in the future.
+
+    An absent or unparseable expiry counts as expired, which is exactly what
+    warrant.authorizes() does with the same field: such a warrant can never
+    authorize anything, so calling its position guarded would be the lie this
+    check exists to end.
+    """
+    try:
+        return float(expires_at) <= now
+    except (TypeError, ValueError):
+        return True
+
+
+def is_guarded(rec: dict, *, brake_armed: bool, disarmed,
+               now: float | None = None) -> bool:
     """Will anything actually exit this position if its stop is touched?
 
-    Three facts have to agree, and the last two live in brake.py, which imports
-    this module: a record can be perfectly armed and warranted while the owner
-    has locally disarmed the brake globally or released that one position. The
-    caller supplies those two, because supervision cannot import brake without
-    a cycle, and a `guarded` that ignores a disarm the owner just performed is
+    Four facts have to agree. Two of them live in brake.py, which imports this
+    module: a record can be perfectly armed and warranted while the owner has
+    locally disarmed the brake globally or released that one position. The
+    caller supplies those, because supervision cannot import brake without a
+    cycle, and a `guarded` that ignores a disarm the owner just performed is
     worse than no field at all.
+
+    The fourth is the warrant's own clock. A warrant lives 24 hours, so a
+    platform dark for a day leaves every brake off while every display says on
+    unless the expiry is read here. `now` stays optional, and omitting it skips
+    only that check, so a caller that predates it does not suddenly report
+    everything unguarded; both real callers pass one.
     """
-    return (bool(rec.get("warrant")) and rec.get("state") == "armed"
-            and brake_armed and rec.get("position_id") not in disarmed)
+    if not (bool(rec.get("warrant")) and rec.get("state") == "armed"
+            and brake_armed and rec.get("position_id") not in disarmed):
+        return False
+    if now is None:
+        return True
+    return not _warrant_expired((rec.get("warrant") or {}).get("expires_at"), now)
 
 
 def open_risk(state: EdgeState, prices: dict, *, brake_armed: bool = True,
-             disarmed=frozenset()) -> list[dict]:
+             disarmed=frozenset(), now: float | None = None) -> list[dict]:
     """Every supervised position, with its risk expressed in R.
 
     R is the entry-to-stop distance, which is the only unit in which one
     position's risk is comparable to another's. `brake_armed`/`disarmed`
     default permissive so a caller that predates the disarm switches (or
-    never touches them) sees the same `guarded` it always did.
+    never touches them) sees the same `guarded` it always did. `now` is the
+    clock `guarded` judges warrant expiry against, and it is read here rather
+    than left to the caller so that no display path can silently skip it.
     """
+    now = time.time() if now is None else now
     out = []
     for rec in load(state).values():
         price = prices.get(rec["symbol"])
@@ -349,7 +377,8 @@ def open_risk(state: EdgeState, prices: dict, *, brake_armed: bool = True,
             "unrealized_r": unrealized_r, "distance_to_stop": distance,
             "open_risk": (one_r * float(rec.get("confirmed_qty", 0.0))),
             "state": rec.get("state", "armed"),
-            "guarded": is_guarded(rec, brake_armed=brake_armed, disarmed=disarmed),
+            "guarded": is_guarded(rec, brake_armed=brake_armed,
+                                  disarmed=disarmed, now=now),
             "warrant_expires_at": (rec.get("warrant") or {}).get("expires_at"),
         })
     return out

@@ -131,12 +131,16 @@ async def test_a_dead_get_accounts_degrades_to_a_connector_level_error():
 
 # ---- the guarded marker ---------------------------------------------------
 
+EXPIRY = 4_102_444_800.0        # 2100-01-01, an epoch float like a real warrant
+
+
 def _supervised(edge_state, **ledger_fields):
     rec = {"position_id": "ap_1", "symbol": "SPY", "connector_id": "robinhood-trading",
            "account": "463605220", "direction": "long", "entry_price": 480.0,
            "stop": 460.0, "entry_qty": 10.0, "confirmed_qty": 10.0,
            "state": "armed", "warrant": {"trigger": {"type": "price_below",
-                                                      "level": 460.0}}}
+                                                      "level": 460.0},
+                                         "expires_at": EXPIRY}}
     rec.update(ledger_fields)
     record(edge_state, rec)
 
@@ -181,6 +185,15 @@ def test_mark_guarded_tags_false_under_a_global_disarm(tmp_path):
     state = EdgeState(tmp_path)
     _supervised(state)
     out = mark_guarded(state, _connectors_with_one_position(), brake_armed=False)
+    assert out[0]["accounts"][0]["positions"][0]["guarded"] is False
+
+
+def test_mark_guarded_tags_false_once_the_warrant_has_expired(tmp_path):
+    """A warrant nobody renewed is a brake that will not fire, so the marker
+    on the owner's Portfolio page has to go dark with it."""
+    state = EdgeState(tmp_path)
+    _supervised(state)
+    out = mark_guarded(state, _connectors_with_one_position(), now=EXPIRY + 1)
     assert out[0]["accounts"][0]["positions"][0]["guarded"] is False
 
 
