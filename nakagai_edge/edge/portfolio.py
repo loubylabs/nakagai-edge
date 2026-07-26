@@ -96,17 +96,22 @@ async def connector_snapshot(hub, spec) -> dict:
     return entry
 
 
-def mark_guarded(state, connectors: list[dict]) -> list[dict]:
+def mark_guarded(state, connectors: list[dict], *, brake_armed: bool = True,
+                disarmed=frozenset()) -> list[dict]:
     """Tag each position with whether the brake is watching it.
 
     Display state only, exactly like every other figure in this document: no
     guardrail, approval, or authorization path may read it back. An unguarded
     position nobody can see is a silent failure, and this is what ends that.
+
+    `brake_armed`/`disarmed` default permissive so a caller that has not been
+    updated to pass the live disarm state behaves as it always did, rather
+    than reporting every position unguarded.
     """
-    from nakagai_edge.edge.supervision import load
+    from nakagai_edge.edge.supervision import is_guarded, load
     guarded = {(r["connector_id"], r["account"], r["symbol"])
                for r in load(state).values()
-               if r.get("state") == "armed" and r.get("warrant")}
+               if is_guarded(r, brake_armed=brake_armed, disarmed=disarmed)}
     for entry in connectors:
         for account in entry.get("accounts") or []:
             for row in account.get("positions") or []:
@@ -130,6 +135,11 @@ class PortfolioReporter:
         self._lock = asyncio.Lock()
 
     async def snapshot_and_push(self) -> dict:
+        # Imported here, not at module scope: brake.py is the one place the
+        # disarm switches actually live, and snapshot_and_push is the one
+        # portfolio caller close enough to the loop to read them fresh each
+        # sweep rather than trusting a value handed in once at construction.
+        from nakagai_edge.edge.brake import armed, disarmed_positions
         async with self._lock:
             now = time.time()
             if (self._last_doc is not None
@@ -137,7 +147,9 @@ class PortfolioReporter:
                 return self._last_doc
             doc = {"connectors": mark_guarded(
                 self._state, [await connector_snapshot(self._hub, s)
-                              for s in broker_specs(self._state.root)])}
+                              for s in broker_specs(self._state.root)],
+                brake_armed=armed(self._state),
+                disarmed=disarmed_positions(self._state))}
             self._last_run = time.time()
             self._last_doc = doc
             try:

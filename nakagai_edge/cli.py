@@ -272,9 +272,12 @@ def _cmd_brake(args) -> int:
                          position_id=args.position or "")
     elif args.action == "on":
         clear_local_disarm(state)
-    print(json.dumps({"armed": armed(state),
-                      "disarmed_positions": sorted(disarmed_positions(state)),
-                      "positions": open_risk(state, {})}, indent=2, default=str))
+    is_armed, off = armed(state), disarmed_positions(state)
+    print(json.dumps({"armed": is_armed,
+                      "disarmed_positions": sorted(off),
+                      "positions": open_risk(state, {}, brake_armed=is_armed,
+                                             disarmed=off)},
+                     indent=2, default=str))
     return 0
 
 

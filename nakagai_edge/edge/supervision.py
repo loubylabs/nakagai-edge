@@ -295,11 +295,28 @@ def apply_renewals(state: EdgeState, warrants: dict) -> dict:
     return doc
 
 
-def open_risk(state: EdgeState, prices: dict) -> list[dict]:
+def is_guarded(rec: dict, *, brake_armed: bool, disarmed) -> bool:
+    """Will anything actually exit this position if its stop is touched?
+
+    Three facts have to agree, and the last two live in brake.py, which imports
+    this module: a record can be perfectly armed and warranted while the owner
+    has locally disarmed the brake globally or released that one position. The
+    caller supplies those two, because supervision cannot import brake without
+    a cycle, and a `guarded` that ignores a disarm the owner just performed is
+    worse than no field at all.
+    """
+    return (bool(rec.get("warrant")) and rec.get("state") == "armed"
+            and brake_armed and rec.get("position_id") not in disarmed)
+
+
+def open_risk(state: EdgeState, prices: dict, *, brake_armed: bool = True,
+             disarmed=frozenset()) -> list[dict]:
     """Every supervised position, with its risk expressed in R.
 
     R is the entry-to-stop distance, which is the only unit in which one
-    position's risk is comparable to another's.
+    position's risk is comparable to another's. `brake_armed`/`disarmed`
+    default permissive so a caller that predates the disarm switches (or
+    never touches them) sees the same `guarded` it always did.
     """
     out = []
     for rec in load(state).values():
@@ -326,7 +343,7 @@ def open_risk(state: EdgeState, prices: dict) -> list[dict]:
             "unrealized_r": unrealized_r, "distance_to_stop": distance,
             "open_risk": (one_r * float(rec.get("confirmed_qty", 0.0))),
             "state": rec.get("state", "armed"),
-            "guarded": bool(rec.get("warrant")) and rec.get("state") == "armed",
+            "guarded": is_guarded(rec, brake_armed=brake_armed, disarmed=disarmed),
             "warrant_expires_at": (rec.get("warrant") or {}).get("expires_at"),
         })
     return out

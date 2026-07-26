@@ -174,6 +174,16 @@ def test_mark_guarded_is_a_no_op_on_an_empty_ledger(tmp_path):
     assert mark_guarded(state, connectors) == connectors
 
 
+def test_mark_guarded_tags_false_under_a_global_disarm(tmp_path):
+    """Fix round 1: an armed, warranted record must still read unguarded once
+    the owner has disarmed the brake, or this display field lies about the
+    one thing it exists to tell the owner."""
+    state = EdgeState(tmp_path)
+    _supervised(state)
+    out = mark_guarded(state, _connectors_with_one_position(), brake_armed=False)
+    assert out[0]["accounts"][0]["positions"][0]["guarded"] is False
+
+
 # ---- spec discovery ------------------------------------------------------
 
 def test_broker_specs_reads_only_enabled_mcp_brokers(tmp_path):

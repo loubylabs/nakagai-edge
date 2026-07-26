@@ -254,3 +254,57 @@ async def test_get_open_risk_survives_a_dead_quote_feed(tmp_path, monkeypatch):
 
     assert out["positions"][0]["position_id"] == "ap_1"
     assert out["positions"][0]["price"] is None
+
+
+async def test_get_open_risk_reports_unguarded_under_a_global_disarm(tmp_path):
+    """Fix round 1: guarded was computed from the ledger record alone (warrant
+    + state == armed) and never consulted brake.armed()/disarmed_positions(),
+    the two mechanisms `brake off` actually drives. After a global disarm
+    nothing fires on a confirmed breach, so a still-True `guarded` here would
+    tell the owner the opposite of the truth."""
+    from nakagai_edge.edge.brake import set_local_disarm
+    from nakagai_edge.edge.supervision import record
+    state = _state(tmp_path)
+    record(state, _supervised_position())
+    set_local_disarm(state, all_positions=True)
+
+    client = PlatformClient("https://api.test", "t",
+                            transport=httpx.MockTransport(lambda r: httpx.Response(500)))
+    audit = EdgeAudit(state)
+    hub = build_hub(state, client)
+    mcp = create_edge_mcp(state, hub, client, audit, _Reporter(),
+                          Brake(state, hub, client, audit))
+
+    result = await mcp.call_tool("get_open_risk", {})
+    text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+    out = json.loads(text)
+
+    assert out["armed"] is False
+    assert out["positions"][0]["guarded"] is False
+
+
+async def test_get_open_risk_is_self_consistent_after_a_per_position_disarm(tmp_path):
+    """A position released with `brake off --position` must never show up
+    both in disarmed_positions AND as guarded: true in the same payload -
+    that combination is the exact self-contradiction the fix round closes."""
+    from nakagai_edge.edge.brake import set_local_disarm
+    from nakagai_edge.edge.supervision import record
+    state = _state(tmp_path)
+    record(state, _supervised_position())
+    set_local_disarm(state, position_id="ap_1")
+
+    client = PlatformClient("https://api.test", "t",
+                            transport=httpx.MockTransport(lambda r: httpx.Response(500)))
+    audit = EdgeAudit(state)
+    hub = build_hub(state, client)
+    mcp = create_edge_mcp(state, hub, client, audit, _Reporter(),
+                          Brake(state, hub, client, audit))
+
+    result = await mcp.call_tool("get_open_risk", {})
+    text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+    out = json.loads(text)
+
+    assert out["disarmed_positions"] == ["ap_1"]
+    guarded_ids = {r["position_id"] for r in out["positions"] if r["guarded"]}
+    assert not (guarded_ids & set(out["disarmed_positions"]))
+    assert out["positions"][0]["guarded"] is False

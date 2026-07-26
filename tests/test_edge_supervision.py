@@ -3,8 +3,8 @@ drift case must resolve toward a SMALLER exit than before."""
 
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.supervision import (
-    claim, held_quantities, load, mark, open_risk, recover_interrupted,
-    reconcile, record, unreadable,
+    claim, held_quantities, is_guarded, load, mark, open_risk,
+    recover_interrupted, reconcile, record, unreadable,
 )
 
 
@@ -171,6 +171,41 @@ def test_open_risk_survives_a_missing_price(tmp_path):
     row = open_risk(state, {})[0]
     assert row["unrealized_r"] is None
     assert row["price"] is None
+
+
+# --- Fix round 1: `guarded` must consult the two disarm switches
+# (brake.armed / brake.disarmed_positions), not just the ledger record. ---
+
+
+def test_is_guarded_true_only_when_armed_warranted_arm_switch_and_not_disarmed():
+    assert is_guarded(_rec(), brake_armed=True, disarmed=frozenset()) is True
+
+
+def test_is_guarded_false_under_a_global_disarm():
+    assert is_guarded(_rec(), brake_armed=False, disarmed=frozenset()) is False
+
+
+def test_is_guarded_false_when_this_position_is_individually_disarmed():
+    assert is_guarded(_rec(), brake_armed=True, disarmed={"ap_1"}) is False
+
+
+def test_is_guarded_false_without_a_warrant_regardless_of_the_switches():
+    rec = _rec(warrant=None, state="unguarded")
+    assert is_guarded(rec, brake_armed=True, disarmed=frozenset()) is False
+
+
+def test_open_risk_reports_unguarded_under_a_global_disarm(tmp_path):
+    state = EdgeState(tmp_path)
+    record(state, _rec())
+    row = open_risk(state, {"AAPL": 48.90}, brake_armed=False)[0]
+    assert row["guarded"] is False
+
+
+def test_open_risk_reports_unguarded_for_a_disarmed_position(tmp_path):
+    state = EdgeState(tmp_path)
+    record(state, _rec())
+    row = open_risk(state, {"AAPL": 48.90}, disarmed={"ap_1"})[0]
+    assert row["guarded"] is False
 
 
 # --- Fix round 1: an unreadable quantity or a sign that contradicts the

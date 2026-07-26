@@ -210,15 +210,19 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         degraded."""
         from nakagai_edge.edge.brake import armed, disarmed_positions
         from nakagai_edge.edge.supervision import open_risk
+        is_armed, off = armed(state), disarmed_positions(state)
         try:
             quotes = await _quotes(hub, state, brake.quote_symbols())
             prices = {symbol: q["price"] for symbol, q in quotes.items()}
         except Exception:  # noqa: BLE001 (a dead quote feed must not hide the book)
             prices = {}
-        rows = open_risk(state, prices)
+        # Same brake_armed/off feed the top-level fields below: a `guarded`
+        # that disagreed with `armed`/`disarmed_positions` in the same payload
+        # would be self-contradictory, not just wrong.
+        rows = open_risk(state, prices, brake_armed=is_armed, disarmed=off)
         return json.dumps({
-            "armed": armed(state),
-            "disarmed_positions": sorted(disarmed_positions(state)),
+            "armed": is_armed,
+            "disarmed_positions": sorted(off),
             "portfolio_heat": round(sum(r["open_risk"] for r in rows), 2),
             "positions": rows}, default=str)
 
