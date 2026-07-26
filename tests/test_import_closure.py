@@ -23,7 +23,7 @@ MODULES = [
     "nakagai_edge.edge.audit", "nakagai_edge.edge.client", "nakagai_edge.edge.executor",
     "nakagai_edge.edge.portfolio", "nakagai_edge.edge.preflight", "nakagai_edge.edge.remote",
     "nakagai_edge.edge.runtime", "nakagai_edge.edge.setup", "nakagai_edge.edge.state",
-    "nakagai_edge.edge.sync",
+    "nakagai_edge.edge.supervision", "nakagai_edge.edge.sync",
 ]
 
 

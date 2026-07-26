@@ -5,6 +5,8 @@
     secrets/tokens/     broker OAuth tokens (the gateway's own layout)
     cache/bundle.json   last bundle + fetch metadata
     cache/intents.json  write intents awaiting a platform grant
+    cache/supervised.json    positions the brake watches, and their warrants
+    cache/brake-off.json     local disarm; its presence never needs the network
     results/audit.jsonl local audit journal, shipped in batches
 """
 
@@ -38,6 +40,14 @@ class EdgeState:
     @property
     def intents_path(self) -> Path:
         return self.root / "cache" / "intents.json"
+
+    @property
+    def supervised_path(self) -> Path:
+        return self.root / "cache" / "supervised.json"
+
+    @property
+    def brake_off_path(self) -> Path:
+        return self.root / "cache" / "brake-off.json"
 
     @property
     def audit_path(self) -> Path:
