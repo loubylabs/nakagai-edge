@@ -33,7 +33,19 @@ def test_the_brake_ships_armed(tmp_path):
 
 
 def test_the_owner_can_disarm_it_from_the_platform(tmp_path):
-    assert armed(_state(tmp_path, {"brake_armed": False})) is False
+    # rails-nested, because that is where the platform's mandate.resolved()
+    # puts it and therefore what GET /api/agent/bundle ships. A flat
+    # brake_armed here would pass while the real bundle silently left every
+    # position armed, which is exactly how this drifted the first time.
+    assert armed(_state(tmp_path, {"rails": {"brake_armed": False}})) is False
+
+
+def test_a_flat_brake_armed_is_not_the_dial(tmp_path):
+    """The platform serializes rails under mandate.rails, never at the top
+    level. Reading a flat key would be reading a key no platform sends, so an
+    owner's disarm would be silently ignored: the edge would stay armed, both
+    repos' suites would stay green, and nothing anywhere would fail."""
+    assert armed(_state(tmp_path, {"brake_armed": False})) is True
 
 
 def test_local_disarm_works_with_no_network(tmp_path):

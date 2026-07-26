@@ -141,9 +141,16 @@ def armed(state: EdgeState) -> bool:
     if _disarm_doc(state).get("all"):
         return False
     mandate = (cached_bundle(state) or {}).get("mandate") or {}
+    rails = mandate.get("rails") or {}
     # Absent means armed: the brake ships on, and a platform that predates the
     # dial must not silently leave every position unguarded.
-    return bool(mandate.get("brake_armed", True))
+    #
+    # Read under `rails` and nowhere else, because that is where the platform's
+    # mandate.resolved() puts it and the bundle ships that dict verbatim. A flat
+    # fallback would be a second spelling of the owner's intent, and the two
+    # would drift: a platform sending rails.brake_armed: false against an edge
+    # reading a flat key leaves every position armed, with both suites green.
+    return bool(rails.get("brake_armed", True))
 
 
 def disarmed_positions(state: EdgeState) -> set:
