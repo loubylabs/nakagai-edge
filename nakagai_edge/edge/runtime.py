@@ -215,11 +215,13 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
 
         R is the entry-to-stop distance, so one position's risk is directly
         comparable to another's. `guarded` false means NOTHING will exit that
-        position if its stop is touched. Not gated on policy freshness: an
-        agent needs to see its own open risk most urgently when things are
-        degraded."""
+        position if its stop is touched. A non-empty `ledger_fault` means the
+        ledger itself was lost: an empty position list then says nothing about
+        what the broker is actually holding, so treat everything as unguarded
+        until it is restored. Not gated on policy freshness: an agent needs to
+        see its own open risk most urgently when things are degraded."""
         from nakagai_edge.edge.brake import armed, disarmed_positions
-        from nakagai_edge.edge.supervision import open_risk
+        from nakagai_edge.edge.supervision import ledger_fault, open_risk
         is_armed, off = armed(state), disarmed_positions(state)
         try:
             quotes = await _quotes(hub, state, brake.quote_symbols())
@@ -238,6 +240,7 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         return json.dumps({
             "armed": is_armed,
             "disarmed_positions": sorted(off),
+            "ledger_fault": ledger_fault(state),
             "portfolio_heat": round(heat, 2),
             "positions": rows}, default=str)
 

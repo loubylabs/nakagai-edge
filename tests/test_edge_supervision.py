@@ -5,8 +5,8 @@ import pytest
 
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.supervision import (
-    TERMINAL, claim, held_quantities, is_guarded, load, mark, open_risk,
-    recover_interrupted, reconcile, record, unreadable,
+    TERMINAL, claim, held_quantities, is_guarded, ledger_fault, load, mark,
+    open_risk, recover_interrupted, reconcile, record, unreadable,
 )
 
 # A real warrant carries an epoch float (see warrant.build_warrant_payload),
@@ -57,6 +57,40 @@ def test_a_corrupt_ledger_is_empty_not_an_error(tmp_path):
     state.supervised_path.parent.mkdir(parents=True, exist_ok=True)
     state.supervised_path.write_text("{not json")
     assert load(state) == {}
+
+
+def test_a_corrupt_ledger_is_kept_aside_and_reported(tmp_path):
+    # {} stays the return value: five callers depend on load() never raising,
+    # and a daemon that dies on a bad byte is worse. But {} on a corrupt file
+    # and {} on a fresh one mean opposite things ("no positions" versus "the
+    # brake forgot every position it was watching"), so the difference has to
+    # survive somewhere the owner can see it.
+    state = EdgeState(tmp_path)
+    state.supervised_path.parent.mkdir(parents=True, exist_ok=True)
+    state.supervised_path.write_text("{not json")
+    assert load(state) == {}
+    aside = state.supervised_path.with_name("supervised.corrupt.json")
+    assert aside.read_text() == "{not json", "the bytes stay recoverable"
+    assert "supervised.corrupt.json" in ledger_fault(state)
+
+
+def test_a_ledger_that_parses_to_the_wrong_shape_is_also_reported(tmp_path):
+    state = EdgeState(tmp_path)
+    state.supervised_path.parent.mkdir(parents=True, exist_ok=True)
+    state.supervised_path.write_text('["not", "a", "ledger"]')
+    assert load(state) == {}
+    assert ledger_fault(state)
+
+
+def test_a_healthy_ledger_reports_no_fault(tmp_path):
+    state = EdgeState(tmp_path)
+    record(state, _rec())
+    assert load(state)["ap_1"]["symbol"] == "AAPL"
+    assert ledger_fault(state) == ""
+
+
+def test_an_absent_ledger_reports_no_fault(tmp_path):
+    assert ledger_fault(EdgeState(tmp_path)) == ""
 
 
 def test_marking_changes_state_and_carries_extras(tmp_path):

@@ -280,6 +280,29 @@ async def test_get_open_risk_keeps_terminal_records_out_of_the_heat(tmp_path):
     assert out["portfolio_heat"] == round(live["open_risk"], 2)
 
 
+async def test_get_open_risk_says_so_when_the_ledger_was_lost(tmp_path):
+    """An empty positions list reads as "you have no open risk". After a
+    corrupt ledger it means "the brake forgot every position it was watching",
+    which is the opposite, so the tool has to say which one it is."""
+    state = _state(tmp_path)
+    state.supervised_path.parent.mkdir(parents=True, exist_ok=True)
+    state.supervised_path.write_text("{not json")
+
+    client = PlatformClient("https://api.test", "t",
+                            transport=httpx.MockTransport(lambda r: httpx.Response(500)))
+    audit = EdgeAudit(state)
+    hub = build_hub(state, client)
+    mcp = create_edge_mcp(state, hub, client, audit, _Reporter(),
+                          Brake(state, hub, client, audit))
+
+    result = await mcp.call_tool("get_open_risk", {})
+    text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+    out = json.loads(text)
+
+    assert out["positions"] == []
+    assert "supervised.corrupt.json" in out["ledger_fault"]
+
+
 async def test_get_open_risk_survives_a_dead_quote_feed(tmp_path, monkeypatch):
     """A quote feed that fails outright (not just one connector inside it)
     must not hide the book: an agent needs to see its own open risk most

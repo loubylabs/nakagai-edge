@@ -158,7 +158,14 @@ def set_local_disarm(state: EdgeState, *, all_positions: bool = False,
     if position_id:
         doc["positions"] = sorted(set(doc.get("positions") or []) | {position_id})
     state.brake_off_path.parent.mkdir(parents=True, exist_ok=True)
-    state.brake_off_path.write_text(json.dumps(doc, indent=2))
+    # Temp file plus replace, exactly as supervision.save writes the ledger. A
+    # torn write here is not a lost preference: _disarm_doc reads an
+    # unparseable file as {"all": True}, so a fragment on this path silently
+    # takes the brake off EVERY position, which is the failure this whole
+    # module exists to prevent.
+    tmp = state.brake_off_path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(doc, indent=2))
+    tmp.replace(state.brake_off_path)
 
 
 def clear_local_disarm(state: EdgeState) -> None:

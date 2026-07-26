@@ -37,6 +37,19 @@ def test_brake_status_prints_json(tmp_path, monkeypatch, capsys):
     assert out["positions"] == []
 
 
+def test_brake_status_reports_a_lost_ledger(tmp_path, monkeypatch, capsys):
+    """`positions: []` reads as "nothing open". After a corrupt ledger it means
+    the brake forgot what it was watching, and the terminal has to say so."""
+    monkeypatch.setenv("NAKAGAI_EDGE_ROOT", str(tmp_path))
+    state = EdgeState(tmp_path)
+    state.supervised_path.parent.mkdir(parents=True, exist_ok=True)
+    state.supervised_path.write_text("{not json")
+    assert main(["brake", "status"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["positions"] == []
+    assert "supervised.corrupt.json" in out["ledger_fault"]
+
+
 def test_brake_status_shows_guarded_false_after_brake_off(tmp_path, monkeypatch,
                                                            capsys):
     """Fix round 1: `guarded` must reflect the very disarm this command just

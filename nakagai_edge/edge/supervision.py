@@ -14,27 +14,90 @@ brake at the worst possible moment.
 """
 
 import json
+import logging
 import math
 import time
 
 from nakagai_edge.edge.state import EdgeState
 
+log = logging.getLogger("nakagai.edge")
+
 # States a reconciliation may never move a record out of: the brake has acted or
 # is acting, and only a human (or recover_interrupted) closes those out.
 TERMINAL = ("firing", "fired", "outcome_unknown", "released")
+
+CORRUPT_LEDGER_NAME = "supervised.corrupt.json"
 
 _SYMBOL_KEYS = ("symbol", "ticker", "instrument_symbol")
 _QUANTITY_KEYS = ("quantity", "qty", "shares", "position_size")
 
 
+def _corrupt_path(state: EdgeState):
+    return state.supervised_path.with_name(CORRUPT_LEDGER_NAME)
+
+
+def _set_aside(state: EdgeState, why: str) -> None:
+    """Move an unreadable ledger out of the way, keeping its bytes.
+
+    Two jobs, and the second is the point: the file stays recoverable, and its
+    presence is the record that this happened, which is what `ledger_fault`
+    turns into something the owner can read.
+    """
+    aside = _corrupt_path(state)
+    try:
+        state.supervised_path.replace(aside)
+    except OSError as e:
+        log.warning("the supervised-position ledger is unreadable (%s) and "
+                    "could not be moved aside either: %s", why, e)
+        return
+    log.warning("the supervised-position ledger could not be read (%s); it was "
+                "moved to %s, and every position it held is now unsupervised",
+                why, aside)
+
+
+def ledger_fault(state: EdgeState) -> str:
+    """Empty unless a ledger was set aside, else what happened, in plain words.
+
+    `load()` returning {} cannot say whether this edge has no positions or has
+    forgotten all of them. This is how the callers tell the owner which.
+    """
+    aside = _corrupt_path(state)
+    if not aside.exists():
+        return ""
+    return (f"the supervised-position ledger could not be read and was moved "
+            f"to {aside}: every position it held is no longer supervised, so "
+            f"treat them as unguarded until it is restored. Delete that file "
+            f"to clear this warning.")
+
+
 def load(state: EdgeState) -> dict:
+    """The ledger, or {} when nothing readable is there.
+
+    Never raises: five callers depend on that, and a daemon that dies on a bad
+    byte is worse than one that starts over. The danger is that {} on a corrupt
+    file looks exactly like {} on a fresh one while meaning the opposite ("no
+    positions" against "the brake forgot every position it was watching"), so a
+    file that exists and will not parse is moved aside, which keeps it
+    recoverable and leaves `ledger_fault` something to report.
+    """
     if not state.supervised_path.exists():
         return {}
     try:
         doc = json.loads(state.supervised_path.read_text())
-    except (json.JSONDecodeError, OSError):
+    except json.JSONDecodeError as e:
+        _set_aside(state, f"not JSON: {e}")
         return {}
-    return doc if isinstance(doc, dict) else {}
+    except OSError as e:
+        # Not corruption: the bytes may be perfectly good and simply
+        # unreachable (permissions, a vanished mount), and renaming would as
+        # likely fail. Log it and let the next pass try again.
+        log.warning("the supervised-position ledger could not be opened, so "
+                    "nothing is supervised this pass: %s", e)
+        return {}
+    if not isinstance(doc, dict):
+        _set_aside(state, f"parsed as {type(doc).__name__}, not a ledger")
+        return {}
+    return doc
 
 
 def save(state: EdgeState, doc: dict) -> None:
