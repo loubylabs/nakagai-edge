@@ -63,3 +63,40 @@ def test_the_exit_is_none_without_declared_market_arguments():
 
 def test_the_exit_is_none_for_a_nested_entry():
     assert exit_order_args(SHAPE, {"order": dict(ENTRY)}, 40.0) is None
+
+
+def test_the_exit_is_none_when_market_args_collide_with_a_side_key():
+    # A market declaration that names its own "side" key is misconfigured:
+    # resolving the collision either way is a guess about a live order.
+    shape = SHAPE.model_copy(update={"market_order_args": {
+        "order_type": "market", "side": "buy"}})
+    assert exit_order_args(shape, ENTRY, 40.0) is None
+
+
+def test_the_exit_is_none_when_market_args_collide_with_a_quantity_key():
+    shape = SHAPE.model_copy(update={"market_order_args": {
+        "order_type": "market", "quantity": 999}})
+    assert exit_order_args(shape, ENTRY, 40.0) is None
+
+
+def test_every_side_alias_is_replaced_not_just_the_one_read():
+    # `side` is a present-but-null alias ahead of `action` in side_keys, so
+    # read_entry resolves through "action". The exit must not leave a stale
+    # "side": None sitting beside the flipped "action".
+    shape = SHAPE.model_copy(update={"side_keys": ["side", "action"]})
+    args = dict(ENTRY)
+    args["side"] = None
+    args["action"] = "buy"
+    result = exit_order_args(shape, args, 40.0)
+    assert result["action"] == "sell"
+    assert "side" not in result
+
+
+def test_every_quantity_alias_is_replaced_not_just_the_one_read():
+    shape = SHAPE.model_copy(update={"quantity_keys": ["quantity", "qty"]})
+    args = dict(ENTRY)
+    args["quantity"] = None
+    args["qty"] = 100
+    result = exit_order_args(shape, args, 40.0)
+    assert result["qty"] == 40.0
+    assert "quantity" not in result

@@ -174,11 +174,20 @@ def exit_order_args(shape, entry_args: dict, qty: float) -> dict | None:
     side = closing_side(shape, entry["side"])
     if not side:
         return None
+    # A connector whose market declaration collides with its own side or
+    # quantity field is misconfigured. Resolving that collision either way
+    # would be a guess about an order bound for a real brokerage, so refuse.
+    aliases = set(shape.side_keys) | set(shape.quantity_keys)
+    if aliases & set(shape.market_order_args):
+        return None
     side_key = _at(entry_args, shape.side_keys)
     qty_key = _at(entry_args, shape.quantity_keys)
-    drop = set(shape.price_keys) | set(shape.stop_keys)
+    # Strip EVERY side and quantity alias, not just the one `_at` picked: an
+    # unused alias sitting in the entry payload would otherwise ride along
+    # beside the flipped one and leave the broker two answers.
+    drop = set(shape.price_keys) | set(shape.stop_keys) | aliases
     args = {k: v for k, v in entry_args.items() if k not in drop}
+    args.update(shape.market_order_args)
     args[side_key] = side
     args[qty_key] = float(qty)
-    args.update(shape.market_order_args)
     return args
