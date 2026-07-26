@@ -1,9 +1,11 @@
 """Renewal exists to defeat expiry. It may narrow a warrant's authority or
 extend its clock; it may NEVER widen it."""
 
+import pytest
+
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.supervision import (
-    apply_renewals, load, record, renewal_request,
+    TERMINAL, apply_renewals, load, record, renewal_request,
 )
 
 
@@ -99,3 +101,67 @@ def test_apply_renewals_refuses_to_arm_an_unclassifiable_position(tmp_path):
     row = load(state)["ap_1"]
     assert row["state"] == "unguarded"
     assert row["warrant"] is None
+
+
+# ---- fix round 1: a non-finite ceiling must never widen a warrant --------
+#
+# NaN and the infinities parse cleanly through float() and are truthy, so a
+# bare `> entry_qty` bound (round 1's version of this check) lets both
+# through and then silently disables every downstream ceiling check:
+# brake.fire()'s clamp (`min(held, nan)` is `held`) and warrant.authorizes()'s
+# `qty > ceiling` (always False against a NaN ceiling). Both of those carry
+# their own regression coverage; these two pin the first line of defense.
+
+def test_a_nan_ceiling_is_refused_and_the_existing_warrant_survives(tmp_path):
+    state = EdgeState(tmp_path)
+    record(state, _rec())
+    apply_renewals(state, {"ap_1": {"grant_id": "wr_2", "max_qty": float("nan"),
+                                    "expires_at": 99999.0}})
+    assert load(state)["ap_1"]["warrant"]["grant_id"] == "wr_1"
+
+
+def test_a_negative_infinite_ceiling_is_refused_and_the_existing_warrant_survives(tmp_path):
+    # -inf is the mirror failure: it would replace a working warrant with one
+    # that can never authorize anything, so the position reports guarded:
+    # True while its brake is permanently dead. Refuse it, same as NaN.
+    state = EdgeState(tmp_path)
+    record(state, _rec())
+    apply_renewals(state, {"ap_1": {"grant_id": "wr_2", "max_qty": float("-inf"),
+                                    "expires_at": 99999.0}})
+    assert load(state)["ap_1"]["warrant"]["grant_id"] == "wr_1"
+
+
+def test_a_batch_with_one_malformed_entry_still_applies_the_other(tmp_path):
+    # A non-dict warrant value raises AttributeError out of `warrant.get(...)`
+    # unless guarded. One caller's bad shape must cost only its own position,
+    # not every other renewal riding in the same batch.
+    state = EdgeState(tmp_path)
+    record(state, _rec())
+    record(state, _rec(position_id="ap_2", symbol="MSFT"))
+    apply_renewals(state, {
+        "ap_1": "not-a-warrant",
+        "ap_2": {"grant_id": "wr_2", "max_qty": 50.0, "expires_at": 99999.0},
+    })
+    doc = load(state)
+    assert doc["ap_1"]["warrant"]["grant_id"] == "wr_1"   # untouched
+    assert doc["ap_2"]["warrant"]["grant_id"] == "wr_2"   # applied
+
+
+def test_a_warrants_batch_that_is_a_list_is_survived_without_raising(tmp_path):
+    state = EdgeState(tmp_path)
+    record(state, _rec())
+    apply_renewals(state, [{"grant_id": "wr_2"}])   # must not raise
+    assert load(state)["ap_1"]["warrant"]["grant_id"] == "wr_1"
+
+
+@pytest.mark.parametrize("terminal_state", TERMINAL)
+def test_a_terminal_position_refuses_an_unsolicited_renewal(tmp_path, terminal_state):
+    # renewal_request already keeps the edge from ASKING about a terminal
+    # position (covered above); this is the second, independent line of
+    # defense -- against a buggy or compromised platform answering for a
+    # position it was never asked about.
+    state = EdgeState(tmp_path)
+    record(state, _rec(state=terminal_state))
+    apply_renewals(state, {"ap_1": {"grant_id": "wr_2", "max_qty": 60.0,
+                                    "expires_at": 99999.0}})
+    assert load(state)["ap_1"]["warrant"]["grant_id"] == "wr_1"

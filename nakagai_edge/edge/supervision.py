@@ -14,6 +14,7 @@ brake at the worst possible moment.
 """
 
 import json
+import math
 import time
 
 from nakagai_edge.edge.state import EdgeState
@@ -255,7 +256,12 @@ def apply_renewals(state: EdgeState, warrants: dict) -> dict:
     more than the entry ever bought.
     """
     doc = load(state)
-    for position_id, warrant in (warrants or {}).items():
+    if not isinstance(warrants, dict):
+        # A malformed batch (a list, a string, ...) must cost every position
+        # nothing: this is the same posture as one bad entry below, just at
+        # the level of the whole payload instead of one item in it.
+        return doc
+    for position_id, warrant in warrants.items():
         rec = doc.get(position_id)
         if rec is None or rec.get("state") in TERMINAL:
             continue
@@ -267,10 +273,20 @@ def apply_renewals(state: EdgeState, warrants: dict) -> dict:
             # "armed" would make open_risk report guarded: True for a
             # position that can never actually be exited.
             continue
+        if not isinstance(warrant, dict):
+            continue          # one malformed entry must cost only itself
         try:
-            if float(warrant.get("max_qty")) > float(rec["entry_qty"]):
-                continue
+            ceiling = float(warrant.get("max_qty"))
         except (TypeError, ValueError):
+            continue
+        # NaN and the infinities parse cleanly through float() and are truthy,
+        # and every NaN comparison is False, so a bare `> entry_qty` bound lets
+        # them through and then silently disables every downstream ceiling
+        # check (brake.fire()'s clamp, warrant.authorizes()'s comparison).
+        # gateway/envelope.py rejects them at the read for the same reason. A
+        # ceiling must be a real, non-negative number no larger than what the
+        # entry actually bought.
+        if not (math.isfinite(ceiling) and 0 <= ceiling <= float(rec["entry_qty"])):
             continue
         rec["warrant"] = warrant
         if rec.get("state") == "unguarded":

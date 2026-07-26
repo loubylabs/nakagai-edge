@@ -12,6 +12,7 @@ Pure: no I/O, no state, no clock of its own. Same posture as guardrails.py and
 the platform's envelope.py, so the safety story is testable without a network.
 """
 
+import math
 import time
 
 from nakagai_edge.signing import verify_artifact
@@ -99,6 +100,13 @@ def authorizes(public_key: str, warrant: dict, exit_order: dict, *,
         held = float(held_qty)
     except (TypeError, ValueError):
         return "exit quantity is not a number"
+    if not (math.isfinite(ceiling) and ceiling >= 0):
+        # A ceiling that cannot be compared is not a ceiling: every NaN
+        # comparison is False, so `qty > ceiling` never trips and the check
+        # below silently no-ops, and +inf compares as larger than any real
+        # qty and so authorizes anything. Refuse it outright rather than let
+        # a malformed max_qty masquerade as an unbounded warrant.
+        return "warrant ceiling is not a usable number"
     if not qty > 0:
         return "exit quantity is not positive"
     if qty > ceiling:

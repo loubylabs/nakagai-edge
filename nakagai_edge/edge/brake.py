@@ -17,6 +17,7 @@ price may be believed lives here where it can be tested exhaustively.
 
 import json
 import logging
+import math
 
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.supervision import claim, load, mark
@@ -337,7 +338,25 @@ class Brake:
 
         spec = self.hub.spec(rec["connector_id"])
         warrant = rec.get("warrant") or {}
-        qty = min(float(held), float(warrant.get("max_qty") or 0.0))
+        try:
+            ceiling = float(warrant.get("max_qty"))
+        except (TypeError, ValueError):
+            ceiling = float("nan")
+        if not (math.isfinite(ceiling) and ceiling >= 0):
+            # `min(held, nan)` returns `held` (every NaN comparison is False),
+            # and the old `... or 0.0` fallback only ever caught a falsy
+            # max_qty, never a NaN one (NaN is truthy): either way the clamp
+            # that is supposed to bound this sale would silently stop
+            # bounding it. authorizes() below refuses a bad ceiling too, but
+            # refusing here, before a size is even computed, names the exact
+            # reason instead of failing later on a mismatch this didn't cause.
+            why_not = "warrant ceiling is not a usable number"
+            self.audit.record("denial", rec["connector_id"], "brake",
+                              {"position_id": pid, "reason": why_not})
+            self._notify(f"The brake could not exit {rec['symbol']}: {why_not}. "
+                         f"That position is unguarded.")
+            return why_not
+        qty = min(float(held), ceiling)
         args = exit_order_args(spec.guardrails.order_shape,
                                rec.get("entry_args") or {}, qty)
         if args is None:

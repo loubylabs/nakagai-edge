@@ -341,6 +341,36 @@ async def test_the_owner_hears_when_the_broker_will_not_confirm_the_position(tmp
     assert "denial" in kinds
 
 
+# ---- fix round 2: a non-finite warrant ceiling must never widen a sale ---
+#
+# `min(held, nan)` returns `held` (every NaN comparison is False), so a NaN
+# max_qty would otherwise remove the ceiling entirely for that sale. This is
+# the earliest of three layers now guarding against it (fire()'s clamp,
+# warrant.authorizes()'s comparison, supervision.apply_renewals's intake);
+# see tests/test_warrant.py and tests/test_edge_warrant_renewal.py for the
+# other two.
+
+async def test_fire_refuses_a_nan_warrant_ceiling(tmp_path):
+    hub = FakeHub(held=500.0)
+    state, client, brake = _brake(tmp_path, hub)
+    record(state, _rec(warrant=_warrant(max_qty=float("nan"))))
+    reason = await brake.fire(load(state)["ap_1"])
+    assert "not a usable number" in reason
+    assert [c[0] for c in hub.calls] == ["get_equity_positions"]
+    assert load(state)["ap_1"]["state"] == "armed"
+    assert client.messages, "the owner must hear the position is unguarded"
+
+
+async def test_fire_refuses_a_negative_infinite_warrant_ceiling(tmp_path):
+    hub = FakeHub(held=500.0)
+    state, client, brake = _brake(tmp_path, hub)
+    record(state, _rec(warrant=_warrant(max_qty=float("-inf"))))
+    reason = await brake.fire(load(state)["ap_1"])
+    assert "not a usable number" in reason
+    assert [c[0] for c in hub.calls] == ["get_equity_positions"]
+    assert load(state)["ap_1"]["state"] == "armed"
+
+
 async def test_the_owner_hears_when_the_connector_cannot_express_an_exit(tmp_path):
     hub = NoMarketExitHub()
     state, client, brake = _brake(tmp_path, hub)

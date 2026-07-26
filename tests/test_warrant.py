@@ -123,6 +123,22 @@ def test_the_exit_may_not_exceed_the_warrant_ceiling():
                             held_qty=500.0)
 
 
+def test_a_nan_ceiling_is_refused_outright():
+    # NaN parses cleanly through float() and every comparison against it is
+    # False, so `qty > ceiling` would never trip and silently wave the exit
+    # through instead of bounding it. This must be caught before that
+    # comparison ever runs.
+    assert "not a usable number" in _ok(_warrant(max_qty=float("nan")),
+                                        _exit(qty=1.0), held_qty=500.0)
+
+
+def test_an_infinite_ceiling_is_refused_outright():
+    # +inf compares as larger than any real qty, so it would authorize any
+    # size at all rather than bound it.
+    assert "not a usable number" in _ok(_warrant(max_qty=float("inf")),
+                                        _exit(qty=1.0), held_qty=500.0)
+
+
 def test_the_exit_may_not_exceed_what_is_actually_held():
     assert "held" in _ok(_warrant(max_qty=100.0), _exit(qty=100.0),
                          held_qty=40.0)
