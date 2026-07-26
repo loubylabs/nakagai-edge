@@ -113,3 +113,12 @@ class PlatformClient:
     def ship_audit(self, events: list[dict]) -> dict:
         return self._check(self._client.post("/api/agent/audit",
                                              json={"events": events}))
+
+    def renew_warrants(self, positions: list[dict]) -> dict:
+        # Warrants expire in 24h so a stolen one dies quickly; the edge
+        # re-asks on its ordinary sync cadence and the platform re-signs what
+        # it still recognizes. This is also the channel that will later carry
+        # recomputed trailing-stop levels, which is why it posts positions
+        # rather than just ids.
+        return self._check(self._client.post("/api/agent/warrants",
+                                             json={"positions": positions}))

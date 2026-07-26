@@ -227,6 +227,58 @@ def reconcile(state: EdgeState, portfolio_doc: dict) -> dict:
     return doc
 
 
+def renewal_request(state: EdgeState) -> list[dict]:
+    """What the platform needs to re-sign this edge's live warrants.
+
+    Excludes any record whose direction is not exactly "long" or "short": that
+    shape means the entry side (or account) could not be classified, so the
+    edge can never safely act on it regardless of what warrant it holds.
+    Asking the platform to re-sign a warrant that can never be used is
+    pointless traffic.
+    """
+    return [{"position_id": rec["position_id"],
+             "connector_id": rec["connector_id"], "account": rec["account"],
+             "symbol": rec["symbol"],
+             "confirmed_qty": float(rec.get("confirmed_qty", 0.0)),
+             "signal_id": rec.get("signal_id", "")}
+            for rec in load(state).values()
+            if rec.get("state") in ("armed", "unguarded")
+            and rec.get("direction") in ("long", "short")]
+
+
+def apply_renewals(state: EdgeState, warrants: dict) -> dict:
+    """Fold refreshed warrants into the ledger.
+
+    A renewal may narrow a warrant or extend its clock. It may NEVER widen the
+    ceiling: the entry quantity is the hard bound, and a platform bug (or a
+    compromised platform) must not be able to hand this edge authority to sell
+    more than the entry ever bought.
+    """
+    doc = load(state)
+    for position_id, warrant in (warrants or {}).items():
+        rec = doc.get(position_id)
+        if rec is None or rec.get("state") in TERMINAL:
+            continue
+        if rec.get("direction") not in ("long", "short"):
+            # Unguarded because the edge cannot act on this record at all (see
+            # renewal_request above), not because a warrant was missing: no
+            # warrant, however well-formed, makes closing_side() stop
+            # returning "" for an unclassifiable side. Promoting it to
+            # "armed" would make open_risk report guarded: True for a
+            # position that can never actually be exited.
+            continue
+        try:
+            if float(warrant.get("max_qty")) > float(rec["entry_qty"]):
+                continue
+        except (TypeError, ValueError):
+            continue
+        rec["warrant"] = warrant
+        if rec.get("state") == "unguarded":
+            rec["state"] = "armed"
+    save(state, doc)
+    return doc
+
+
 def open_risk(state: EdgeState, prices: dict) -> list[dict]:
     """Every supervised position, with its risk expressed in R.
 

@@ -22,7 +22,10 @@ from nakagai_edge.edge.executor import poll_once
 from nakagai_edge.edge.portfolio import PORTFOLIO_INTERVAL_S, PortfolioReporter
 from nakagai_edge.edge.remote import RemoteApprovalQueue
 from nakagai_edge.edge.state import EdgeState
-from nakagai_edge.edge.supervision import load as load_positions, reconcile, recover_interrupted
+from nakagai_edge.edge.supervision import (
+    apply_renewals, load as load_positions, reconcile, recover_interrupted,
+    renewal_request,
+)
 from nakagai_edge.edge.sync import POLICY_TTL_S, SYNC_INTERVAL_S, policy_fresh, sync_once
 
 EXECUTOR_INTERVAL_S = 5
@@ -260,6 +263,19 @@ async def _loops(state: EdgeState, hub, client: PlatformClient, audit: EdgeAudit
                 logging.getLogger("nakagai.edge").warning(
                     "connector status not reported to the platform this "
                     "cycle: %s", e)
+            try:
+                # Warrants expire in 24h; a position held longer needs this to
+                # keep its exit authority alive. A platform without the
+                # endpoint 404s here, which is a non-event: existing warrants
+                # keep working until they expire, and a failed renewal
+                # disarms nothing, so this logs at debug rather than warning.
+                ask = renewal_request(state)
+                if ask:
+                    out = await asyncio.to_thread(client.renew_warrants, ask)
+                    apply_renewals(state, out.get("warrants") or {})
+            except Exception as e:  # noqa: BLE001
+                logging.getLogger("nakagai.edge").debug(
+                    "warrants not renewed this cycle: %s", e)
             await asyncio.sleep(SYNC_INTERVAL_S)
 
     async def executor():
