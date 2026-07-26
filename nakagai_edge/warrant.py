@@ -43,7 +43,8 @@ def breached(trigger: dict, price: float) -> bool:
     try:
         kind = (trigger or {}).get("kind")
         level = float((trigger or {}).get("level"))
-    except (TypeError, ValueError):
+        price = float(price)
+    except (TypeError, ValueError, AttributeError):
         return False
     if kind == TRIGGER_BELOW:
         return price <= level
@@ -63,6 +64,8 @@ def authorizes(public_key: str, warrant: dict, exit_order: dict, *,
     now = time.time() if now is None else now
     if not isinstance(warrant, dict):
         return "no warrant"
+    if not isinstance(exit_order, dict):
+        return "no exit order"
     if not verify_artifact(public_key, warrant):
         return "signature verification failed"
     if warrant.get("kind") != WARRANT_KIND:
@@ -81,6 +84,8 @@ def authorizes(public_key: str, warrant: dict, exit_order: dict, *,
 
     if exit_order.get("connector_id") != warrant.get("connector_id"):
         return "connector mismatch"
+    if exit_order.get("account") != warrant.get("account"):
+        return "account mismatch"
     if exit_order.get("tool") != warrant.get("tool"):
         return "tool mismatch"
     if str(exit_order.get("symbol", "")).upper() != warrant.get("symbol"):

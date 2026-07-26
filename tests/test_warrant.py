@@ -29,9 +29,9 @@ def _warrant(*, max_qty=100.0, level=46.20, ttl_s=86400, agent_id="ag1",
 
 
 def _exit(qty=100.0, symbol="AAPL", side="sell", tool="place_equity_order",
-          connector_id="demo"):
+          connector_id="demo", account="463605220"):
     return {"connector_id": connector_id, "tool": tool, "symbol": symbol,
-            "side": side, "qty": qty}
+            "side": side, "qty": qty, "account": account}
 
 
 def _ok(warrant, exit_order, *, held_qty=100.0, spent=False, agent_id="ag1"):
@@ -68,6 +68,24 @@ def test_an_unreadable_trigger_never_fires():
     # arbitrary exit. The caller alerts instead.
     assert breached({"kind": "sideways", "level": 46.20}, 1.0) is False
     assert breached({}, 1.0) is False
+    assert breached("garbage", 1.0) is False
+    assert breached([1, 2, 3], 1.0) is False
+
+
+def test_a_string_price_that_crosses_the_level_still_breaches():
+    # A quote crossing from a broker or the platform can arrive as a string;
+    # the comparison must not require the caller to have already parsed it.
+    trigger = {"kind": TRIGGER_BELOW, "level": 46.20}
+    assert breached(trigger, "46.19") is True
+
+
+def test_an_unparseable_price_never_fires():
+    trigger = {"kind": TRIGGER_BELOW, "level": 46.20}
+    assert breached(trigger, "not-a-number") is False
+
+
+def test_a_malformed_exit_order_is_refused():
+    assert "exit order" in _ok(_warrant(), None)
 
 
 def test_a_tampered_warrant_is_refused():
@@ -120,6 +138,7 @@ def test_a_zero_or_negative_exit_is_refused():
     ("side", "buy", "side"),
     ("tool", "place_option_order", "tool"),
     ("connector_id", "other", "connector"),
+    ("account", "999", "account"),
 ])
 def test_the_exit_must_match_the_warrant(field, value, expected):
     order = _exit()
