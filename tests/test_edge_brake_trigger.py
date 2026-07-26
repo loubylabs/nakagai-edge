@@ -84,7 +84,15 @@ def test_bid_zero_and_ask_ten_is_refused_for_spread():
     assert "spread" in usable(_q(bid=0.0, ask=10.0), 46.50, NOW)
 
 
-def test_prior_price_of_zero_behaves_as_no_prior():
-    # prior_price=0.0 should be treated as no prior, so an otherwise sane
-    # quote is usable, and the jump check does not run.
-    assert usable(_q(), 0.0, NOW) == ""
+def test_a_zero_prior_is_treated_as_absent_and_never_divides_by_zero():
+    # This test pins documented semantics: prior_price=0.0 is treated as no
+    # prior (same as None), and the jump check does not run. It also guards
+    # against a future edit that might drop the > 0 clause, which would cause
+    # abs(price - 0) / 0 * 100 to raise ZeroDivisionError inside the one
+    # function whose entire job is to never let a bad input through. The test
+    # cannot discriminate this round's change from pre-fix code (both skip
+    # 0.0), but it guards the regression where the guard is removed.
+    result = usable(_q(), 0.0, NOW)
+    assert result == ""
+    # Confirm no exception is raised.
+    assert isinstance(result, str)
