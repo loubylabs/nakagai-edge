@@ -3,8 +3,8 @@ drift case must resolve toward a SMALLER exit than before."""
 
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.supervision import (
-    held_quantities, load, mark, open_risk, recover_interrupted, reconcile,
-    record, unreadable,
+    claim, held_quantities, load, mark, open_risk, recover_interrupted,
+    reconcile, record, unreadable,
 )
 
 
@@ -58,6 +58,27 @@ def test_marking_changes_state_and_carries_extras(tmp_path):
     row = load(state)["ap_1"]
     assert row["state"] == "fired"
     assert row["fired_at"] == 99.0
+
+
+def test_claim_moves_a_matching_record_and_reports_success(tmp_path):
+    state = EdgeState(tmp_path)
+    record(state, _rec())
+    assert claim(state, "ap_1", expected="armed", new="firing") is True
+    assert load(state)["ap_1"]["state"] == "firing"
+
+
+def test_claim_refuses_when_the_state_has_already_moved(tmp_path):
+    # The whole point of claim(): a second caller racing to move the same
+    # record loses rather than silently overwriting the first caller's claim.
+    state = EdgeState(tmp_path)
+    record(state, _rec())
+    assert claim(state, "ap_1", expected="armed", new="firing") is True
+    assert claim(state, "ap_1", expected="armed", new="firing") is False
+    assert load(state)["ap_1"]["state"] == "firing"
+
+
+def test_claim_refuses_on_an_unknown_position(tmp_path):
+    assert claim(EdgeState(tmp_path), "nope", expected="armed", new="firing") is False
 
 
 def test_held_quantities_are_keyed_by_connector_account_and_symbol():

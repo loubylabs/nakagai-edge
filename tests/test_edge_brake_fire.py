@@ -7,6 +7,8 @@ a signed artifact rather than from cached policy, and because reducing exposure
 is the safe direction.
 """
 
+import asyncio
+
 import pytest
 
 pytest.importorskip("cryptography")
@@ -87,6 +89,34 @@ class NoQtyKeyHub(FakeHub):
         if self.fail is not None:
             raise self.fail
         return {"is_error": False, "data": {"order_id": "42"}}
+
+
+NO_MARKET_SHAPE = OrderShape(
+    symbol_keys=["symbol"], side_keys=["side"], quantity_keys=["quantity"],
+    price_keys=["limit_price"], stop_keys=["stop_price"],
+    stock_tools=["place_equity_order"])  # no market_order_args declared
+
+
+class NoMarketExitHub(FakeHub):
+    """A connector that never declared how to say "market order"."""
+
+    def __init__(self, held=100.0, fail=None):
+        super().__init__(held=held, fail=fail)
+        self._spec = ConnectorSpec(
+            id="demo", kind="mcp-http", role="broker",
+            guardrails=GuardrailsConfig(order_shape=NO_MARKET_SHAPE))
+
+
+class RacingHub(FakeHub):
+    """FakeHub's call() never actually suspends, so two gathered coroutines
+    calling it run fully sequentially -- no interleaving, no race, whether or
+    not the one-shot guard is atomic. A real await point here is what forces
+    genuine interleaving between two concurrent fire() calls, which is what
+    the one-shot claim must survive."""
+
+    async def call(self, connector_id, tool, args, **kw):
+        await asyncio.sleep(0)
+        return await super().call(connector_id, tool, args, **kw)
 
 
 class FakeClient:
@@ -274,3 +304,51 @@ async def test_a_symbol_row_with_no_recognizable_quantity_key_does_not_release(t
     assert "not firing blind" in reason
     assert [c[0] for c in hub.calls] == ["get_equity_positions"]
     assert load(state)["ap_1"]["state"] == "armed"
+
+
+# ---- fix round 1: one-shot under concurrency, and loud refusals ----------
+
+
+async def test_two_concurrent_fires_place_only_one_order(tmp_path):
+    # Two coroutines, each holding its OWN independently-loaded snapshot of
+    # the same armed record -- exactly the shape a future runtime loop and a
+    # manually-triggered pass could produce together. Only an atomic claim on
+    # the disk state (not the in-memory `armed` each coroutine already read)
+    # can stop the second one from also reaching the broker.
+    hub = RacingHub()
+    state, client, brake = _brake(tmp_path, hub)
+    record(state, _rec())
+    rec_a, rec_b = load(state)["ap_1"], load(state)["ap_1"]
+    results = await asyncio.gather(brake.fire(rec_a), brake.fire(rec_b))
+    placed = [c for c in hub.calls if c[0] == "place_equity_order"]
+    assert len(placed) == 1, f"expected exactly one live order, placed {len(placed)}"
+    assert "" in results, "one of the two calls must still have succeeded"
+    losers = [r for r in results if r]
+    assert losers and "already claimed" in losers[0]
+    assert load(state)["ap_1"]["state"] == "fired"
+
+
+async def test_the_owner_hears_when_the_broker_will_not_confirm_the_position(tmp_path):
+    # held is None is the worst case in the module: the stop may have just
+    # been touched and the brake is choosing not to act, so silence here is
+    # not caution, it is a position nobody is told about.
+    hub = MalformedPositionsHub()
+    state, client, brake = _brake(tmp_path, hub)
+    record(state, _rec())
+    await brake.fire(load(state)["ap_1"])
+    assert client.messages, "the owner must hear the position is unguarded"
+    kinds = [e["kind"] for e in brake.audit.pending()]
+    assert "denial" in kinds
+
+
+async def test_the_owner_hears_when_the_connector_cannot_express_an_exit(tmp_path):
+    hub = NoMarketExitHub()
+    state, client, brake = _brake(tmp_path, hub)
+    record(state, _rec())
+    reason = await brake.fire(load(state)["ap_1"])
+    assert "cannot express a market exit" in reason
+    assert [c[0] for c in hub.calls] == ["get_equity_positions"]
+    assert load(state)["ap_1"]["state"] == "armed"
+    assert client.messages, "the owner must hear the position is unguarded"
+    kinds = [e["kind"] for e in brake.audit.pending()]
+    assert "denial" in kinds

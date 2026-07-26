@@ -59,6 +59,24 @@ def mark(state: EdgeState, position_id: str, new_state: str, **extra) -> None:
     save(state, doc)
 
 
+def claim(state: EdgeState, position_id: str, *, expected: str, new: str) -> bool:
+    """Atomically move a record from `expected` to `new`, or refuse.
+
+    Synchronous on purpose, with no await points anywhere inside it: asyncio
+    cannot interleave two callers within a synchronous function, so a second
+    concurrent claim on the same position loses the race and is refused rather
+    than placing a second live order. `mark()` cannot do this job, because
+    load-mutate-save lets both callers read `armed` before either writes.
+    """
+    doc = load(state)
+    rec = doc.get(position_id)
+    if rec is None or rec.get("state") != expected:
+        return False
+    rec["state"] = new
+    save(state, doc)
+    return True
+
+
 def recover_interrupted(state: EdgeState) -> list[str]:
     """Close out any exit that was in flight when the process died.
 

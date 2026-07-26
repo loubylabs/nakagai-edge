@@ -18,7 +18,7 @@ price may be believed lives here where it can be tested exhaustively.
 import logging
 
 from nakagai_edge.edge.state import EdgeState
-from nakagai_edge.edge.supervision import mark
+from nakagai_edge.edge.supervision import claim, mark
 from nakagai_edge.edge.sync import public_key
 from nakagai_edge.warrant import authorizes, exit_order_args
 
@@ -212,7 +212,16 @@ class Brake:
 
         held = await self._held_now(rec)
         if held is None:
-            return "the broker would not confirm the position; not firing blind"
+            # Over-refusal here is real harm, not caution: the stop was just
+            # touched and the brake is declining to act on it, so the owner
+            # must hear that exactly as loudly as any other unguarded moment.
+            why_not = "the broker would not confirm the position; not firing blind"
+            self.audit.record("denial", rec["connector_id"], "brake",
+                              {"position_id": pid, "reason": why_not})
+            self._notify(f"The brake could not confirm {rec['symbol']} with the "
+                         f"broker and did NOT fire. That position is unguarded "
+                         f"until the next pass can read it.")
+            return why_not
         if held <= 0:
             mark(self.state, pid, "released", confirmed_qty=0.0)
             return "the position is no longer held"
@@ -223,7 +232,12 @@ class Brake:
         args = exit_order_args(spec.guardrails.order_shape,
                                rec.get("entry_args") or {}, qty)
         if args is None:
-            return "this connector cannot express a market exit"
+            why_not = "this connector cannot express a market exit"
+            self.audit.record("denial", rec["connector_id"], "brake",
+                              {"position_id": pid, "reason": why_not})
+            self._notify(f"The brake could not build an exit for {rec['symbol']}: "
+                         f"{why_not}. That position is unguarded.")
+            return why_not
 
         # Verify the order about to reach the broker, not a restatement of
         # the ledger's own assumptions. Reading the fields back out of `args`
@@ -253,8 +267,15 @@ class Brake:
             return why_not
 
         # One shot: spend the warrant BEFORE the call, so a crash mid-flight
-        # can never produce a second exit on restart.
-        mark(self.state, pid, "firing")
+        # can never produce a second exit on restart. A compare-and-swap, not
+        # a plain mark(): two concurrent passes can both load this record as
+        # `armed` and both pass authorizes() above (spent=False either way),
+        # so only an atomic claim on the state transition itself stops a
+        # second live order. After verification, not before it: claiming
+        # first would strand the record in `firing` whenever verification
+        # then failed.
+        if not claim(self.state, pid, expected="armed", new="firing"):
+            return f"position {pid} was already claimed by another pass"
         try:
             result = await self.hub.call(rec["connector_id"], warrant["tool"],
                                          args, approved=True)
