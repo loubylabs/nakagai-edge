@@ -53,7 +53,8 @@ def build_hub(state: EdgeState, client: PlatformClient):
     return ConnectorHub(state.root, approvals=queue)
 
 
-def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAudit, reporter):
+def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAudit,
+                    reporter, brake: Brake):
     from mcp.server.fastmcp import FastMCP
 
     mcp = FastMCP("nakagai-edge")
@@ -197,6 +198,29 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
             return json.dumps(await reporter.snapshot_and_push(), default=str)
         except Exception as e:  # noqa: BLE001 (tool surface: report, don't crash)
             return json.dumps({"is_error": True, "error": str(e)})
+
+    @mcp.tool()
+    async def get_open_risk() -> str:
+        """Every position this edge is supervising, with its risk in R.
+
+        R is the entry-to-stop distance, so one position's risk is directly
+        comparable to another's. `guarded` false means NOTHING will exit that
+        position if its stop is touched. Not gated on policy freshness: an
+        agent needs to see its own open risk most urgently when things are
+        degraded."""
+        from nakagai_edge.edge.brake import armed, disarmed_positions
+        from nakagai_edge.edge.supervision import open_risk
+        try:
+            quotes = await _quotes(hub, state, brake.quote_symbols())
+            prices = {symbol: q["price"] for symbol, q in quotes.items()}
+        except Exception:  # noqa: BLE001 (a dead quote feed must not hide the book)
+            prices = {}
+        rows = open_risk(state, prices)
+        return json.dumps({
+            "armed": armed(state),
+            "disarmed_positions": sorted(disarmed_positions(state)),
+            "portfolio_heat": round(sum(r["open_risk"] for r in rows), 2),
+            "positions": rows}, default=str)
 
     return mcp
 
@@ -353,7 +377,7 @@ def run(root, port: int = 8330) -> None:
         audit.record("error", "", "brake",
                      {"position_id": pid,
                       "error": "exit in flight when the edge stopped"})
-    mcp = create_edge_mcp(state, hub, client, audit, reporter)
+    mcp = create_edge_mcp(state, hub, client, audit, reporter, brake)
     mcp.settings.host, mcp.settings.port = "127.0.0.1", port
 
     async def main():

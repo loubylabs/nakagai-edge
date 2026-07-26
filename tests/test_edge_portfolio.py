@@ -11,7 +11,9 @@ import yaml
 from nakagai_edge.edge.client import PlatformClient
 from nakagai_edge.edge.portfolio import (
     PORTFOLIO_INTERVAL_S, REFRESH_MIN_INTERVAL_S, PortfolioReporter,
-    broker_specs, connector_snapshot, tiered_accounts)
+    broker_specs, connector_snapshot, mark_guarded, tiered_accounts)
+from nakagai_edge.edge.state import EdgeState
+from nakagai_edge.edge.supervision import record
 from nakagai_edge.config import ConnectorSpec
 
 pytestmark = pytest.mark.anyio
@@ -127,6 +129,51 @@ async def test_a_dead_get_accounts_degrades_to_a_connector_level_error():
     assert entry["accounts"] == []
 
 
+# ---- the guarded marker ---------------------------------------------------
+
+def _supervised(edge_state, **ledger_fields):
+    rec = {"position_id": "ap_1", "symbol": "SPY", "connector_id": "robinhood-trading",
+           "account": "463605220", "direction": "long", "entry_price": 480.0,
+           "stop": 460.0, "entry_qty": 10.0, "confirmed_qty": 10.0,
+           "state": "armed", "warrant": {"trigger": {"type": "price_below",
+                                                      "level": 460.0}}}
+    rec.update(ledger_fields)
+    record(edge_state, rec)
+
+
+def _connectors_with_one_position():
+    return [{"id": "robinhood-trading", "error": "", "accounts": [
+        {"account_number": "463605220", "positions": [{"symbol": "SPY"}]}]}]
+
+
+def test_mark_guarded_tags_an_armed_warranted_position(tmp_path):
+    state = EdgeState(tmp_path)
+    _supervised(state)
+    out = mark_guarded(state, _connectors_with_one_position())
+    assert out[0]["accounts"][0]["positions"][0]["guarded"] is True
+
+
+def test_mark_guarded_is_false_with_no_ledger_entry(tmp_path):
+    state = EdgeState(tmp_path)
+    out = mark_guarded(state, _connectors_with_one_position())
+    assert out[0]["accounts"][0]["positions"][0]["guarded"] is False
+
+
+def test_mark_guarded_is_false_for_an_unguarded_ledger_entry(tmp_path):
+    """A record without a warrant must not read as guarded: this marker's
+    whole purpose is to make that gap visible, not hide it."""
+    state = EdgeState(tmp_path)
+    _supervised(state, warrant=None, state="unguarded")
+    out = mark_guarded(state, _connectors_with_one_position())
+    assert out[0]["accounts"][0]["positions"][0]["guarded"] is False
+
+
+def test_mark_guarded_is_a_no_op_on_an_empty_ledger(tmp_path):
+    state = EdgeState(tmp_path)
+    connectors = [{"id": "robinhood-trading", "error": "", "accounts": []}]
+    assert mark_guarded(state, connectors) == connectors
+
+
 # ---- spec discovery ------------------------------------------------------
 
 def test_broker_specs_reads_only_enabled_mcp_brokers(tmp_path):
@@ -151,11 +198,6 @@ def test_broker_specs_with_no_registry_is_empty(tmp_path):
 
 # ---- the reporter: one path, rate-limited, pushes to the platform ---------
 
-class _State:
-    def __init__(self, root):
-        self.root = root
-
-
 def _reporter(tmp_path, hub, handler):
     (tmp_path / "config").mkdir(exist_ok=True)
     (tmp_path / "config" / "connectors.yaml").write_text(yaml.safe_dump(
@@ -168,7 +210,7 @@ def _reporter(tmp_path, hub, handler):
                                         "read": ["5QU41901"]}}}]}))
     client = PlatformClient("http://platform.test", "nk_agent_x",
                             transport=httpx.MockTransport(handler))
-    return PortfolioReporter(_State(tmp_path), hub, client)
+    return PortfolioReporter(EdgeState(tmp_path), hub, client)
 
 
 async def test_snapshot_and_push_posts_the_document(tmp_path):

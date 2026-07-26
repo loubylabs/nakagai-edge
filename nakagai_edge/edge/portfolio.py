@@ -96,6 +96,28 @@ async def connector_snapshot(hub, spec) -> dict:
     return entry
 
 
+def mark_guarded(state, connectors: list[dict]) -> list[dict]:
+    """Tag each position with whether the brake is watching it.
+
+    Display state only, exactly like every other figure in this document: no
+    guardrail, approval, or authorization path may read it back. An unguarded
+    position nobody can see is a silent failure, and this is what ends that.
+    """
+    from nakagai_edge.edge.supervision import load
+    guarded = {(r["connector_id"], r["account"], r["symbol"])
+               for r in load(state).values()
+               if r.get("state") == "armed" and r.get("warrant")}
+    for entry in connectors:
+        for account in entry.get("accounts") or []:
+            for row in account.get("positions") or []:
+                if isinstance(row, dict):
+                    key = (entry.get("id", ""),
+                           str(account.get("account_number", "")),
+                           str(row.get("symbol", "")).upper())
+                    row["guarded"] = key in guarded
+    return connectors
+
+
 class PortfolioReporter:
     """One code path for all three triggers, rate-limited so a confused agent
     cannot convert "poke" into "hammer Robinhood": inside the window the
@@ -113,8 +135,9 @@ class PortfolioReporter:
             if (self._last_doc is not None
                     and now - self._last_run < REFRESH_MIN_INTERVAL_S):
                 return self._last_doc
-            doc = {"connectors": [await connector_snapshot(self._hub, s)
-                                  for s in broker_specs(self._state.root)]}
+            doc = {"connectors": mark_guarded(
+                self._state, [await connector_snapshot(self._hub, s)
+                              for s in broker_specs(self._state.root)])}
             self._last_run = time.time()
             self._last_doc = doc
             try:

@@ -94,7 +94,10 @@ async def test_refresh_portfolio_tool_pokes_the_reporter_and_returns_the_doc(tmp
     reporter = _Reporter()
     from nakagai_edge.hub import ConnectorHub
     hub = ConnectorHub(state.root)
-    mcp = create_edge_mcp(state, hub, _client(), EdgeAudit(state), reporter)
+    client = _client()
+    audit = EdgeAudit(state)
+    mcp = create_edge_mcp(state, hub, client, audit, reporter,
+                          Brake(state, hub, client, audit))
 
     result = await mcp.call_tool("refresh_portfolio", {})
     body = json.loads(result[0][0].text)

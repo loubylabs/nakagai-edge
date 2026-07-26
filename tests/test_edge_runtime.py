@@ -9,6 +9,7 @@ import pytest
 pytest.importorskip("mcp")
 
 from nakagai_edge.edge.audit import EdgeAudit
+from nakagai_edge.edge.brake import Brake
 from nakagai_edge.edge.client import PlatformClient
 from nakagai_edge.edge.runtime import build_hub, create_edge_mcp, freshness_error
 from nakagai_edge.edge.state import EdgeState
@@ -45,7 +46,9 @@ async def test_call_connector_denied_on_stale_policy(tmp_path, monkeypatch):
     client = PlatformClient("https://api.test", "t",
                             transport=httpx.MockTransport(lambda r: httpx.Response(500)))
     hub = build_hub(state, client)
-    mcp = create_edge_mcp(state, hub, client, EdgeAudit(state), _Reporter())
+    audit = EdgeAudit(state)
+    mcp = create_edge_mcp(state, hub, client, audit, _Reporter(),
+                          Brake(state, hub, client, audit))
     real = time.time
     monkeypatch.setattr(time, "time", lambda: real() + 1000)  # past 900s TTL
     result = await mcp.call_tool("call_connector",
@@ -59,7 +62,9 @@ async def test_get_approval_denied_on_stale_policy(tmp_path, monkeypatch):
     client = PlatformClient("https://api.test", "t",
                             transport=httpx.MockTransport(lambda r: httpx.Response(500)))
     hub = build_hub(state, client)
-    mcp = create_edge_mcp(state, hub, client, EdgeAudit(state), _Reporter())
+    audit = EdgeAudit(state)
+    mcp = create_edge_mcp(state, hub, client, audit, _Reporter(),
+                          Brake(state, hub, client, audit))
     real = time.time
     monkeypatch.setattr(time, "time", lambda: real() + 1000)  # past 900s TTL
     result = await mcp.call_tool("get_approval", {"approval_id": "anything"})
@@ -72,7 +77,9 @@ async def test_status_tool_works_even_stale(tmp_path, monkeypatch):
     client = PlatformClient("https://api.test", "t",
                             transport=httpx.MockTransport(lambda r: httpx.Response(500)))
     hub = build_hub(state, client)
-    mcp = create_edge_mcp(state, hub, client, EdgeAudit(state), _Reporter())
+    audit = EdgeAudit(state)
+    mcp = create_edge_mcp(state, hub, client, audit, _Reporter(),
+                          Brake(state, hub, client, audit))
     real = time.time
     monkeypatch.setattr(time, "time", lambda: real() + 1000)
     result = await mcp.call_tool("get_connector_status", {})
@@ -112,7 +119,9 @@ async def test_agent_checkin_forwards_to_the_platform_and_is_not_gated_on_stalen
     state = _state(tmp_path)
     client = PlatformClient("https://api.test", "t", transport=httpx.MockTransport(handler))
     hub = build_hub(state, client)
-    mcp = create_edge_mcp(state, hub, client, EdgeAudit(state), _Reporter())
+    audit = EdgeAudit(state)
+    mcp = create_edge_mcp(state, hub, client, audit, _Reporter(),
+                          Brake(state, hub, client, audit))
     real = time.time
     monkeypatch.setattr(time, "time", lambda: real() + 1000)  # past 900s TTL
 
@@ -134,7 +143,9 @@ async def test_agent_checkin_platform_error_returns_is_error_json(tmp_path):
     client = PlatformClient("https://api.test", "t",
                             transport=httpx.MockTransport(lambda r: httpx.Response(401)))
     hub = build_hub(state, client)
-    mcp = create_edge_mcp(state, hub, client, EdgeAudit(state), _Reporter())
+    audit = EdgeAudit(state)
+    mcp = create_edge_mcp(state, hub, client, audit, _Reporter(),
+                          Brake(state, hub, client, audit))
 
     result = await mcp.call_tool("agent_checkin", {"status": "scanning"})
     text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
@@ -160,7 +171,9 @@ async def test_write_tool_edge_client_error_returns_is_error_json(tmp_path):
     client = PlatformClient("https://api.test", "t",
                             transport=httpx.MockTransport(lambda r: httpx.Response(500)))
     audit = EdgeAudit(state)
-    mcp = create_edge_mcp(state, BoomHub(), client, audit, _Reporter())
+    boom_hub = BoomHub()
+    mcp = create_edge_mcp(state, boom_hub, client, audit, _Reporter(),
+                          Brake(state, boom_hub, client, audit))
     result = await mcp.call_tool("call_connector",
                                  {"connector_id": "demo", "tool": "place_order",
                                   "args_json": "{}"})
@@ -168,3 +181,76 @@ async def test_write_tool_edge_client_error_returns_is_error_json(tmp_path):
     doc = json.loads(text)
     assert doc["is_error"] is True
     assert "revoked" in doc["error"]
+
+
+def _supervised_position(**over) -> dict:
+    rec = {"position_id": "ap_1", "symbol": "AAPL", "connector_id": "demo",
+           "account": "123", "direction": "long", "entry_price": 100.0,
+           "stop": 95.0, "entry_qty": 10.0, "confirmed_qty": 10.0,
+           "state": "armed",
+           "warrant": {"trigger": {"type": "price_below", "level": 95.0},
+                      "expires_at": "2026-08-01T00:00:00Z"}}
+    rec.update(over)
+    return rec
+
+
+async def test_get_open_risk_reports_positions_with_live_prices(tmp_path):
+    """The tool must convert _quotes()'s {symbol: full quote} shape to the
+    bare {symbol: price} that open_risk() still expects - the boundary
+    correction this task exists to land."""
+    from nakagai_edge.edge.supervision import record
+    state = _state(tmp_path)
+    record(state, _supervised_position())
+
+    class QuoteHub:
+        async def call(self, connector_id, tool, args, **kw):
+            assert tool == "get_quotes"
+            return {"data": {"quotes": [{"symbol": "AAPL", "price": 92.0}]}}
+
+    client = PlatformClient("https://api.test", "t",
+                            transport=httpx.MockTransport(lambda r: httpx.Response(500)))
+    audit = EdgeAudit(state)
+    hub = QuoteHub()
+    mcp = create_edge_mcp(state, hub, client, audit, _Reporter(),
+                          Brake(state, hub, client, audit))
+
+    result = await mcp.call_tool("get_open_risk", {})
+    text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+    out = json.loads(text)
+
+    assert out["armed"] is True
+    assert out["disarmed_positions"] == []
+    row = out["positions"][0]
+    assert row["position_id"] == "ap_1"
+    assert row["price"] == 92.0
+    assert row["guarded"] is True
+    assert out["portfolio_heat"] == row["open_risk"]
+
+
+async def test_get_open_risk_survives_a_dead_quote_feed(tmp_path, monkeypatch):
+    """A quote feed that fails outright (not just one connector inside it)
+    must not hide the book: an agent needs to see its own open risk most
+    urgently when things are degraded."""
+    import nakagai_edge.edge.runtime as runtime
+    from nakagai_edge.edge.supervision import record
+    state = _state(tmp_path)
+    record(state, _supervised_position())
+
+    async def boom(hub, state, symbols):
+        raise RuntimeError("no route to broker")
+
+    monkeypatch.setattr(runtime, "_quotes", boom)
+
+    client = PlatformClient("https://api.test", "t",
+                            transport=httpx.MockTransport(lambda r: httpx.Response(500)))
+    audit = EdgeAudit(state)
+    hub = build_hub(state, client)
+    mcp = create_edge_mcp(state, hub, client, audit, _Reporter(),
+                          Brake(state, hub, client, audit))
+
+    result = await mcp.call_tool("get_open_risk", {})
+    text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+    out = json.loads(text)
+
+    assert out["positions"][0]["position_id"] == "ap_1"
+    assert out["positions"][0]["price"] is None

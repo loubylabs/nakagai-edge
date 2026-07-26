@@ -5,7 +5,10 @@ imports pandas at module scope: that weight is exactly what this package sheds.
 """
 
 import argparse
+import json
 import sys
+
+from nakagai_edge.edge.state import EdgeState, default_root
 
 
 def _gateway_run(coro):
@@ -257,6 +260,24 @@ def _cmd_status(args) -> int:
     return 0
 
 
+def _cmd_brake(args) -> int:
+    from nakagai_edge.edge.brake import (
+        armed, clear_local_disarm, disarmed_positions, set_local_disarm,
+    )
+    from nakagai_edge.edge.supervision import open_risk
+
+    state = EdgeState(default_root())
+    if args.action == "off":
+        set_local_disarm(state, all_positions=not args.position,
+                         position_id=args.position or "")
+    elif args.action == "on":
+        clear_local_disarm(state)
+    print(json.dumps({"armed": armed(state),
+                      "disarmed_positions": sorted(disarmed_positions(state)),
+                      "positions": open_risk(state, {})}, indent=2, default=str))
+    return 0
+
+
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(
         prog="nakagai-edge",
@@ -295,6 +316,14 @@ def main(argv=None) -> int:
 
     p_status = sub.add_parser("status", help="pairing + policy freshness")
     p_status.set_defaults(func=_cmd_status)
+
+    p_brake = sub.add_parser(
+        "brake", help="the stop supervisor: status, or disarm/re-arm locally")
+    p_brake.add_argument("action", choices=["status", "off", "on"],
+                         nargs="?", default="status")
+    p_brake.add_argument("--position", default="",
+                         help="disarm one position instead of all of them")
+    p_brake.set_defaults(func=_cmd_brake)
 
     args = p.parse_args(argv)
     return args.func(args)

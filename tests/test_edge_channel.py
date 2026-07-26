@@ -14,6 +14,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from nakagai_platform.api.app import create_app  # noqa: E402
 from nakagai_edge.edge.audit import EdgeAudit  # noqa: E402
+from nakagai_edge.edge.brake import Brake  # noqa: E402
 from nakagai_edge.edge.client import PlatformClient  # noqa: E402
 from nakagai_edge.edge.runtime import build_hub, create_edge_mcp  # noqa: E402
 from nakagai_edge.edge.state import EdgeState  # noqa: E402
@@ -82,7 +83,9 @@ def _edge_mcp(edge_root, platform_client: PlatformClient):
     apply_bundle(state, {"bundle_version": "v1", "connectors": {"connectors": []},
                          "signing_public_key": "k"}, "v1")
     hub = build_hub(state, platform_client)
-    return create_edge_mcp(state, hub, platform_client, EdgeAudit(state), _Reporter())
+    audit = EdgeAudit(state)
+    return create_edge_mcp(state, hub, platform_client, audit, _Reporter(),
+                           Brake(state, hub, platform_client, audit))
 
 
 def _tool_json(result) -> dict:
