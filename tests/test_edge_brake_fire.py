@@ -352,3 +352,77 @@ async def test_the_owner_hears_when_the_connector_cannot_express_an_exit(tmp_pat
     assert client.messages, "the owner must hear the position is unguarded"
     kinds = [e["kind"] for e in brake.audit.pending()]
     assert "denial" in kinds
+
+
+# ---- the tick: observation to firing --------------------------------------
+#
+# tick() takes the FULL normalized quote per symbol (ts, bid, ask included),
+# never a bare price: usable() needs the real receipt time and the book to do
+# its job, and an observation restated by its consumer is an observation
+# whose provenance has been erased.
+
+
+def _q(price, ts=1.0, bid=None, ask=None):
+    return {"price": price, "bid": bid, "ask": ask, "ts": ts}
+
+
+async def test_a_tick_needs_two_confirmed_breaches_before_it_fires(tmp_path):
+    hub = FakeHub()
+    state, client, brake = _brake(tmp_path, hub)
+    record(state, _rec())
+    assert await brake.tick({"AAPL": _q(46.10, ts=1.0)}, 1.0) == []
+    assert await brake.tick({"AAPL": _q(46.10, ts=16.0)}, 16.0) == ["ap_1"]
+
+
+async def test_a_tick_carries_a_real_book_through_to_usable(tmp_path):
+    # Proves bid/ask actually survive the trip into usable(): a spread this
+    # tight must not block a legitimate breach.
+    hub = FakeHub()
+    state, client, brake = _brake(tmp_path, hub)
+    record(state, _rec())
+    q1 = _q(46.10, ts=1.0, bid=46.09, ask=46.11)
+    q2 = _q(46.10, ts=16.0, bid=46.09, ask=46.11)
+    assert await brake.tick({"AAPL": q1}, 1.0) == []
+    assert await brake.tick({"AAPL": q2}, 16.0) == ["ap_1"]
+
+
+async def test_a_price_above_the_stop_resets_the_run(tmp_path):
+    hub = FakeHub()
+    state, client, brake = _brake(tmp_path, hub)
+    record(state, _rec())
+    await brake.tick({"AAPL": _q(46.10, ts=1.0)}, 1.0)
+    await brake.tick({"AAPL": _q(46.90, ts=16.0)}, 16.0)
+    assert await brake.tick({"AAPL": _q(46.10, ts=31.0)}, 31.0) == []
+
+
+async def test_a_disarmed_position_never_fires(tmp_path):
+    from nakagai_edge.edge.brake import set_local_disarm
+    hub = FakeHub()
+    state, client, brake = _brake(tmp_path, hub)
+    record(state, _rec())
+    set_local_disarm(state, position_id="ap_1")
+    await brake.tick({"AAPL": _q(46.10, ts=1.0)}, 1.0)
+    assert await brake.tick({"AAPL": _q(46.10, ts=16.0)}, 16.0) == []
+
+
+async def test_an_unguarded_position_is_never_ticked(tmp_path):
+    hub = FakeHub()
+    state, client, brake = _brake(tmp_path, hub)
+    record(state, _rec(warrant=None, state="unguarded"))
+    await brake.tick({"AAPL": _q(46.10, ts=1.0)}, 1.0)
+    assert await brake.tick({"AAPL": _q(46.10, ts=16.0)}, 16.0) == []
+
+
+async def test_a_stale_quote_never_fires_the_brake_through_tick(tmp_path):
+    # Proves the freshness check in usable() is actually reachable FROM
+    # tick(), not just exercised by unit tests of usable() in isolation. If
+    # tick() restamped every quote with its own `now` (the discarded first
+    # draft), this same stale observation would look fresh on every pass and
+    # would confirm-and-fire on the second tick below.
+    hub = FakeHub()
+    state, client, brake = _brake(tmp_path, hub)
+    record(state, _rec())
+    stale = _q(46.10, ts=1.0)
+    past_max_age = 1.0 + brake_module.QUOTE_MAX_AGE_S + 1
+    assert await brake.tick({"AAPL": stale}, past_max_age) == []
+    assert await brake.tick({"AAPL": stale}, past_max_age + 15.0) == []

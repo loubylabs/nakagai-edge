@@ -16,11 +16,13 @@ import time
 import httpx
 
 from nakagai_edge.edge.audit import EdgeAudit
+from nakagai_edge.edge.brake import BRAKE_INTERVAL_S, Brake, normalize_quote
 from nakagai_edge.edge.client import EdgeClientError, PlatformClient
 from nakagai_edge.edge.executor import poll_once
 from nakagai_edge.edge.portfolio import PORTFOLIO_INTERVAL_S, PortfolioReporter
 from nakagai_edge.edge.remote import RemoteApprovalQueue
 from nakagai_edge.edge.state import EdgeState
+from nakagai_edge.edge.supervision import load as load_positions, reconcile, recover_interrupted
 from nakagai_edge.edge.sync import POLICY_TTL_S, SYNC_INTERVAL_S, policy_fresh, sync_once
 
 EXECUTOR_INTERVAL_S = 5
@@ -196,7 +198,48 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
     return mcp
 
 
-async def _loops(state: EdgeState, hub, client: PlatformClient, audit: EdgeAudit, reporter):
+async def _quotes(hub, state: EdgeState, symbols: list[str]) -> dict:
+    """Full normalized quotes for the supervised symbols, per connector.
+
+    A read, so it clears the guardrails without an approval. A connector that
+    will not answer contributes nothing: no quote means no tick for that
+    symbol, which means no fire, which is the safe direction.
+
+    Returns {symbol: full quote}, ts and book included, never a bare price:
+    see the comment on Brake.tick for why that distinction matters.
+    """
+    wanted: dict = {}
+    for rec in load_positions(state).values():
+        if rec["symbol"] in symbols:
+            wanted.setdefault(rec["connector_id"], set()).add(rec["symbol"])
+    out: dict = {}
+    for connector_id, syms in wanted.items():
+        try:
+            got = await hub.call(connector_id, "get_quotes",
+                                 {"symbols": sorted(syms)})
+        except Exception as e:  # noqa: BLE001
+            logging.getLogger("nakagai.edge").warning(
+                "no quotes from %s this tick: %s", connector_id, e)
+            continue
+        # The moment WE received this batch, not any timestamp the broker
+        # supplied (brokers rarely stamp a quote): normalize_quote requires
+        # this so usable()'s freshness check has a real receipt time to
+        # measure against, not the tick's own later clock read.
+        received_at = time.time()
+        payload = (got or {}).get("data")
+        if isinstance(payload, dict) and "data" in payload:
+            payload = payload["data"]
+        rows = payload.get("quotes") if isinstance(payload, dict) else payload
+        for row in rows if isinstance(rows, list) else []:
+            quote = normalize_quote(row, received_at)
+            symbol = str((row or {}).get("symbol", "")).upper()
+            if quote and symbol:
+                out[symbol] = quote
+    return out
+
+
+async def _loops(state: EdgeState, hub, client: PlatformClient, audit: EdgeAudit,
+                 reporter, brake: Brake):
     from nakagai_edge.edge.client import EdgeClientError
 
     async def syncer():
@@ -250,16 +293,30 @@ async def _loops(state: EdgeState, hub, client: PlatformClient, audit: EdgeAudit
             try:
                 # Same broad-catch posture as syncer() above, same reason:
                 # this loop runs forever and no single bad cycle may kill it.
-                await reporter.snapshot_and_push()
+                doc = await reporter.snapshot_and_push()
+                reconcile(state, doc)
             except Exception as e:  # noqa: BLE001
                 logging.getLogger("nakagai.edge").warning(
                     "portfolio snapshot failed this cycle: %s", e)
             await asyncio.sleep(PORTFOLIO_INTERVAL_S)
 
+    async def brake_loop():
+        while True:
+            try:
+                symbols = brake.quote_symbols()
+                if symbols:
+                    await brake.tick(await _quotes(hub, state, symbols),
+                                     time.time())
+            except Exception as e:  # noqa: BLE001 (a brake that dies is no brake)
+                logging.getLogger("nakagai.edge").warning(
+                    "brake tick failed this cycle: %s", e)
+            await asyncio.sleep(BRAKE_INTERVAL_S)
+
     return [asyncio.create_task(syncer(), name="syncer"),
             asyncio.create_task(executor(), name="executor"),
             asyncio.create_task(shipper(), name="shipper"),
-            asyncio.create_task(portfolio_loop(), name="portfolio_loop")]
+            asyncio.create_task(portfolio_loop(), name="portfolio_loop"),
+            asyncio.create_task(brake_loop(), name="brake_loop")]
 
 
 def run(root, port: int = 8330) -> None:
@@ -273,11 +330,18 @@ def run(root, port: int = 8330) -> None:
     hub = build_hub(state, client)
     audit = EdgeAudit(state)
     reporter = PortfolioReporter(state, hub, client)
+    brake = Brake(state, hub, client, audit)
+    for pid in recover_interrupted(state):
+        # Spent its warrant, then the edge stopped before the broker answered.
+        # Never retried, always surfaced.
+        audit.record("error", "", "brake",
+                     {"position_id": pid,
+                      "error": "exit in flight when the edge stopped"})
     mcp = create_edge_mcp(state, hub, client, audit, reporter)
     mcp.settings.host, mcp.settings.port = "127.0.0.1", port
 
     async def main():
-        tasks = await _loops(state, hub, client, audit, reporter)
+        tasks = await _loops(state, hub, client, audit, reporter, brake)
         try:
             await mcp.run_streamable_http_async()
         finally:

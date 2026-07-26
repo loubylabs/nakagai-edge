@@ -15,12 +15,13 @@ print sells a good position at a fictional number, so the judgment about when a
 price may be believed lives here where it can be tested exhaustively.
 """
 
+import json
 import logging
 
 from nakagai_edge.edge.state import EdgeState
-from nakagai_edge.edge.supervision import claim, mark
-from nakagai_edge.edge.sync import public_key
-from nakagai_edge.warrant import authorizes, exit_order_args
+from nakagai_edge.edge.supervision import claim, load, mark
+from nakagai_edge.edge.sync import cached_bundle, public_key
+from nakagai_edge.warrant import authorizes, breached, exit_order_args
 
 log = logging.getLogger("nakagai.edge")
 
@@ -111,6 +112,54 @@ def confirmed(run: int, needed: int = BREACH_CONFIRMATIONS) -> bool:
     return run >= needed
 
 
+# ---- arming -------------------------------------------------------------
+#
+# Effective state is `platform_armed and not local_off`. The local half is a
+# plain file the loop reads every tick, so `nakagai-edge brake off` works with
+# no network at all: a brake you cannot release because the platform is down is
+# not a safety feature.
+
+
+def _disarm_doc(state: EdgeState) -> dict:
+    if not state.brake_off_path.exists():
+        return {}
+    try:
+        doc = json.loads(state.brake_off_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        # Fail SAFE, not closed: an unreadable file means the owner's intent is
+        # unknown, and firing on an unknown intent is worse than not firing.
+        return {"all": True}
+    return doc if isinstance(doc, dict) else {"all": True}
+
+
+def armed(state: EdgeState) -> bool:
+    if _disarm_doc(state).get("all"):
+        return False
+    mandate = (cached_bundle(state) or {}).get("mandate") or {}
+    # Absent means armed: the brake ships on, and a platform that predates the
+    # dial must not silently leave every position unguarded.
+    return bool(mandate.get("brake_armed", True))
+
+
+def disarmed_positions(state: EdgeState) -> set:
+    return set(_disarm_doc(state).get("positions") or [])
+
+
+def set_local_disarm(state: EdgeState, *, all_positions: bool = False,
+                     position_id: str = "") -> None:
+    doc = _disarm_doc(state)
+    if all_positions:
+        doc["all"] = True
+    if position_id:
+        doc["positions"] = sorted(set(doc.get("positions") or []) | {position_id})
+    state.brake_off_path.parent.mkdir(parents=True, exist_ok=True)
+    state.brake_off_path.write_text(json.dumps(doc, indent=2))
+
+
+def clear_local_disarm(state: EdgeState) -> None:
+    state.brake_off_path.unlink(missing_ok=True)
+
+
 # ---- firing -------------------------------------------------------------
 
 _POSITION_QTY_KEYS = ("quantity", "qty", "shares")
@@ -153,6 +202,66 @@ class Brake:
 
     def __init__(self, state: EdgeState, hub, client, audit) -> None:
         self.state, self.hub, self.client, self.audit = state, hub, client, audit
+        self._runs: dict = {}       # position_id -> consecutive breach count
+        # position_id -> last believed price. A plain dict with .get() yields
+        # None for a symbol never seen, which is exactly what usable() treats
+        # as "no prior observation". Do NOT seed this with 0.0: usable()
+        # treats a non-positive prior as absent BY DESIGN, so a zero default
+        # would look like a real prior and silently disable jump detection
+        # for every position, forever.
+        self._prior: dict = {}
+
+    def quote_symbols(self) -> list[str]:
+        """Symbols worth a quote this tick: armed, warranted, not disarmed."""
+        off = disarmed_positions(self.state)
+        return sorted({r["symbol"] for r in load(self.state).values()
+                       if r.get("state") == "armed" and r.get("warrant")
+                       and r["position_id"] not in off})
+
+    async def tick(self, quotes: dict, now: float) -> list[str]:
+        """One evaluation pass. Returns the position ids it fired.
+
+        `quotes` maps symbol to the FULL normalized quote `normalize_quote`
+        produced (price, bid, ask, ts), never a bare price. usable() needs the
+        real receipt time and the book to judge freshness and spread; an
+        observation restated by its consumer -- re-stamped with this
+        function's own `now`, stripped of its book -- is an observation whose
+        provenance has been erased, and a reused or stale quote would then
+        look fresh every time. This is the same mistake already found and
+        fixed in Brake.fire(), where verification checked a restatement of
+        the ledger instead of the payload actually being sent.
+        """
+        if not armed(self.state):
+            return []
+        off = disarmed_positions(self.state)
+        fired = []
+        for rec in list(load(self.state).values()):
+            pid = rec["position_id"]
+            if rec.get("state") != "armed" or not rec.get("warrant"):
+                continue
+            if pid in off:
+                continue
+            quote = quotes.get(rec["symbol"])
+            if quote is None:
+                continue
+            why_not = usable(quote, self._prior.get(pid), now)
+            if why_not:
+                # Discarded, NOT counted: a bad print may neither fire the
+                # brake nor reset a run already underway.
+                log.warning("brake discarded a quote for %s: %s",
+                            rec["symbol"], why_not)
+                continue
+            price = quote["price"]
+            self._prior[pid] = price
+            run = advance(self._runs.get(pid, 0),
+                          breached((rec["warrant"] or {}).get("trigger") or {},
+                                   price))
+            self._runs[pid] = run
+            if confirmed(run):
+                self._runs[pid] = 0
+                if await self.fire(rec) == "":
+                    fired.append(pid)
+        return fired
 
     async def _held_now(self, rec: dict) -> float | None:
         """What the broker says is held THIS INSTANT, or None if it will not say.
