@@ -20,7 +20,7 @@ MODULES = [
     "nakagai_edge.cli", "nakagai_edge.config", "nakagai_edge.guardrails",
     "nakagai_edge.hub", "nakagai_edge.identity", "nakagai_edge.oauth_login",
     "nakagai_edge.signing", "nakagai_edge.slug", "nakagai_edge.warrant",
-    "nakagai_edge.edge.audit", "nakagai_edge.edge.client", "nakagai_edge.edge.executor",
+    "nakagai_edge.edge.audit", "nakagai_edge.edge.brake", "nakagai_edge.edge.client", "nakagai_edge.edge.executor",
     "nakagai_edge.edge.portfolio", "nakagai_edge.edge.preflight", "nakagai_edge.edge.remote",
     "nakagai_edge.edge.runtime", "nakagai_edge.edge.setup", "nakagai_edge.edge.state",
     "nakagai_edge.edge.supervision", "nakagai_edge.edge.sync",
