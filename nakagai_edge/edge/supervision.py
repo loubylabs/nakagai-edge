@@ -56,6 +56,12 @@ def mark(state: EdgeState, position_id: str, new_state: str, **extra) -> None:
     if rec is None:
         return
     rec["state"] = new_state
+    if new_state == "fired":
+        # The exit is placed, so this record's risk is closed. reconcile()
+        # skips TERMINAL and will never zero it, so a stale confirmed_qty
+        # would keep a closed position inside portfolio_heat forever. Before
+        # `extra`, so an explicit caller value still wins.
+        rec["confirmed_qty"] = 0.0
     rec.update(extra)
     save(state, doc)
 

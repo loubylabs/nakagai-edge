@@ -23,8 +23,8 @@ from nakagai_edge.edge.portfolio import PORTFOLIO_INTERVAL_S, PortfolioReporter
 from nakagai_edge.edge.remote import RemoteApprovalQueue
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.supervision import (
-    apply_renewals, load as load_positions, reconcile, recover_interrupted,
-    renewal_request,
+    TERMINAL, apply_renewals, load as load_positions, reconcile,
+    recover_interrupted, renewal_request,
 )
 from nakagai_edge.edge.sync import POLICY_TTL_S, SYNC_INTERVAL_S, policy_fresh, sync_once
 
@@ -220,10 +220,15 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         # that disagreed with `armed`/`disarmed_positions` in the same payload
         # would be self-contradictory, not just wrong.
         rows = open_risk(state, prices, brake_armed=is_armed, disarmed=off)
+        # Heat answers "what if every stop hit at once", so a position that has
+        # already closed does not belong in it. The rows keep every record: a
+        # fired or outcome_unknown position is still something the owner needs
+        # to see, it just carries no open risk.
+        heat = sum(r["open_risk"] for r in rows if r["state"] not in TERMINAL)
         return json.dumps({
             "armed": is_armed,
             "disarmed_positions": sorted(off),
-            "portfolio_heat": round(sum(r["open_risk"] for r in rows), 2),
+            "portfolio_heat": round(heat, 2),
             "positions": rows}, default=str)
 
     return mcp

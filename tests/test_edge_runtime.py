@@ -230,6 +230,34 @@ async def test_get_open_risk_reports_positions_with_live_prices(tmp_path):
     assert out["portfolio_heat"] == row["open_risk"]
 
 
+async def test_get_open_risk_keeps_terminal_records_out_of_the_heat(tmp_path):
+    """portfolio_heat answers "what if every stop hit at once", so a position
+    that already closed must not sit in it forever. reconcile() skips TERMINAL,
+    so nothing downstream ever zeroes such a record. The row itself stays
+    visible: only the figure changes."""
+    from nakagai_edge.edge.supervision import record
+    state = _state(tmp_path)
+    record(state, _supervised_position())
+    record(state, _supervised_position(position_id="ap_2",
+                                       state="outcome_unknown"))
+
+    client = PlatformClient("https://api.test", "t",
+                            transport=httpx.MockTransport(lambda r: httpx.Response(500)))
+    audit = EdgeAudit(state)
+    hub = build_hub(state, client)
+    mcp = create_edge_mcp(state, hub, client, audit, _Reporter(),
+                          Brake(state, hub, client, audit))
+
+    result = await mcp.call_tool("get_open_risk", {})
+    text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+    out = json.loads(text)
+
+    assert {r["position_id"] for r in out["positions"]} == {"ap_1", "ap_2"}
+    live = next(r for r in out["positions"] if r["position_id"] == "ap_1")
+    assert live["open_risk"] > 0
+    assert out["portfolio_heat"] == round(live["open_risk"], 2)
+
+
 async def test_get_open_risk_survives_a_dead_quote_feed(tmp_path, monkeypatch):
     """A quote feed that fails outright (not just one connector inside it)
     must not hide the book: an agent needs to see its own open risk most

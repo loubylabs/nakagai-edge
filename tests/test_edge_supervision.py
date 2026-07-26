@@ -68,6 +68,19 @@ def test_marking_changes_state_and_carries_extras(tmp_path):
     assert row["fired_at"] == 99.0
 
 
+def test_marking_fired_zeroes_the_confirmed_quantity(tmp_path):
+    # The exit is placed, so this record carries no risk any more. reconcile()
+    # skips TERMINAL, so nothing downstream will ever zero it, and a stale
+    # confirmed_qty keeps a closed position inside "portfolio heat if every
+    # stop hit at once" for as long as the record exists.
+    state = EdgeState(tmp_path)
+    record(state, _rec())
+    mark(state, "ap_1", "fired", fired_qty=100.0)
+    row = load(state)["ap_1"]
+    assert row["confirmed_qty"] == 0.0
+    assert row["fired_qty"] == 100.0
+
+
 def test_claim_moves_a_matching_record_and_reports_success(tmp_path):
     state = EdgeState(tmp_path)
     record(state, _rec())
