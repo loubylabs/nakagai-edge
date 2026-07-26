@@ -65,6 +65,43 @@ Point your agent's MCP client (OpenClaw, Claude Code, Hermes, ...) at
 The platform never holds a broker credential at any point in this chain. It
 authorizes; the edge acts.
 
+## The brake
+
+Every out-of-sample number in Nakagai's evidence store was measured on a
+strategy that exits. Live, the agent places an entry and goes to sleep. The
+brake is what exits.
+
+When the platform grants an entry it also signs an **exit warrant** scoped to
+that position: reduce-only, capped at the entry quantity, single-use, and
+expiring. The edge watches the position against its approved stop and places a
+market exit when the level is confirmed broken, with no agent and no model
+awake. The warrant is renewed on the ordinary sync cadence.
+
+It is armed by default, because the stop it enforces is one you already
+approved when you stamped the entry. Two properties are deliberate and worth
+knowing:
+
+- **It fires on stale policy and through a platform outage.** Every other path
+  in the edge refuses when policy goes stale, because every other path exists
+  to restrain the agent. The brake's authority is in the signed warrant, and
+  firing only reduces exposure.
+- **The kill switch does not stop it.** The kill switch halts the agent.
+  Killing the agent must not strip the stops off your open positions.
+
+```bash
+nakagai-edge brake status              # what is watched, and its risk in R
+nakagai-edge brake off                 # disarm, locally, with no network
+nakagai-edge brake off --position <id> # release one position
+nakagai-edge brake on                  # re-arm
+```
+
+The brake does not promise the level. A gap opens a position under its stop and
+the exit goes off at the market, below it. That is what a stop is.
+
+A connector must declare an `order_shape` with `market_order_args` before its
+positions can be supervised. Without it, positions are recorded as unguarded
+and reported that way rather than silently ignored.
+
 ## Failure modes
 
 - **Platform unreachable.** The edge caches the bootstrap bundle with a policy

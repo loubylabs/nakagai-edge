@@ -16,15 +16,30 @@ import time
 import httpx
 
 from nakagai_edge.edge.audit import EdgeAudit
+from nakagai_edge.edge.brake import BRAKE_INTERVAL_S, Brake, normalize_quote
 from nakagai_edge.edge.client import EdgeClientError, PlatformClient
 from nakagai_edge.edge.executor import poll_once
 from nakagai_edge.edge.portfolio import PORTFOLIO_INTERVAL_S, PortfolioReporter
 from nakagai_edge.edge.remote import RemoteApprovalQueue
 from nakagai_edge.edge.state import EdgeState
+from nakagai_edge.edge.supervision import (
+    TERMINAL, apply_renewals, load as load_positions, reconcile,
+    recover_interrupted, renewal_request,
+)
 from nakagai_edge.edge.sync import POLICY_TTL_S, SYNC_INTERVAL_S, policy_fresh, sync_once
 
 EXECUTOR_INTERVAL_S = 5
 AUDIT_SHIP_INTERVAL_S = 30
+
+# The one broker read the brake's whole existence depends on, named here
+# because it MUST be classified read-only somewhere: the downstream's own
+# readOnlyHint, or the owner's `read_only_tools` glob. Otherwise
+# classify_write's `unknown_is_write` calls it a write, and check_accounts
+# denies a write that names no account whenever account tiers exist. That
+# denial is silent from the brake's side: no price, no breach, no fire, and
+# every display still saying guarded. See _quotes below, and the famine signal
+# in brake.tick, which is what makes the silence audible.
+QUOTE_TOOL = "get_quotes"
 
 
 def freshness_error() -> str:
@@ -48,7 +63,8 @@ def build_hub(state: EdgeState, client: PlatformClient):
     return ConnectorHub(state.root, approvals=queue)
 
 
-def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAudit, reporter):
+def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAudit,
+                    reporter, brake: Brake):
     from mcp.server.fastmcp import FastMCP
 
     mcp = FastMCP("nakagai-edge")
@@ -193,10 +209,87 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         except Exception as e:  # noqa: BLE001 (tool surface: report, don't crash)
             return json.dumps({"is_error": True, "error": str(e)})
 
+    @mcp.tool()
+    async def get_open_risk() -> str:
+        """Every position this edge is supervising, with its risk in R.
+
+        R is the entry-to-stop distance, so one position's risk is directly
+        comparable to another's. `guarded` false means NOTHING will exit that
+        position if its stop is touched. A non-empty `ledger_fault` means the
+        ledger itself was lost: an empty position list then says nothing about
+        what the broker is actually holding, so treat everything as unguarded
+        until it is restored. Not gated on policy freshness: an agent needs to
+        see its own open risk most urgently when things are degraded."""
+        from nakagai_edge.edge.brake import armed, disarmed_positions
+        from nakagai_edge.edge.supervision import ledger_fault, open_risk
+        is_armed, off = armed(state), disarmed_positions(state)
+        try:
+            quotes = await _quotes(hub, state, brake.quote_symbols())
+            prices = {symbol: q["price"] for symbol, q in quotes.items()}
+        except Exception:  # noqa: BLE001 (a dead quote feed must not hide the book)
+            prices = {}
+        # Same brake_armed/off feed the top-level fields below: a `guarded`
+        # that disagreed with `armed`/`disarmed_positions` in the same payload
+        # would be self-contradictory, not just wrong.
+        rows = open_risk(state, prices, brake_armed=is_armed, disarmed=off)
+        # Heat answers "what if every stop hit at once", so a position that has
+        # already closed does not belong in it. The rows keep every record: a
+        # fired or outcome_unknown position is still something the owner needs
+        # to see, it just carries no open risk.
+        heat = sum(r["open_risk"] for r in rows if r["state"] not in TERMINAL)
+        return json.dumps({
+            "armed": is_armed,
+            "disarmed_positions": sorted(off),
+            "ledger_fault": ledger_fault(state),
+            "portfolio_heat": round(heat, 2),
+            "positions": rows}, default=str)
+
     return mcp
 
 
-async def _loops(state: EdgeState, hub, client: PlatformClient, audit: EdgeAudit, reporter):
+async def _quotes(hub, state: EdgeState, symbols: list[str]) -> dict:
+    """Full normalized quotes for the supervised symbols, per connector.
+
+    Meant to be a read, and only the guardrail config makes it one: see
+    QUOTE_TOOL. A connector that will not answer contributes nothing: no quote
+    means no tick for that symbol, which means no fire, which is the safe
+    direction, but it is NOT a quiet direction. brake.tick counts the silence.
+
+    Returns {symbol: full quote}, ts and book included, never a bare price:
+    see the comment on Brake.tick for why that distinction matters.
+    """
+    wanted: dict = {}
+    for rec in load_positions(state).values():
+        if rec["symbol"] in symbols:
+            wanted.setdefault(rec["connector_id"], set()).add(rec["symbol"])
+    out: dict = {}
+    for connector_id, syms in wanted.items():
+        try:
+            got = await hub.call(connector_id, QUOTE_TOOL,
+                                 {"symbols": sorted(syms)})
+        except Exception as e:  # noqa: BLE001
+            logging.getLogger("nakagai.edge").warning(
+                "no quotes from %s this tick: %s", connector_id, e)
+            continue
+        # The moment WE received this batch, not any timestamp the broker
+        # supplied (brokers rarely stamp a quote): normalize_quote requires
+        # this so usable()'s freshness check has a real receipt time to
+        # measure against, not the tick's own later clock read.
+        received_at = time.time()
+        payload = (got or {}).get("data")
+        if isinstance(payload, dict) and "data" in payload:
+            payload = payload["data"]
+        rows = payload.get("quotes") if isinstance(payload, dict) else payload
+        for row in rows if isinstance(rows, list) else []:
+            quote = normalize_quote(row, received_at)
+            symbol = str((row or {}).get("symbol", "")).upper()
+            if quote and symbol:
+                out[symbol] = quote
+    return out
+
+
+async def _loops(state: EdgeState, hub, client: PlatformClient, audit: EdgeAudit,
+                 reporter, brake: Brake):
     from nakagai_edge.edge.client import EdgeClientError
 
     async def syncer():
@@ -217,6 +310,19 @@ async def _loops(state: EdgeState, hub, client: PlatformClient, audit: EdgeAudit
                 logging.getLogger("nakagai.edge").warning(
                     "connector status not reported to the platform this "
                     "cycle: %s", e)
+            try:
+                # Warrants expire in 24h; a position held longer needs this to
+                # keep its exit authority alive. A platform without the
+                # endpoint 404s here, which is a non-event: existing warrants
+                # keep working until they expire, and a failed renewal
+                # disarms nothing, so this logs at debug rather than warning.
+                ask = renewal_request(state)
+                if ask:
+                    out = await asyncio.to_thread(client.renew_warrants, ask)
+                    apply_renewals(state, out.get("warrants") or {})
+            except Exception as e:  # noqa: BLE001
+                logging.getLogger("nakagai.edge").debug(
+                    "warrants not renewed this cycle: %s", e)
             await asyncio.sleep(SYNC_INTERVAL_S)
 
     async def executor():
@@ -250,16 +356,30 @@ async def _loops(state: EdgeState, hub, client: PlatformClient, audit: EdgeAudit
             try:
                 # Same broad-catch posture as syncer() above, same reason:
                 # this loop runs forever and no single bad cycle may kill it.
-                await reporter.snapshot_and_push()
+                doc = await reporter.snapshot_and_push()
+                reconcile(state, doc)
             except Exception as e:  # noqa: BLE001
                 logging.getLogger("nakagai.edge").warning(
                     "portfolio snapshot failed this cycle: %s", e)
             await asyncio.sleep(PORTFOLIO_INTERVAL_S)
 
+    async def brake_loop():
+        while True:
+            try:
+                symbols = brake.quote_symbols()
+                if symbols:
+                    await brake.tick(await _quotes(hub, state, symbols),
+                                     time.time())
+            except Exception as e:  # noqa: BLE001 (a brake that dies is no brake)
+                logging.getLogger("nakagai.edge").warning(
+                    "brake tick failed this cycle: %s", e)
+            await asyncio.sleep(BRAKE_INTERVAL_S)
+
     return [asyncio.create_task(syncer(), name="syncer"),
             asyncio.create_task(executor(), name="executor"),
             asyncio.create_task(shipper(), name="shipper"),
-            asyncio.create_task(portfolio_loop(), name="portfolio_loop")]
+            asyncio.create_task(portfolio_loop(), name="portfolio_loop"),
+            asyncio.create_task(brake_loop(), name="brake_loop")]
 
 
 def run(root, port: int = 8330) -> None:
@@ -273,11 +393,18 @@ def run(root, port: int = 8330) -> None:
     hub = build_hub(state, client)
     audit = EdgeAudit(state)
     reporter = PortfolioReporter(state, hub, client)
-    mcp = create_edge_mcp(state, hub, client, audit, reporter)
+    brake = Brake(state, hub, client, audit)
+    for pid in recover_interrupted(state):
+        # Spent its warrant, then the edge stopped before the broker answered.
+        # Never retried, always surfaced.
+        audit.record("error", "", "brake",
+                     {"position_id": pid,
+                      "error": "exit in flight when the edge stopped"})
+    mcp = create_edge_mcp(state, hub, client, audit, reporter, brake)
     mcp.settings.host, mcp.settings.port = "127.0.0.1", port
 
     async def main():
-        tasks = await _loops(state, hub, client, audit, reporter)
+        tasks = await _loops(state, hub, client, audit, reporter, brake)
         try:
             await mcp.run_streamable_http_async()
         finally:

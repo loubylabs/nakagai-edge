@@ -96,6 +96,37 @@ async def connector_snapshot(hub, spec) -> dict:
     return entry
 
 
+def mark_guarded(state, connectors: list[dict], *, brake_armed: bool = True,
+                disarmed=frozenset(), now: float | None = None) -> list[dict]:
+    """Tag each position with whether the brake is watching it.
+
+    Display state only, exactly like every other figure in this document: no
+    guardrail, approval, or authorization path may read it back. An unguarded
+    position nobody can see is a silent failure, and this is what ends that.
+
+    `brake_armed`/`disarmed` default permissive so a caller that has not been
+    updated to pass the live disarm state behaves as it always did, rather
+    than reporting every position unguarded. `now` is what warrant expiry is
+    judged against, and it is read here rather than left to the caller so no
+    display path can silently skip that check.
+    """
+    from nakagai_edge.edge.supervision import is_guarded, load
+    now = time.time() if now is None else now
+    guarded = {(r["connector_id"], r["account"], r["symbol"])
+               for r in load(state).values()
+               if is_guarded(r, brake_armed=brake_armed, disarmed=disarmed,
+                             now=now)}
+    for entry in connectors:
+        for account in entry.get("accounts") or []:
+            for row in account.get("positions") or []:
+                if isinstance(row, dict):
+                    key = (entry.get("id", ""),
+                           str(account.get("account_number", "")),
+                           str(row.get("symbol", "")).upper())
+                    row["guarded"] = key in guarded
+    return connectors
+
+
 class PortfolioReporter:
     """One code path for all three triggers, rate-limited so a confused agent
     cannot convert "poke" into "hammer Robinhood": inside the window the
@@ -108,13 +139,21 @@ class PortfolioReporter:
         self._lock = asyncio.Lock()
 
     async def snapshot_and_push(self) -> dict:
+        # Imported here, not at module scope: brake.py is the one place the
+        # disarm switches actually live, and snapshot_and_push is the one
+        # portfolio caller close enough to the loop to read them fresh each
+        # sweep rather than trusting a value handed in once at construction.
+        from nakagai_edge.edge.brake import armed, disarmed_positions
         async with self._lock:
             now = time.time()
             if (self._last_doc is not None
                     and now - self._last_run < REFRESH_MIN_INTERVAL_S):
                 return self._last_doc
-            doc = {"connectors": [await connector_snapshot(self._hub, s)
-                                  for s in broker_specs(self._state.root)]}
+            doc = {"connectors": mark_guarded(
+                self._state, [await connector_snapshot(self._hub, s)
+                              for s in broker_specs(self._state.root)],
+                brake_armed=armed(self._state),
+                disarmed=disarmed_positions(self._state))}
             self._last_run = time.time()
             self._last_doc = doc
             try:
