@@ -208,3 +208,18 @@ def test_a_genuinely_flat_position_still_releases(tmp_path):
     row = load(state)["ap_1"]
     assert row["state"] == "released"
     assert row["confirmed_qty"] == 0.0
+
+
+def test_a_resolved_anomaly_is_cleared_not_left_stale(tmp_path):
+    # A record that picked up "anomaly" from a contradiction must not carry it
+    # forever: once a later reconcile's broker sign agrees with the recorded
+    # direction again, the stale note would misreport a resolved condition as
+    # still live to any consumer keying off "anomaly" in rec.
+    state = EdgeState(tmp_path)
+    record(state, _rec())
+    reconcile(state, _portfolio(-100))
+    assert "anomaly" in load(state)["ap_1"]
+    reconcile(state, _portfolio(80))
+    row = load(state)["ap_1"]
+    assert row["confirmed_qty"] == 80.0
+    assert "anomaly" not in row

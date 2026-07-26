@@ -186,6 +186,7 @@ def reconcile(state: EdgeState, portfolio_doc: dict) -> dict:
             rec["state"] = "released"
             rec["confirmed_qty"] = 0.0
             rec["unguarded_qty"] = 0.0
+            rec.pop("anomaly", None)
             continue
         if raw * expected < 0:
             # The broker reports the OPPOSITE direction to what we recorded, so
@@ -199,6 +200,7 @@ def reconcile(state: EdgeState, portfolio_doc: dict) -> dict:
         ceiling = float(rec["entry_qty"])
         rec["confirmed_qty"] = min(actual, ceiling)
         rec["unguarded_qty"] = max(0.0, actual - ceiling)
+        rec.pop("anomaly", None)
     save(state, doc)
     return doc
 
