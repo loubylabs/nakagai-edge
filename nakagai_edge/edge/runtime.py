@@ -31,6 +31,16 @@ from nakagai_edge.edge.sync import POLICY_TTL_S, SYNC_INTERVAL_S, policy_fresh, 
 EXECUTOR_INTERVAL_S = 5
 AUDIT_SHIP_INTERVAL_S = 30
 
+# The one broker read the brake's whole existence depends on, named here
+# because it MUST be classified read-only somewhere: the downstream's own
+# readOnlyHint, or the owner's `read_only_tools` glob. Otherwise
+# classify_write's `unknown_is_write` calls it a write, and check_accounts
+# denies a write that names no account whenever account tiers exist. That
+# denial is silent from the brake's side: no price, no breach, no fire, and
+# every display still saying guarded. See _quotes below, and the famine signal
+# in brake.tick, which is what makes the silence audible.
+QUOTE_TOOL = "get_quotes"
+
 
 def freshness_error() -> str:
     return json.dumps({"is_error": True, "error":
@@ -237,9 +247,10 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
 async def _quotes(hub, state: EdgeState, symbols: list[str]) -> dict:
     """Full normalized quotes for the supervised symbols, per connector.
 
-    A read, so it clears the guardrails without an approval. A connector that
-    will not answer contributes nothing: no quote means no tick for that
-    symbol, which means no fire, which is the safe direction.
+    Meant to be a read, and only the guardrail config makes it one: see
+    QUOTE_TOOL. A connector that will not answer contributes nothing: no quote
+    means no tick for that symbol, which means no fire, which is the safe
+    direction, but it is NOT a quiet direction. brake.tick counts the silence.
 
     Returns {symbol: full quote}, ts and book included, never a bare price:
     see the comment on Brake.tick for why that distinction matters.
@@ -251,7 +262,7 @@ async def _quotes(hub, state: EdgeState, symbols: list[str]) -> dict:
     out: dict = {}
     for connector_id, syms in wanted.items():
         try:
-            got = await hub.call(connector_id, "get_quotes",
+            got = await hub.call(connector_id, QUOTE_TOOL,
                                  {"symbols": sorted(syms)})
         except Exception as e:  # noqa: BLE001
             logging.getLogger("nakagai.edge").warning(

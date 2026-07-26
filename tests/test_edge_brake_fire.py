@@ -481,6 +481,61 @@ async def test_an_unguarded_position_is_never_ticked(tmp_path):
     assert await brake.tick({"AAPL": _q(46.10, ts=16.0)}, 16.0) == []
 
 
+async def test_a_quote_famine_reaches_the_owner_once(tmp_path):
+    # A quote read the edge's own guardrails deny is indistinguishable from a
+    # working brake from outside: no price, no breach, no fire, and a display
+    # that still says guarded. Only the elapsed silence tells them apart, so
+    # the silence itself has to reach the owner. Then it must go quiet: 118
+    # messages an hour is how an owner learns to ignore the channel.
+    hub = FakeHub()
+    state, client, brake = _brake(tmp_path, hub)
+    record(state, _rec())
+    ticks = brake_module.QUOTE_FAMINE_TICKS
+    for i in range(ticks - 1):
+        assert await brake.tick({}, 1.0 + i * 15.0) == []
+    assert client.messages == [], "not yet: a single dry tick is routine"
+
+    assert await brake.tick({}, 1.0 + (ticks - 1) * 15.0) == []
+    assert len(client.messages) == 1
+    assert "AAPL" in client.messages[0]
+    assert "error" in [e["kind"] for e in brake.audit.pending()]
+
+    for i in range(ticks, ticks + 6):
+        await brake.tick({}, 1.0 + i * 15.0)
+    assert len(client.messages) == 1, "the famine is reported once, not per tick"
+
+
+async def test_quotes_resuming_re_arms_the_famine_signal(tmp_path):
+    hub = FakeHub()
+    state, client, brake = _brake(tmp_path, hub)
+    record(state, _rec())
+    ticks = brake_module.QUOTE_FAMINE_TICKS
+    for i in range(ticks):
+        await brake.tick({}, 1.0 + i * 15.0)
+    assert len(client.messages) == 1
+
+    resumed = 1.0 + ticks * 15.0
+    await brake.tick({"AAPL": _q(46.90, ts=resumed)}, resumed)
+    for i in range(ticks):
+        await brake.tick({}, resumed + 15.0 + i * 15.0)
+    assert len(client.messages) == 2, "a second famine is a second event"
+
+
+async def test_a_quote_discarded_every_tick_counts_as_a_famine(tmp_path):
+    # usable() discarding every observation leaves the brake exactly as blind
+    # as no quote at all, and just as quiet toward the owner.
+    hub = FakeHub()
+    state, client, brake = _brake(tmp_path, hub)
+    record(state, _rec())
+    ticks = brake_module.QUOTE_FAMINE_TICKS
+    for i in range(ticks):
+        now = 1.0 + i * 15.0
+        # Unstamped: refused by usable() on every pass, never counted.
+        await brake.tick({"AAPL": _q(46.10, ts=0.0)}, now)
+    assert len(client.messages) == 1
+    assert "AAPL" in client.messages[0]
+
+
 async def test_a_stale_quote_never_fires_the_brake_through_tick(tmp_path):
     # Proves the freshness check in usable() is actually reachable FROM
     # tick(), not just exercised by unit tests of usable() in isolation. If

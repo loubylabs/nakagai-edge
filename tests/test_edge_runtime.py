@@ -230,6 +230,28 @@ async def test_get_open_risk_reports_positions_with_live_prices(tmp_path):
     assert out["portfolio_heat"] == row["open_risk"]
 
 
+async def test_the_quote_read_goes_through_the_named_constant(tmp_path, monkeypatch):
+    """The one tool name the brake's whole existence depends on lives in a
+    single named place, because it has to be classified read-only in the
+    guardrail config or the read is denied and the brake goes blind in
+    silence."""
+    import nakagai_edge.edge.runtime as runtime
+    from nakagai_edge.edge.supervision import record
+    state = _state(tmp_path)
+    record(state, _supervised_position())
+    monkeypatch.setattr(runtime, "QUOTE_TOOL", "get_market_quotes")
+
+    asked = []
+
+    class QuoteHub:
+        async def call(self, connector_id, tool, args, **kw):
+            asked.append(tool)
+            return {"data": {"quotes": []}}
+
+    await runtime._quotes(QuoteHub(), state, ["AAPL"])
+    assert asked == ["get_market_quotes"]
+
+
 async def test_get_open_risk_keeps_terminal_records_out_of_the_heat(tmp_path):
     """portfolio_heat answers "what if every stop hit at once", so a position
     that already closed must not sit in it forever. reconcile() skips TERMINAL,

@@ -31,6 +31,7 @@ MAX_SPREAD_PCT = 5.0          # of the mid
 MAX_JUMP_PCT = 20.0           # from the prior observation
 BREACH_CONFIRMATIONS = 2      # consecutive sane breaches before firing
 BRAKE_INTERVAL_S = 15.0
+QUOTE_FAMINE_TICKS = 8        # two minutes of blindness at that cadence
 
 _PRICE_KEYS = ("price", "last_trade_price", "last_price", "mark_price", "last")
 _BID_KEYS = ("bid", "bid_price")
@@ -211,6 +212,10 @@ class Brake:
         # would look like a real prior and silently disable jump detection
         # for every position, forever.
         self._prior: dict = {}
+        # position_id -> consecutive ticks that produced no usable observation.
+        # Reset by the first usable one, so the count is always the length of
+        # the CURRENT blindness, not a lifetime total.
+        self._dry: dict = {}
 
     def quote_symbols(self) -> list[str]:
         """Symbols worth a quote this tick: armed, warranted, not disarmed."""
@@ -244,6 +249,7 @@ class Brake:
                 continue
             quote = quotes.get(rec["symbol"])
             if quote is None:
+                self._note_blind_tick(rec, "no quote came back for it")
                 continue
             why_not = usable(quote, self._prior.get(pid), now)
             if why_not:
@@ -251,7 +257,9 @@ class Brake:
                 # brake nor reset a run already underway.
                 log.warning("brake discarded a quote for %s: %s",
                             rec["symbol"], why_not)
+                self._note_blind_tick(rec, why_not)
                 continue
+            self._dry.pop(pid, None)          # sighted again
             price = quote["price"]
             self._prior[pid] = price
             run = advance(self._runs.get(pid, 0),
@@ -263,6 +271,35 @@ class Brake:
                 if await self.fire(rec) == "":
                     fired.append(pid)
         return fired
+
+    def _note_blind_tick(self, rec: dict, why: str) -> None:
+        """Count a tick that produced no usable observation, and say so once.
+
+        A quote read the edge's own guardrails deny (get_quotes classified as a
+        write, then refused for naming no account) looks exactly like a working
+        brake from outside: no price, no breach, no fire, and a display that
+        still says guarded. The elapsed silence is the only thing that tells
+        them apart, so the silence itself has to reach the owner. Reported on
+        the tick that crosses the threshold and not again until a usable quote
+        resets the count: a repeat every 15 seconds is how an owner learns to
+        ignore the channel.
+        """
+        pid = rec["position_id"]
+        self._dry[pid] = dry = self._dry.get(pid, 0) + 1
+        if dry != QUOTE_FAMINE_TICKS:
+            return
+        blind_s = int(QUOTE_FAMINE_TICKS * BRAKE_INTERVAL_S)
+        detail = {"position_id": pid, "symbol": rec["symbol"],
+                  "ticks": dry, "reason": why}
+        self.audit.record("error", rec["connector_id"], "brake", detail)
+        # The connector's quote tool is named in runtime.QUOTE_TOOL, which this
+        # module cannot import (runtime imports this one), so the message says
+        # what to look at rather than quoting the name.
+        self._notify(
+            f"The brake has had no usable price for {rec['symbol']} in "
+            f"{blind_s}s ({dry} passes): {why}. Nothing is watching that stop "
+            f"until quotes resume. If it persists, check that the quote tool "
+            f"on {rec['connector_id']} is classified as a READ.")
 
     async def _held_now(self, rec: dict) -> float | None:
         """What the broker says is held THIS INSTANT, or None if it will not say.
