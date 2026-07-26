@@ -227,7 +227,7 @@ class Brake:
         # the CURRENT blindness, not a lifetime total.
         self._dry: dict = {}
         # (position_id, reason) -> (when the owner was told, the state then).
-        # See _refuse: the journal keeps every refusal, the chat does not.
+        # See _tell_owner: the journal keeps every refusal, the chat does not.
         self._told: dict = {}
 
     def quote_symbols(self) -> list[str]:
@@ -246,9 +246,9 @@ class Brake:
         observation restated by its consumer (re-stamped with this function's
         own `now`, stripped of its book) is an observation whose provenance has
         been erased, and a reused or stale quote would then look fresh every
-        time. This is the same mistake already found and
-        fixed in Brake.fire(), where verification checked a restatement of
-        the ledger instead of the payload actually being sent.
+        time. This is the same mistake already found and fixed in
+        Brake.fire(), where verification checked a restatement of the ledger
+        instead of the payload actually being sent.
         """
         if not armed(self.state):
             return []
