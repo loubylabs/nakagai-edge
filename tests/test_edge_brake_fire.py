@@ -422,6 +422,63 @@ async def test_fire_refuses_an_account_less_record_without_asking_the_broker(tmp
     assert "denial" in [e["kind"] for e in brake.audit.pending()]
 
 
+# ---- final round: the owner is told, not buried ---------------------------
+#
+# One unfireable position is retried every 15 seconds forever, so an
+# unthrottled message per refusal is roughly 118 owner messages an hour about
+# a single name. Spec section 9 asks for backoff and an alert after a few
+# failures. The journal must stay complete either way: it is the record of
+# what happened, and it is not the thing an owner learns to ignore.
+
+
+async def test_a_refusal_repeated_every_tick_is_told_once(tmp_path):
+    hub = MalformedPositionsHub()
+    state, client, brake = _brake(tmp_path, hub)
+    record(state, _rec())
+    for i in range(6):
+        await brake.fire(load(state)["ap_1"], now=1000.0 + i * 15.0)
+    assert len(client.messages) == 1
+    denials = [e for e in brake.audit.pending() if e["kind"] == "denial"]
+    assert len(denials) == 6, "the journal keeps every refusal"
+
+
+async def test_the_owner_hears_again_once_the_backoff_has_run_out(tmp_path):
+    # Still unguarded an hour later is news again, not the same news.
+    hub = MalformedPositionsHub()
+    state, client, brake = _brake(tmp_path, hub)
+    record(state, _rec())
+    await brake.fire(load(state)["ap_1"], now=1000.0)
+    await brake.fire(load(state)["ap_1"], now=1000.0 + 15.0)
+    await brake.fire(load(state)["ap_1"],
+                     now=1000.0 + brake_module.NOTIFY_BACKOFF_S + 1)
+    assert len(client.messages) == 2
+
+
+async def test_a_second_distinct_reason_on_one_position_still_reaches_the_owner(
+        tmp_path, monkeypatch):
+    # Suppression is per reason as well as per position: the next thing the
+    # owner needs to hear must never be swallowed by the last thing they were
+    # told.
+    hub = FakeHub()
+    state, client, brake = _brake(tmp_path, hub)
+    record(state, _rec(warrant=_warrant(max_qty=float("nan"))))
+    await brake.fire(load(state)["ap_1"], now=1000.0)
+    record(state, _rec())                       # a usable ceiling now
+    monkeypatch.setattr(brake_module, "exit_order_args", lambda *a: None)
+    await brake.fire(load(state)["ap_1"], now=1015.0)
+    assert len(client.messages) == 2
+
+
+async def test_two_positions_failing_the_same_way_are_both_reported(tmp_path):
+    hub = MalformedPositionsHub()
+    state, client, brake = _brake(tmp_path, hub)
+    record(state, _rec())
+    record(state, _rec(position_id="ap_2"))
+    await brake.fire(load(state)["ap_1"], now=1000.0)
+    await brake.fire(load(state)["ap_2"], now=1000.0)
+    assert len(client.messages) == 2
+
+
 # ---- the tick: observation to firing --------------------------------------
 #
 # tick() takes the FULL normalized quote per symbol (ts, bid, ask included),

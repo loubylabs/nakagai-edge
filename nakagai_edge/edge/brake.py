@@ -18,6 +18,7 @@ price may be believed lives here where it can be tested exhaustively.
 import json
 import logging
 import math
+import time
 
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.supervision import claim, load, mark
@@ -32,6 +33,7 @@ MAX_JUMP_PCT = 20.0           # from the prior observation
 BREACH_CONFIRMATIONS = 2      # consecutive sane breaches before firing
 BRAKE_INTERVAL_S = 15.0
 QUOTE_FAMINE_TICKS = 8        # two minutes of blindness at that cadence
+NOTIFY_BACKOFF_S = 3600.0     # one owner message per position per reason
 
 _PRICE_KEYS = ("price", "last_trade_price", "last_price", "mark_price", "last")
 _BID_KEYS = ("bid", "bid_price")
@@ -216,6 +218,9 @@ class Brake:
         # Reset by the first usable one, so the count is always the length of
         # the CURRENT blindness, not a lifetime total.
         self._dry: dict = {}
+        # (position_id, reason) -> (when the owner was told, the state then).
+        # See _refuse: the journal keeps every refusal, the chat does not.
+        self._told: dict = {}
 
     def quote_symbols(self) -> list[str]:
         """Symbols worth a quote this tick: armed, warranted, not disarmed."""
@@ -268,7 +273,7 @@ class Brake:
             self._runs[pid] = run
             if confirmed(run):
                 self._runs[pid] = 0
-                if await self.fire(rec) == "":
+                if await self.fire(rec, now=now) == "":
                     fired.append(pid)
         return fired
 
@@ -351,9 +356,49 @@ class Brake:
         except Exception:  # noqa: BLE001 (never let a message failure matter)
             pass
 
-    async def fire(self, rec: dict) -> str:
-        """Place the exit. Returns "" on success, else why it did not fire."""
+    def _tell_owner(self, rec: dict, reason: str, text: str, now: float) -> None:
+        """Send `text` unless the owner already heard this same complaint.
+
+        An unfireable position is retried on every 15-second pass forever, so
+        an unthrottled message is roughly 118 owner messages an hour about one
+        name, on every refusal path. Spec section 9 asks for backoff and an
+        alert after a few failures, not one alert per failure. Only the chat is
+        throttled: the journal keeps every refusal, because it is the record of
+        what happened and it is not the thing an owner learns to ignore.
+
+        Suppression is per position AND per reason, and it re-opens the moment
+        the record's state changes: the next thing the owner needs to hear must
+        never be swallowed by the last thing they were told.
+        """
+        pid, state = rec["position_id"], rec.get("state")
+        told = self._told.get((pid, reason))
+        if told is not None and told[1] == state and now - told[0] < NOTIFY_BACKOFF_S:
+            return
+        self._told[(pid, reason)] = (now, state)
+        self._notify(text)
+
+    def _refuse(self, rec: dict, why_not: str, owner_text: str,
+                now: float) -> str:
+        """Journal a refusal, tell the owner if they have not just heard it."""
+        self.audit.record("denial", rec["connector_id"], "brake",
+                          {"position_id": rec["position_id"], "reason": why_not})
+        self._tell_owner(rec, why_not, owner_text, now)
+        return why_not
+
+    def _forget_refusals(self, position_id: str) -> None:
+        """Drop this position's suppression state: the condition cleared."""
+        for key in [k for k in self._told if k[0] == position_id]:
+            del self._told[key]
+
+    async def fire(self, rec: dict, *, now: float | None = None) -> str:
+        """Place the exit. Returns "" on success, else why it did not fire.
+
+        `now` is only the clock the owner-notification backoff is measured on;
+        nothing about the authority to fire depends on it. tick() passes its
+        own so one pass reads one clock.
+        """
         pid = rec["position_id"]
+        now = time.time() if now is None else now
         if rec.get("state") != "armed":
             return f"position {pid} is already {rec.get('state')}"
 
@@ -365,27 +410,25 @@ class Brake:
             # supervise() already records such a position `unguarded`; this is
             # the last line of that same rule, for a record that reached
             # `armed` some other way.
-            why_not = "the record names no account, so no broker can be asked"
-            self.audit.record("denial", rec["connector_id"], "brake",
-                              {"position_id": pid, "reason": why_not})
-            self._notify(f"The brake cannot exit {rec['symbol']}: {why_not}. "
-                         f"That position is unguarded.")
-            return why_not
+            return self._refuse(
+                rec, "the record names no account, so no broker can be asked",
+                f"The brake cannot exit {rec['symbol']}: the ledger record "
+                f"names no account, so no broker can be asked about it. That "
+                f"position is unguarded.", now)
 
         held = await self._held_now(rec)
         if held is None:
             # Over-refusal here is real harm, not caution: the stop was just
             # touched and the brake is declining to act on it, so the owner
             # must hear that exactly as loudly as any other unguarded moment.
-            why_not = "the broker would not confirm the position; not firing blind"
-            self.audit.record("denial", rec["connector_id"], "brake",
-                              {"position_id": pid, "reason": why_not})
-            self._notify(f"The brake could not confirm {rec['symbol']} with the "
-                         f"broker and did NOT fire. That position is unguarded "
-                         f"until the next pass can read it.")
-            return why_not
+            return self._refuse(
+                rec, "the broker would not confirm the position; not firing blind",
+                f"The brake could not confirm {rec['symbol']} with the broker "
+                f"and did NOT fire. That position is unguarded until a pass "
+                f"can read it.", now)
         if held <= 0:
             mark(self.state, pid, "released", confirmed_qty=0.0)
+            self._forget_refusals(pid)
             return "the position is no longer held"
 
         spec = self.hub.spec(rec["connector_id"])
@@ -403,21 +446,19 @@ class Brake:
             # refusing here, before a size is even computed, names the exact
             # reason instead of failing later on a mismatch this didn't cause.
             why_not = "warrant ceiling is not a usable number"
-            self.audit.record("denial", rec["connector_id"], "brake",
-                              {"position_id": pid, "reason": why_not})
-            self._notify(f"The brake could not exit {rec['symbol']}: {why_not}. "
-                         f"That position is unguarded.")
-            return why_not
+            return self._refuse(
+                rec, why_not,
+                f"The brake could not exit {rec['symbol']}: {why_not}. That "
+                f"position is unguarded.", now)
         qty = min(float(held), ceiling)
         args = exit_order_args(spec.guardrails.order_shape,
                                rec.get("entry_args") or {}, qty)
         if args is None:
             why_not = "this connector cannot express a market exit"
-            self.audit.record("denial", rec["connector_id"], "brake",
-                              {"position_id": pid, "reason": why_not})
-            self._notify(f"The brake could not build an exit for {rec['symbol']}: "
-                         f"{why_not}. That position is unguarded.")
-            return why_not
+            return self._refuse(
+                rec, why_not,
+                f"The brake could not build an exit for {rec['symbol']}: "
+                f"{why_not}. That position is unguarded.", now)
 
         # Verify the order about to reach the broker, not a restatement of
         # the ledger's own assumptions. Reading the fields back out of `args`
@@ -440,11 +481,10 @@ class Brake:
             public_key(self.state), warrant, sent,
             agent_id=agent.get("agent_id"), held_qty=held, spent=False)
         if why_not:
-            self.audit.record("denial", rec["connector_id"], "brake",
-                              {"position_id": pid, "reason": why_not})
-            self._notify(f"The brake could not exit {rec['symbol']}: {why_not}. "
-                         f"That position is unguarded.")
-            return why_not
+            return self._refuse(
+                rec, why_not,
+                f"The brake could not exit {rec['symbol']}: {why_not}. That "
+                f"position is unguarded.", now)
 
         # One shot: spend the warrant BEFORE the call, so a crash mid-flight
         # can never produce a second exit on restart. A compare-and-swap, not
@@ -465,10 +505,14 @@ class Brake:
                               {"position_id": pid, "error": str(e)})
             if denied:
                 # Never left the machine, so nothing happened and this is safe
-                # to retry once the owner fixes the configuration.
+                # to retry once the owner fixes the configuration. Retried on
+                # every pass, so the owner message is throttled like the
+                # refusals above; the journal above still gets every attempt.
                 mark(self.state, pid, "armed")
-                self._notify(f"The brake was refused on {rec['symbol']}: {e}. "
-                             f"Nothing was placed and the position is unguarded.")
+                self._tell_owner(
+                    rec, str(e),
+                    f"The brake was refused on {rec['symbol']}: {e}. Nothing "
+                    f"was placed and the position is unguarded.", now)
             else:
                 mark(self.state, pid, "outcome_unknown", error=str(e))
                 self._notify(
@@ -482,6 +526,7 @@ class Brake:
             return str(e)
 
         mark(self.state, pid, "fired", fired_qty=qty)
+        self._forget_refusals(pid)
         self.audit.record("execution", rec["connector_id"], "brake",
                           {"position_id": pid, "qty": qty, "ok": True})
         try:
