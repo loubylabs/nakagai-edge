@@ -173,13 +173,18 @@ def reconcile(state: EdgeState, portfolio_doc: dict) -> dict:
     for rec in doc.values():
         if rec.get("state") in TERMINAL:
             continue
+        direction = rec.get("direction", "long")
+        if direction not in ("long", "short"):
+            # An uninterpretable direction cannot tell us how to read the
+            # broker's sign, so leave the record alone rather than guess.
+            continue
         key = (rec["connector_id"], rec["account"], rec["symbol"])
         if key[:2] not in seen:
             continue                      # this account did not answer
         if key in unread:
             continue                      # quantity present but unparseable, not a release
         raw = held.get(key, 0.0)
-        expected = 1.0 if rec.get("direction", "long") == "long" else -1.0
+        expected = 1.0 if direction == "long" else -1.0
         rec["last_confirmed_at"] = now
         if raw == 0:
             # Absent from a successful snapshot, or genuinely flat: closed.
@@ -193,8 +198,7 @@ def reconcile(state: EdgeState, portfolio_doc: dict) -> dict:
             # the position we would exit is not the position we are watching.
             # Exiting on the warrant's side would ADD exposure, which is the one
             # thing a reduce-only brake may never do. Leave it alone and say so.
-            rec["anomaly"] = (f"broker reports {raw:g} against a recorded "
-                              f"{rec.get('direction', 'long')} position")
+            rec["anomaly"] = f"broker reports {raw:g} against a recorded {direction} position"
             continue
         actual = abs(raw)
         ceiling = float(rec["entry_qty"])
@@ -216,16 +220,19 @@ def open_risk(state: EdgeState, prices: dict) -> list[dict]:
         price = prices.get(rec["symbol"])
         entry, stop = float(rec["entry_price"]), float(rec["stop"])
         one_r = abs(entry - stop)
-        long_ = rec.get("direction", "long") == "long"
+        direction = rec.get("direction", "long")
         unrealized_r = distance = None
-        if price is not None and one_r > 0:
+        # An unrecognized direction cannot say which way "unrealized" points,
+        # so report it as unknown rather than silently reading it as short.
+        if direction in ("long", "short") and price is not None and one_r > 0:
+            long_ = direction == "long"
             move = (price - entry) if long_ else (entry - price)
             unrealized_r = move / one_r
             distance = (price - stop) if long_ else (stop - price)
         out.append({
             "position_id": rec["position_id"], "symbol": rec["symbol"],
             "connector_id": rec["connector_id"], "account": rec["account"],
-            "direction": rec.get("direction", "long"),
+            "direction": direction,
             "signal_id": rec.get("signal_id", ""),
             "qty": rec.get("confirmed_qty", rec["entry_qty"]),
             "unguarded_qty": rec.get("unguarded_qty", 0.0),

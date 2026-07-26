@@ -30,6 +30,15 @@ class FakeHub:
         return self._spec
 
 
+class RaisingHub:
+    """A hub whose spec() blows up mid-lookup, the way a misbehaving registry
+    or a stale connector cache actually could. Used to prove supervise()'s
+    try/except really guards a raise, not just a None short-circuit."""
+
+    def spec(self, connector_id):
+        raise RuntimeError("registry unavailable")
+
+
 def _intent():
     return {"connector_id": "demo", "tool": "place_equity_order",
             "args": dict(ENTRY_ARGS)}
@@ -44,7 +53,7 @@ def _record(warrant=None):
 
 def test_an_executed_entry_becomes_a_supervised_position(tmp_path):
     state = EdgeState(tmp_path)
-    supervise(FakeHub(), state, _intent(), _record({"grant_id": "wr_1"}),
+    supervise(FakeHub(), state, "ap_1", _intent(), _record({"grant_id": "wr_1"}),
               {"data": {"order_id": "42"}})
     rec = load(state)["ap_1"]
     assert rec["symbol"] == "AAPL"
@@ -53,13 +62,14 @@ def test_an_executed_entry_becomes_a_supervised_position(tmp_path):
     assert rec["stop"] == 46.20
     assert rec["signal_id"] == "sig_1"
     assert rec["state"] == "armed"
+    assert rec["account"] == "463605220"
 
 
 def test_a_platform_that_sent_no_warrant_leaves_an_unguarded_record(tmp_path):
     # Version skew is not a policy decision. The entry was approved and it
     # executed; the owner must be able to SEE that it is unprotected.
     state = EdgeState(tmp_path)
-    supervise(FakeHub(), state, _intent(), _record(), {})
+    supervise(FakeHub(), state, "ap_1", _intent(), _record(), {})
     rec = load(state)["ap_1"]
     assert rec["state"] == "unguarded"
     assert rec["warrant"] is None
@@ -69,27 +79,73 @@ def test_an_entry_with_no_stop_is_not_supervised_at_all(tmp_path):
     state = EdgeState(tmp_path)
     intent = _intent()
     del intent["args"]["stop_price"]
-    supervise(FakeHub(), state, intent, _record({"grant_id": "wr_1"}), {})
+    supervise(FakeHub(), state, "ap_1", intent, _record({"grant_id": "wr_1"}), {})
     assert load(state) == {}
 
 
 def test_a_connector_with_no_declared_shape_is_not_supervised(tmp_path):
     state = EdgeState(tmp_path)
-    supervise(FakeHub(OrderShape()), state, _intent(),
+    supervise(FakeHub(OrderShape()), state, "ap_1", _intent(),
               _record({"grant_id": "wr_1"}), {})
     assert load(state) == {}
 
 
 def test_a_reported_fill_price_beats_the_order_price(tmp_path):
     state = EdgeState(tmp_path)
-    supervise(FakeHub(), state, _intent(), _record({"grant_id": "wr_1"}),
+    supervise(FakeHub(), state, "ap_1", _intent(), _record({"grant_id": "wr_1"}),
               {"data": {"order_id": "42", "average_price": "47.61"}})
     assert load(state)["ap_1"]["entry_price"] == 47.61
 
 
-def test_supervision_never_raises_into_the_executor(tmp_path):
-    # A bookkeeping failure must never relabel a really-executed trade.
+def test_a_zero_fill_price_falls_back_to_the_order_price(tmp_path):
+    # A broker can plausibly echo "0" for an order accepted but not yet
+    # filled. Trusting it would put a zero-priced entry into every R this
+    # position ever reports.
     state = EdgeState(tmp_path)
-    supervise(FakeHub(), state, {"connector_id": "demo", "tool": "t"},
-              _record(), None)
+    supervise(FakeHub(), state, "ap_1", _intent(), _record({"grant_id": "wr_1"}),
+              {"data": {"order_id": "42", "average_price": "0"}})
+    assert load(state)["ap_1"]["entry_price"] == 47.55
+
+
+def test_supervision_never_raises_into_the_executor(tmp_path):
+    # A bookkeeping failure must never relabel a really-executed trade. This
+    # must make supervise() actually raise inside its body (a hub.spec() that
+    # blows up on an otherwise-complete intent), not merely short-circuit on
+    # a None from read_entry: removing the try/except must fail this test.
+    state = EdgeState(tmp_path)
+    supervise(RaisingHub(), state, "ap_1", _intent(),
+              _record({"grant_id": "wr_1"}), {"data": {"order_id": "42"}})
     assert load(state) == {}
+
+
+def test_an_unclassifiable_order_side_records_unguarded(tmp_path):
+    # "sell_short" is neither buy nor sell for this connector's declared
+    # values, so direction cannot be read. Failing open to "short" would put
+    # a wrong sign into reconcile's broker comparison; failing closed leaves
+    # the position visible but never acted on.
+    state = EdgeState(tmp_path)
+    intent = _intent()
+    intent["args"]["side"] = "transfer"
+    supervise(FakeHub(), state, "ap_1", intent, _record({"grant_id": "wr_1"}), {})
+    rec = load(state)["ap_1"]
+    assert rec["direction"] == ""
+    assert rec["state"] == "unguarded"
+    assert rec["warrant"] is None
+    assert rec["anomaly"] == "unclassifiable order side"
+
+
+def test_an_entry_with_no_recognizable_account_records_unguarded(tmp_path):
+    # None of GuardrailsConfig's default arg_names ("account_number",
+    # "account_id", "account") appear in the order, so account cannot be
+    # named. An empty account would never appear in reconcile's answered()
+    # set, so the record would never sync to broker truth again; recording it
+    # unguarded keeps that visible instead of silently orphaning it.
+    state = EdgeState(tmp_path)
+    intent = _intent()
+    del intent["args"]["account_number"]
+    supervise(FakeHub(), state, "ap_1", intent, _record({"grant_id": "wr_1"}), {})
+    rec = load(state)["ap_1"]
+    assert rec["account"] == ""
+    assert rec["state"] == "unguarded"
+    assert rec["warrant"] is None
+    assert rec["anomaly"] == "no account on the order"
