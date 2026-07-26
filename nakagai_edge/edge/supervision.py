@@ -11,6 +11,23 @@ unguarded. A position that vanished is released. And a connector whose
 snapshot FAILED reconciles nothing at all, because a brief broker outage looks
 exactly like "the position was closed", and releasing on that would disarm the
 brake at the worst possible moment.
+
+Two fields on a record say why something is wrong, and the difference between
+them is load-bearing:
+
+`anomaly` is an OBSERVATION about the broker, made during reconciliation and
+cleared by reconciliation the moment the broker stops saying it. It is
+transient by design.
+
+`blocked` is a JUDGEMENT made once, at entry, in executor.supervise: this
+record names a side we cannot classify, an account we cannot name, or a
+connector that declared no way to express a market order. It is written on
+every record (empty string when the position is fine) and it is **never
+cleared, by reconciliation or by anything else**, because no later observation
+can change what the entry order said. Every gate that could re-arm a
+position (renewal_request, apply_renewals, is_guarded) reads it. That
+redundancy is deliberate: this branch has three times now enforced a
+disqualification at the entry path and then quietly undone it downstream.
 """
 
 import json
@@ -301,14 +318,14 @@ def renewal_request(state: EdgeState) -> list[dict]:
     """What the platform needs to re-sign this edge's live warrants.
 
     Excludes any record the edge could never act on no matter what warrant came
-    back: a direction that is not exactly "long" or "short" (the entry side
-    could not be classified), or an empty account. Both halves matter, and the
-    account half is the sharper one: `brake.fire()` asks the broker about
-    `rec["account"]`, and a broker asked about account "" can answer with a
-    readable list that does not name the symbol, which reads as "flat" and
-    releases a fully-held position. Asking the platform to re-sign a warrant
-    that can never be used is pointless traffic; PROMOTING a record on the
-    answer is a live position reported as guarded.
+    back. `blocked` is the whole answer for anything written since it existed;
+    the direction and account checks stay because a record written before it
+    carries no `blocked` field at all, and dropping a working guard to chase
+    tidiness is how this bug arrives a fourth time.
+
+    Asking the platform to re-sign a warrant that can never be used is
+    pointless traffic; PROMOTING a record on the answer is a live position
+    reported as guarded, which is the actual harm.
     """
     return [{"position_id": rec["position_id"],
              "connector_id": rec["connector_id"], "account": rec["account"],
@@ -317,6 +334,7 @@ def renewal_request(state: EdgeState) -> list[dict]:
              "signal_id": rec.get("signal_id", "")}
             for rec in load(state).values()
             if rec.get("state") in ("armed", "unguarded")
+            and not rec.get("blocked")
             and rec.get("direction") in ("long", "short")
             and rec.get("account")]
 
@@ -339,14 +357,16 @@ def apply_renewals(state: EdgeState, warrants: dict) -> dict:
         rec = doc.get(position_id)
         if rec is None or rec.get("state") in TERMINAL:
             continue
-        if rec.get("direction") not in ("long", "short") or not rec.get("account"):
+        if (rec.get("blocked") or rec.get("direction") not in ("long", "short")
+                or not rec.get("account")):
             # Unguarded because the edge cannot act on this record at all (see
-            # renewal_request above), not because a warrant was missing: no
-            # warrant, however well-formed, makes closing_side() stop
-            # returning "" for an unclassifiable side, or makes account "" a
-            # question a broker can answer. Promoting it to "armed" would make
-            # open_risk report guarded: True for a position that can never
-            # actually be exited.
+            # renewal_request above), not because a warrant was missing. No
+            # warrant, however well-formed, makes closing_side() stop returning
+            # "" for an unclassifiable side, makes account "" a question a
+            # broker can answer, or teaches a connector how to say "market
+            # order". Promoting it to "armed" would make open_risk report
+            # guarded: True for a position that can never actually be exited,
+            # and this path is where that has happened twice.
             continue
         if not isinstance(warrant, dict):
             continue          # one malformed entry must cost only itself
@@ -400,7 +420,15 @@ def is_guarded(rec: dict, *, brake_armed: bool, disarmed,
     unless the expiry is read here. `now` stays optional, and omitting it skips
     only that check, so a caller that predates it does not suddenly report
     everything unguarded; both real callers pass one.
+
+    `blocked` sits above all four. It is the durable judgement made at entry
+    (see the module docstring), and it is checked here because this is the one
+    function every display path goes through: each of the three times a
+    disqualified record has been re-armed downstream, this check is what would
+    have kept `guarded` honest anyway.
     """
+    if rec.get("blocked"):
+        return False
     if not (bool(rec.get("warrant")) and rec.get("state") == "armed"
             and brake_armed and rec.get("position_id") not in disarmed):
         return False

@@ -13,6 +13,7 @@ from nakagai_edge.edge.supervision import (
 # and `guarded` now reads it, so the fixture has to carry a real one too.
 EXPIRY = 4_102_444_800.0            # 2100-01-01
 BEFORE_EXPIRY = EXPIRY - 3600.0
+LONG_EXPIRED = 1_000_000_000.0      # 2001-09-09, past against any real clock
 
 
 def _rec(**over):
@@ -26,6 +27,13 @@ def _rec(**over):
            "state": "armed", "opened_at": 1.0}
     rec.update(over)
     return rec
+
+
+def _blocked_rec(**over):
+    # A record the edge established at entry it can never act on. Its direction
+    # and account are both fine, so nothing but `blocked` can catch it.
+    why = "connector declares no market_order_args"
+    return _rec(blocked=why, anomaly=why, **over)
 
 
 def _portfolio(qty, *, error="", symbol="AAPL"):
@@ -300,6 +308,48 @@ def test_open_risk_reports_unguarded_on_an_expired_warrant(tmp_path):
     record(state, _rec())
     assert open_risk(state, {}, now=EXPIRY + 1)[0]["guarded"] is False
     assert open_risk(state, {}, now=BEFORE_EXPIRY)[0]["guarded"] is True
+
+
+def test_open_risk_checks_expiry_against_the_real_clock_by_default(tmp_path):
+    # No `now=`, exactly as runtime.py and cli.py call it. Every test above
+    # passes one explicitly, which is precisely why none of them notices if
+    # open_risk stops reading the clock: is_guarded(now=None) is permissive by
+    # design, so deleting that one default line silently un-does the whole
+    # expiry fix in production while the suite stays green.
+    state = EdgeState(tmp_path)
+    record(state, _rec(warrant={"grant_id": "wr_1", "expires_at": LONG_EXPIRED}))
+    assert open_risk(state, {})[0]["guarded"] is False
+
+
+def test_is_guarded_false_for_a_blocked_record_however_it_got_armed():
+    # The last line of the same rule, and the layer that would have caught all
+    # three times this branch re-armed a record it had already disqualified.
+    # Everything else here is in order: warranted, armed, live warrant, both
+    # switches on. Only `blocked` knows the connector can never build an exit.
+    rec = _rec(blocked="connector declares no market_order_args")
+    assert is_guarded(rec, brake_armed=True, disarmed=frozenset(),
+                      now=BEFORE_EXPIRY) is False
+
+
+def test_is_guarded_is_unaffected_by_an_empty_blocked_field():
+    # Every healthy record carries blocked: "", so an empty string must read
+    # as "nothing wrong" rather than as a disqualification.
+    assert is_guarded(_rec(blocked=""), brake_armed=True, disarmed=frozenset(),
+                      now=BEFORE_EXPIRY) is True
+
+
+def test_reconcile_clears_the_anomaly_but_never_the_blocked_field(tmp_path):
+    # `anomaly` is an observation about the broker and clears when the broker
+    # stops saying it. `blocked` is something learned at entry that no later
+    # observation can change, and reconcile's pop() is exactly how the last
+    # trace of it used to disappear one portfolio sweep after entry.
+    state = EdgeState(tmp_path)
+    record(state, _blocked_rec())
+    reconcile(state, _portfolio(80))
+    row = load(state)["ap_1"]
+    assert row["confirmed_qty"] == 80.0
+    assert "anomaly" not in row
+    assert row["blocked"] == "connector declares no market_order_args"
 
 
 @pytest.mark.parametrize("terminal_state", TERMINAL)

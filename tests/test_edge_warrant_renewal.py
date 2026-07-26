@@ -89,6 +89,41 @@ def test_an_unclassifiable_position_is_absent_from_the_renewal_request(tmp_path)
     assert renewal_request(state) == []
 
 
+# ---- final round: the disqualification travels WITH the record ----------
+#
+# Three times now, a rule enforced at the entry path has been quietly undone
+# downstream. `blocked` is written once at entry and never cleared, so the
+# renewal path cannot re-arm a record the edge established it can never act
+# on. These use the market_order_args case on purpose: its direction and
+# account are both perfectly good, so only `blocked` can catch it.
+
+
+def _blocked_rec(**over):
+    return _rec(blocked="connector declares no market_order_args",
+                anomaly="connector declares no market_order_args",
+                warrant=None, state="unguarded", **over)
+
+
+def test_a_blocked_position_is_absent_from_the_renewal_request(tmp_path):
+    state = EdgeState(tmp_path)
+    record(state, _blocked_rec())
+    assert renewal_request(state) == []
+
+
+def test_apply_renewals_refuses_to_arm_a_blocked_position(tmp_path):
+    # The reopening in full: sixty seconds after entry the platform answers
+    # with a perfectly valid warrant, and before this the record went back to
+    # `armed` and reported guarded: true for a brake that can never fire.
+    state = EdgeState(tmp_path)
+    record(state, _blocked_rec())
+    apply_renewals(state, {"ap_1": {"grant_id": "wr_2", "max_qty": 100.0,
+                                    "expires_at": 99999.0}})
+    row = load(state)["ap_1"]
+    assert row["state"] == "unguarded"
+    assert row["warrant"] is None
+    assert row["blocked"]
+
+
 def test_an_account_less_position_is_absent_from_the_renewal_request(tmp_path):
     # Task 4 disqualified the account-less record for the same reason as the
     # side-less one, and the renewal path has to honour BOTH halves of that

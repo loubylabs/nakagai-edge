@@ -192,6 +192,27 @@ def test_a_connector_with_no_market_order_args_records_unguarded(tmp_path):
     assert "market_order_args" in rec["anomaly"]
 
 
+def test_the_disqualification_is_persisted_on_the_record(tmp_path):
+    # `anomaly` is not enough: reconcile pops it on the next clean sweep, and
+    # the renewal path re-armed the record sixty seconds after entry. `blocked`
+    # is the durable half, written once here and read by every downstream gate.
+    state = EdgeState(tmp_path)
+    supervise(FakeHub(NO_MARKET_SHAPE), state, "ap_1", _intent(),
+              _record({"grant_id": "wr_1"}), {})
+    assert load(state)["ap_1"]["blocked"] == "connector declares no market_order_args"
+
+
+def test_a_healthy_position_records_an_empty_blocked_field(tmp_path):
+    # Present and falsy, not absent: every gate reads it, and a field that
+    # only appears on failures invites a `.get()` that quietly means "fine".
+    state = EdgeState(tmp_path)
+    supervise(FakeHub(), state, "ap_1", _intent(), _record({"grant_id": "wr_1"}),
+              {"data": {"order_id": "42"}})
+    rec = load(state)["ap_1"]
+    assert rec["blocked"] == ""
+    assert rec["state"] == "armed"
+
+
 def test_a_swallowed_bookkeeping_failure_says_so_in_the_log(tmp_path, caplog):
     # The swallow stays: it must never relabel a genuinely executed trade. But
     # a silent swallow leaves a LIVE position with no ledger record and no

@@ -197,6 +197,20 @@ def test_mark_guarded_tags_false_once_the_warrant_has_expired(tmp_path):
     assert out[0]["accounts"][0]["positions"][0]["guarded"] is False
 
 
+def test_mark_guarded_checks_expiry_against_the_real_clock_by_default(tmp_path):
+    """No `now=`, exactly as snapshot_and_push calls it. The test above passes
+    one explicitly and so cannot notice if mark_guarded stops reading the
+    clock: is_guarded(now=None) is permissive by design, so deleting that one
+    default line puts the expired-warrant marker back on the owner's Portfolio
+    page with the suite still green."""
+    state = EdgeState(tmp_path)
+    _supervised(state, warrant={"trigger": {"type": "price_below",
+                                            "level": 460.0},
+                                "expires_at": 1_000_000_000.0})   # 2001
+    out = mark_guarded(state, _connectors_with_one_position())
+    assert out[0]["accounts"][0]["positions"][0]["guarded"] is False
+
+
 # ---- spec discovery ------------------------------------------------------
 
 def test_broker_specs_reads_only_enabled_mcp_brokers(tmp_path):

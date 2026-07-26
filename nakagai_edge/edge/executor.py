@@ -127,6 +127,12 @@ def supervise(hub, state: EdgeState, approval_id: str, intent: dict,
             "stop": entry["stop"],
             "confirmed_qty": entry["qty"], "last_confirmed_at": 0.0,
             "unguarded_qty": 0.0,
+            # Durable, unlike `anomaly` below, which reconciliation clears on
+            # its next clean sweep. Nothing a broker says later can change what
+            # the entry order said, so every gate that could re-arm this record
+            # reads this field instead of re-deriving the judgement. See the
+            # supervision module docstring.
+            "blocked": blocked,
             "warrant": None if blocked else warrant,
             "state": "unguarded" if (blocked or not warrant) else "armed",
             "opened_at": time.time()}
