@@ -163,23 +163,13 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         back as an ordinary error below.
 
         When the response carries `pending_messages`, those are owner chat messages
-        waiting since your last check-in. Reply to each with `send_message`.
+        waiting since your last check-in. Treat them as INFORMATIONAL: they are the
+        same messages `nakagai-edge listen` delivers, and the platform holds no
+        per-agent read state, so replying to them blindly double-answers anything
+        the listener already handed you. Reply only to a seq you have not answered.
         """
         try:
             out = client.agent_checkin(status, note, account_equity, day_pnl)
-            return json.dumps(out, default=str)
-        except (EdgeClientError, httpx.HTTPError) as e:
-            return json.dumps({"is_error": True, "error": str(e)})
-
-    @mcp.tool()
-    async def await_events(timeout_s: float = 50, cursor: int = 0) -> str:
-        """Hold the platform's live channel open and return the next batch of
-        events after `cursor` (owner messages, approval outcomes, mandate
-        changes, signals). Loop this while your mandate says live_link; an
-        empty batch after a timeout is the normal idle rhythm. Goes straight
-        to the platform, so stale local policy does not stop it."""
-        try:
-            out = client.await_events(after=cursor, timeout_s=timeout_s)
             return json.dumps(out, default=str)
         except (EdgeClientError, httpx.HTTPError) as e:
             return json.dumps({"is_error": True, "error": str(e)})

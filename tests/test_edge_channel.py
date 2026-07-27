@@ -1,6 +1,6 @@
-"""An edge agent's live-channel loop reaches the platform: the edge shim's
-await_events/send_message tools forward to /api/agent/events and
-/api/agent/message through a real bridged ASGI stack, like test_edge_checkin."""
+"""An edge agent's live-channel loop reaches the platform: `nakagai-edge listen`
+reads /api/agent/events and the send_message tool forwards to
+/api/agent/message, through a real bridged ASGI stack, like test_edge_checkin."""
 
 import json
 
@@ -93,21 +93,34 @@ def _tool_json(result) -> dict:
     return json.loads(text)
 
 
-async def test_await_events_tool_returns_the_owner_message_and_a_cursor(
-        tmp_path, platform):
-    """The wrapper layer itself: cursor->after mapping and the json.dumps
-    output shape, not just the PlatformClient method underneath it."""
+def test_listener_emits_an_owner_message_through_the_real_stack(tmp_path, platform):
+    """The listener against a real platform, not a scripted client: a message
+    posted to the owner's pane comes back out as one emitted line.
+
+    This replaces the old await_events MCP tool test. The tool is gone: once
+    `nakagai-edge listen` owns reading the channel, a second read path over the
+    same cursor-less endpoint would hand an agent every message twice.
+    """
+    from nakagai_edge.edge.listen import ChannelListener, CursorStore
+
     app, web, token = platform
     client = _bridged(app, token)
-    mcp = _edge_mcp(tmp_path / "edge", client)
+    root = tmp_path / "edge"
+    # Resume from the beginning so the drain sees the message posted below;
+    # a fresh listener would anchor to now and skip it, which is the point.
+    CursorStore(root).save(0)
 
     web.post("/api/channel/message", json={"text": "owner says hi"},
              headers={**AUTH, "X-User": "chris@nakag.ai"})
 
-    result = await mcp.call_tool("await_events", {"timeout_s": 0, "cursor": 0})
-    out = _tool_json(result)
-    assert out["events"][0]["body"]["text"] == "owner says hi"
-    assert "cursor" in out
+    emitted = []
+    once = iter([True, False])
+    ChannelListener(client, root, emit=emitted.append, sleep=lambda _s: None,
+                    timeout_s=0).run(should_continue=lambda: next(once, False))
+
+    assert [e["text"] for e in emitted] == ["owner says hi"]
+    assert emitted[0]["from"] == "chris@nakag.ai"
+    assert CursorStore(root).load() == emitted[0]["cursor"]
 
 
 async def test_send_message_tool_returns_ok_and_seq(tmp_path, platform):
