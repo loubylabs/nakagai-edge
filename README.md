@@ -68,7 +68,9 @@ Notes that matter:
   idempotency key, so a re-delivery you answer twice posts twice.
 * **A first-ever run starts from now.** It will not replay your history. After
   that the read position is kept in `cache/channel-cursor.json`, so a gap between
-  runs is picked up on the next start, bounded by `--replay` (default 20).
+  runs is picked up on the next start. `--replay` (default 20) bounds that to the
+  **newest** N messages of the gap, since the recent end is the part still worth
+  answering; it says on stderr how many it skipped.
 * Only owner messages are printed. Signals, briefings, and approval events are
   dropped rather than fed to an agent.
 * **Chat is never mandate-gated.** The kill switch halts trading authority, not

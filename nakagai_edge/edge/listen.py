@@ -3,7 +3,7 @@
 The agent is turn-based and cannot be pushed to, so something local has to hold
 the line and turn an arriving message into a wake-up. That is this module.
 
-Two design points carry most of the weight:
+Three design points carry most of the weight:
 
 * The hold is CONTINUOUS. Presence on the platform is `holds > 0`
   (nakagai/channel.py), true only while someone is actively holding a long poll,
@@ -12,10 +12,17 @@ Two design points carry most of the weight:
 * The listener is PACED. Every /api/agent/* route shares one per-agent token
   bucket, so an unpaced drain here does not degrade chat, it 429s the trade
   executor and the stop-loss brake: a granted approval then reads as "no such
-  approval" and a stop-loss execution report is dropped for good. Never
-  cold-start at cursor 0, bound every catch-up, stay well under the refill rate.
+  approval" and a stop-loss execution report is dropped for good.
+* The saved cursor NEVER outruns what has been emitted. A cursor past an
+  unemitted owner message is silent message loss, which is the exact failure
+  this feature exists to remove. During catch-up nothing is saved at all: the
+  gap is buffered, trimmed to the NEWEST `replay` messages, emitted, and only
+  then is the cursor written. A crash mid-catch-up re-does the gap, which is
+  the right direction to fail (delivery is at-least-once and the consumer
+  dedupes on seq).
 """
 
+import fcntl
 import json
 import os
 import sys
@@ -36,61 +43,77 @@ DEFAULT_MAX_CATCHUP_REQUESTS = 50
 BACKOFF_START_S = 1.0
 BACKOFF_CAP_S = 60.0
 ANCHOR_NOW = -1
+# How much of a gap may be held in memory before the oldest end is discarded.
+# Well above any sane --replay, so the trim is what bounds delivery, not this.
+MAX_BUFFERED = 500
+
+# A malformed response is a data error, not a transport one: httpx.HTTPError
+# and EdgeClientError do not cover a 200 carrying a Cloudflare interstitial
+# (JSONDecodeError, a ValueError) or a payload missing `cursor` (KeyError) or
+# holding a null one (TypeError). One bad response must not end the hold.
+POLL_ERRORS = (EdgeClientError, httpx.HTTPError, ValueError, KeyError, TypeError)
 
 
 class ListenLocked(Exception):
     """Another listener already holds this edge's channel."""
 
 
-def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        # Someone else's process, but alive.
-        return True
-    except OSError:
-        return False
-    return True
-
-
 class ListenLock:
-    """One listener per edge root.
+    """One listener per edge, enforced with flock on a held descriptor.
 
     Two listeners would both receive every event and both reply, and presence
     cannot reveal it: `_touch` keys on agent_id, so two holds sum onto a single
     record and `presence()` flattens them to one `connected: true`.
+
+    flock rather than a pid file: the kernel releases it when the process dies,
+    however it dies, so there is no stale lock to reap, no create-then-write
+    window for a second listener to steal, and no pid-reuse hazard that could
+    lock the owner out of their own chat after a reboot.
     """
 
     def __init__(self, root) -> None:
         self.path = Path(root) / LOCK_RELPATH
+        self._fd: int | None = None
 
     def acquire(self) -> "ListenLock":
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        except FileExistsError:
-            holder = self._holder()
-            if holder is not None and _pid_alive(holder):
-                raise ListenLocked(
-                    f"another nakagai-edge listen is running (pid {holder}). "
-                    "Stop it first, or this edge would answer every message twice.")
-            # A killed listener must not lock the owner out of chat forever.
-            self.path.unlink(missing_ok=True)
-            fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-        with os.fdopen(fd, "w") as fh:
-            json.dump({"pid": os.getpid()}, fh)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            holder = self._recorded_pid(fd)
+            os.close(fd)
+            where = f" (pid {holder})" if holder else ""
+            raise ListenLocked(
+                f"another nakagai-edge listen is running{where}. Stop it first, "
+                "or this edge would answer every message twice.") from None
+        os.ftruncate(fd, 0)
+        os.write(fd, json.dumps({"pid": os.getpid()}).encode())
+        self._fd = fd
         return self
 
-    def _holder(self) -> int | None:
+    @staticmethod
+    def _recorded_pid(fd: int) -> int | None:
+        """Best effort, for the error message only. Never load-bearing: the
+        flock is what decides, so a truncated or unwritten file is harmless."""
         try:
-            return int(json.loads(self.path.read_text()).get("pid"))
-        except (OSError, ValueError, TypeError, AttributeError):
+            os.lseek(fd, 0, os.SEEK_SET)
+            return int(json.loads(os.read(fd, 256).decode() or "{}").get("pid"))
+        except (OSError, ValueError, TypeError):
             return None
 
     def release(self) -> None:
-        self.path.unlink(missing_ok=True)
+        # The file is deliberately left in place. Unlinking it would let this
+        # process delete a lock another one has since taken.
+        if self._fd is None:
+            return
+        try:
+            fcntl.flock(self._fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        finally:
+            os.close(self._fd)
+            self._fd = None
 
     def __enter__(self) -> "ListenLock":
         return self.acquire()
@@ -100,12 +123,7 @@ class ListenLock:
 
 
 class CursorStore:
-    """The read position, on disk so a gap between sessions is recoverable.
-
-    Written only AFTER a message is emitted, so a crash re-delivers rather than
-    skips. Delivery is at-least-once by the channel's own design, and the
-    consumer dedupes by seq.
-    """
+    """The read position, on disk so a gap between sessions is recoverable."""
 
     def __init__(self, root) -> None:
         self.path = Path(root) / CURSOR_RELPATH
@@ -129,7 +147,8 @@ def _stderr_note(text: str) -> None:
 
 class ChannelListener:
     def __init__(self, client, root, *, emit, note=_stderr_note,
-                 sleep=time.sleep, replay: int = DEFAULT_REPLAY,
+                 sleep=time.sleep, now=time.monotonic,
+                 replay: int = DEFAULT_REPLAY,
                  timeout_s: float = DEFAULT_TIMEOUT_S,
                  pace_s: float = DEFAULT_PACE_S,
                  max_catchup_requests: int = DEFAULT_MAX_CATCHUP_REQUESTS) -> None:
@@ -138,7 +157,8 @@ class ChannelListener:
         self.emit = emit
         self.note = note
         self.sleep = sleep
-        self.replay = int(replay)
+        self.now = now
+        self.replay = max(0, int(replay))
         self.timeout_s = float(timeout_s)
         self.pace_s = float(pace_s)
         self.max_catchup_requests = int(max_catchup_requests)
@@ -146,78 +166,133 @@ class ChannelListener:
     def run(self, should_continue=lambda: True) -> int:
         cursor = self.cursors.load()
         anchor_needed = cursor is None
-        # A resumed cursor may sit behind a real backlog; a fresh start cannot,
-        # because it anchors to now. So the replay bound applies only to a resume.
-        budget = None if anchor_needed else self.replay
+        # A resumed cursor may sit behind a real gap. A fresh start cannot,
+        # because it anchors to now, so only a resume buffers.
+        catching_up = not anchor_needed
+        pending: list[dict] = []
+        requests = 0
         backoff = BACKOFF_START_S
-        catchup_requests = 0
 
         while should_continue():
             if anchor_needed:
                 try:
-                    cursor = int(self._poll(ANCHOR_NOW, 0)["cursor"])
-                except EdgeClientError as exc:
+                    cursor = self._anchor()
+                except POLL_ERRORS as exc:
                     if self._fatal(exc):
                         return 1
-                    backoff = self._back_off(backoff)
-                    continue
-                except httpx.HTTPError as exc:
-                    self.note(f"[listen] transport error anchoring: {exc}")
+                    self.note(f"[listen] cannot anchor yet: {exc}")
                     backoff = self._back_off(backoff)
                     continue
                 self.cursors.save(cursor)
                 self.note(f"[listen] holding from cursor {cursor}")
-                anchor_needed, catchup_requests, budget = False, 0, None
+                anchor_needed, catching_up, requests = False, False, 0
+                backoff = BACKOFF_START_S
                 continue
 
+            started = self.now()
             try:
-                payload = self._poll(cursor, self.timeout_s)
-            except EdgeClientError as exc:
+                events, moved = self._poll(cursor, self.timeout_s)
+            except POLL_ERRORS as exc:
                 if self._fatal(exc):
                     return 1
-                self.note(f"[listen] platform error: {exc}")
-                backoff = self._back_off(backoff)
-                continue
-            except httpx.HTTPError as exc:
-                # Disjoint from EdgeClientError: catching only the latter would
-                # kill the listener on the first network blip.
-                self.note(f"[listen] transport error: {exc}")
+                self.note(f"[listen] {type(exc).__name__}: {exc}")
                 backoff = self._back_off(backoff)
                 continue
             backoff = BACKOFF_START_S
 
-            # Deliberately no mandate gate here. Chat is never mandate-gated:
-            # a halted agent must still be able to say that it is halted, and
-            # parking the listener during a dark phase would strand exactly the
-            # messages this feature exists to deliver. The mandate governs
-            # trading authority, not whether the owner can reach their agent.
-            events = payload.get("events") or []
-            cursor = int(payload.get("cursor", cursor))
-            budget = self._deliver(events, cursor, budget)
-            self.cursors.save(cursor)
-
-            if not events:
-                catchup_requests, budget = 0, None
+            if events and moved <= cursor:
+                # Re-delivering the same batch forever would post the same reply
+                # forever. Today's server always advances; this keeps a payload
+                # anomaly a bounded failure rather than an unbounded one.
+                self.note("[listen] batch did not advance the cursor; backing off")
+                backoff = self._back_off(backoff)
                 continue
 
-            catchup_requests += 1
-            if catchup_requests > self.max_catchup_requests:
-                self.note(f"[listen] catch-up exceeded {self.max_catchup_requests} "
-                          "requests; re-anchoring to now and skipping the rest")
-                anchor_needed = True
+            msgs = [self._envelope(e, moved) for e in events
+                    if isinstance(e, dict) and e.get("kind") == "owner_msg"]
+
+            if not catching_up:
+                for msg in msgs:
+                    self.emit(msg)
+                cursor = moved
+                self.cursors.save(cursor)
+                self._pace(started)
                 continue
-            # Pace only when there is more to fetch. A quiet hold already cost
-            # its full timeout, and sleeping after it would just add latency.
-            self.sleep(self.pace_s)
+
+            pending.extend(msgs)
+            if len(pending) > MAX_BUFFERED:
+                pending = pending[-MAX_BUFFERED:]
+            cursor = moved
+            requests += 1
+            capped = requests >= self.max_catchup_requests
+            if not events or capped:
+                self._flush(pending, capped=capped, requests=requests)
+                pending, catching_up = [], False
+                self.cursors.save(cursor)
+                continue
+            self._pace(started)
         return 0
 
-    def _poll(self, after: int, timeout_s: float) -> dict:
-        return self.client.await_events(after=after, timeout_s=timeout_s)
+    # --- one poll -------------------------------------------------------
 
-    def _fatal(self, exc: EdgeClientError) -> bool:
+    def _anchor(self) -> int:
+        payload = self.client.await_events(after=ANCHOR_NOW, timeout_s=0)
+        if not isinstance(payload, dict) or "cursor" not in payload:
+            raise ValueError("anchor response carried no cursor")
+        return int(payload["cursor"])
+
+    def _poll(self, cursor: int, timeout_s: float) -> tuple[list, int]:
+        payload = self.client.await_events(after=cursor, timeout_s=timeout_s)
+        if not isinstance(payload, dict):
+            raise ValueError(f"expected an object, got {type(payload).__name__}")
+        events = payload.get("events") or []
+        if not isinstance(events, list):
+            raise ValueError("events was not a list")
+        return events, int(payload.get("cursor", cursor))
+
+    def _pace(self, started: float) -> None:
+        """Hold the request rate under the bucket the trade executor shares.
+
+        Measured rather than assumed. A quiet hold already spent its timeout, so
+        this sleeps nothing; but if the server ever returns empty promptly, the
+        guarantee still holds instead of becoming a hot loop.
+        """
+        left = self.pace_s - (self.now() - started)
+        if left > 0:
+            self.sleep(left)
+
+    # --- delivery -------------------------------------------------------
+
+    @staticmethod
+    def _envelope(event: dict, cursor: int) -> dict:
+        body = event.get("body") or {}
+        return {"seq": event.get("seq"), "text": body.get("text", ""),
+                "from": body.get("from", ""), "at": event.get("created_at"),
+                "cursor": cursor}
+
+    def _flush(self, pending: list[dict], *, capped: bool, requests: int) -> None:
+        """Deliver the end of a gap: the NEWEST `replay`, never the oldest.
+
+        Someone restarting a listener wants the recent end of the conversation,
+        and the newest message is the one most likely to still matter.
+        """
+        keep = pending[-self.replay:] if self.replay else []
+        dropped = len(pending) - len(keep)
+        if capped:
+            self.note(f"[listen] catch-up stopped after {requests} requests; "
+                      "continuing live from here")
+        if dropped:
+            self.note(f"[listen] gap held {len(pending)} owner messages; "
+                      f"delivering the newest {len(keep)}, skipping {dropped}")
+        for msg in keep:
+            self.emit(msg)
+
+    # --- failure --------------------------------------------------------
+
+    def _fatal(self, exc: Exception) -> bool:
         """A revoked token is terminal. Reconnecting forever against it leaves
         the owner believing the pipe is live."""
-        if getattr(exc, "status", None) == 401:
+        if isinstance(exc, EdgeClientError) and getattr(exc, "status", None) == 401:
             self.note(f"[listen] {exc}")
             return True
         return False
@@ -225,23 +300,3 @@ class ChannelListener:
     def _back_off(self, backoff: float) -> float:
         self.sleep(backoff)
         return min(backoff * 2, BACKOFF_CAP_S)
-
-    def _deliver(self, events, cursor: int, budget):
-        """Emit owner messages only.
-
-        Every other kind is dropped before it reaches stdout. That is a security
-        boundary, not a convenience: `briefing` bodies carry model-written text
-        derived from third-party RSS, and house events are cross-tenant today.
-        """
-        for event in events:
-            if event.get("kind") != "owner_msg":
-                continue
-            if budget is not None:
-                if budget <= 0:
-                    continue
-                budget -= 1
-            body = event.get("body") or {}
-            self.emit({"seq": event.get("seq"), "text": body.get("text", ""),
-                       "from": body.get("from", ""), "at": event.get("created_at"),
-                       "cursor": cursor})
-        return budget

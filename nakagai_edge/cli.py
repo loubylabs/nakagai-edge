@@ -280,19 +280,22 @@ def _cmd_listen(args) -> int:
                                                  "--platform <url>`"}))
         return 1
     try:
-        lock = ListenLock(state.root).acquire()
-    except ListenLocked as e:
-        print(_json.dumps({"ok": False, "error": str(e)}))
-        return 1
-    try:
-        return ChannelListener(
-            client, state.root,
-            emit=lambda msg: print(_json.dumps(msg), flush=True),
-            replay=args.replay).run()
-    except KeyboardInterrupt:
-        return 0
+        try:
+            lock = ListenLock(state.root).acquire()
+        except ListenLocked as e:
+            print(_json.dumps({"ok": False, "error": str(e)}))
+            return 1
+        try:
+            return ChannelListener(
+                client, state.root,
+                emit=lambda msg: print(_json.dumps(msg), flush=True),
+                replay=args.replay).run()
+        except KeyboardInterrupt:
+            return 0
+        finally:
+            lock.release()
     finally:
-        lock.release()
+        # Its own block: a failed release must not skip closing the pool.
         client.close()
 
 
@@ -364,8 +367,9 @@ def main(argv=None) -> int:
         "listen", help="hold the owner's chat channel open and print each message")
     p_listen.add_argument(
         "--replay", type=int, default=20,
-        help="most messages to hand back from a gap since the last run "
-             "(default 20); a first-ever run starts from now and replays nothing")
+        help="how many of the NEWEST messages to hand back from a gap since the "
+             "last run (default 20, 0 to skip the gap entirely); a first-ever "
+             "run starts from now and replays nothing")
     p_listen.set_defaults(func=_cmd_listen)
 
     p_brake = sub.add_parser(
