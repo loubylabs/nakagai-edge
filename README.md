@@ -46,6 +46,36 @@ anything.
 Point your agent's MCP client (OpenClaw, Claude Code, Hermes, ...) at
 `http://127.0.0.1:8330/mcp/`.
 
+## Live chat with your agent
+
+`edge run` serves tools. It does not make you reachable. For that, run:
+
+```bash
+nakagai-edge listen
+```
+
+It holds the platform's chat channel open and prints one JSON object per owner
+message on stdout, `{"seq", "text", "from", "at", "cursor"}`. Point your agent at
+those lines and have it answer with the `send_message` tool. While it runs, the
+web app's chat pane reports "Agent connected", because the platform counts an
+agent as present only while a poll is genuinely held.
+
+Notes that matter:
+
+* **One listener per edge.** A second one refuses to start. Two would both
+  receive every message and both answer it.
+* **Dedupe on `seq`.** Delivery is at-least-once and `send_message` carries no
+  idempotency key, so a re-delivery you answer twice posts twice.
+* **A first-ever run starts from now.** It will not replay your history. After
+  that the read position is kept in `cache/channel-cursor.json`, so a gap between
+  runs is picked up on the next start. `--replay` (default 20) bounds that to the
+  **newest** N messages of the gap, since the recent end is the part still worth
+  answering; it says on stderr how many it skipped.
+* Only owner messages are printed. Signals, briefings, and approval events are
+  dropped rather than fed to an agent.
+* **Chat is never mandate-gated.** The kill switch halts trading authority, not
+  speech: a halted agent must still be able to tell you that it is halted.
+
 ## The write path
 
 1. **Intent.** The agent calls a write tool through the edge's MCP surface.

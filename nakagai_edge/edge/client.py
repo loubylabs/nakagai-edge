@@ -6,7 +6,17 @@ import httpx
 
 
 class EdgeClientError(Exception):
-    """The platform refused or could not be reached."""
+    """The platform refused or could not be reached.
+
+    `status` is the HTTP status when there was one, and None for a transport
+    failure. A retry loop needs it: 401 is terminal (the token was revoked and
+    reconnecting forever would leave the owner believing the pipe is live),
+    while 429 and 5xx are worth backing off and trying again.
+    """
+
+    def __init__(self, message: str, status: int | None = None) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 def _detail(resp: httpx.Response) -> str:
@@ -37,10 +47,12 @@ class PlatformClient:
 
     def _check(self, resp: httpx.Response) -> dict:
         if resp.status_code == 401:
-            raise EdgeClientError("platform rejected the agent token. Was it revoked?")
+            raise EdgeClientError(
+                "platform rejected the agent token. Was it revoked?", 401)
         if resp.status_code >= 400:
             raise EdgeClientError(f"{resp.request.method} {resp.request.url.path} "
-                                  f"-> {resp.status_code}: {_detail(resp)}")
+                                  f"-> {resp.status_code}: {_detail(resp)}",
+                                  resp.status_code)
         return resp.json()
 
     def get_bundle(self, etag: str = "") -> tuple[str, dict | None]:

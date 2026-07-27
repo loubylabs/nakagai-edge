@@ -65,8 +65,10 @@ These prove data flows OUT to the platform, not just that auth works:
 3. `refresh_portfolio()`: expect a portfolio document; it was also pushed
    to the owner's Portfolio page. A rate-limit echo (same snapshot within
    15s) still counts as green.
-4. `await_events(timeout_s=5, cursor=-1)`: an empty batch is green; the
-   point is that the long-poll channel answers rather than errors.
+4. `nakagai-edge listen` in a scratch terminal: a `[listen] holding from
+   cursor N` line on stderr is green, and the owner's chat pane should read
+   "Agent connected" while it runs. Ctrl-C to stop. The point is that the
+   long-poll channel answers rather than errors.
 
 Direct raw checks when MCP tools are unavailable (token from
 `~/.nakagai/edge/agent.json`; never print it whole):

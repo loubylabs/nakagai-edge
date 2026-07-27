@@ -260,6 +260,45 @@ def _cmd_status(args) -> int:
     return 0
 
 
+def _cmd_listen(args) -> int:
+    """Hold the owner's chat channel open, printing one JSON line per message.
+
+    Foreground and long-lived on purpose. The platform counts an agent as
+    present only while a poll is actually held, so this process staying up is
+    what makes the owner's chat pane read "Agent connected" honestly.
+    """
+    import json as _json
+
+    from nakagai_edge.edge.listen import ChannelListener, ListenLock, ListenLocked
+    from nakagai_edge.edge.state import EdgeState, default_root
+
+    state = EdgeState(default_root())
+    client = _edge_client(state)
+    if client is None:
+        print(_json.dumps({"ok": False, "error": "edge is not paired: run "
+                                                 "`nakagai-edge setup <code> "
+                                                 "--platform <url>`"}))
+        return 1
+    try:
+        try:
+            lock = ListenLock(state.root).acquire()
+        except ListenLocked as e:
+            print(_json.dumps({"ok": False, "error": str(e)}))
+            return 1
+        try:
+            return ChannelListener(
+                client, state.root,
+                emit=lambda msg: print(_json.dumps(msg), flush=True),
+                replay=args.replay).run()
+        except KeyboardInterrupt:
+            return 0
+        finally:
+            lock.release()
+    finally:
+        # Its own block: a failed release must not skip closing the pool.
+        client.close()
+
+
 def _cmd_brake(args) -> int:
     from nakagai_edge.edge.brake import (
         armed, clear_local_disarm, disarmed_positions, set_local_disarm,
@@ -323,6 +362,15 @@ def main(argv=None) -> int:
 
     p_status = sub.add_parser("status", help="pairing + policy freshness")
     p_status.set_defaults(func=_cmd_status)
+
+    p_listen = sub.add_parser(
+        "listen", help="hold the owner's chat channel open and print each message")
+    p_listen.add_argument(
+        "--replay", type=int, default=20,
+        help="how many of the NEWEST messages to hand back from a gap since the "
+             "last run (default 20, 0 to skip the gap entirely); a first-ever "
+             "run starts from now and replays nothing")
+    p_listen.set_defaults(func=_cmd_listen)
 
     p_brake = sub.add_parser(
         "brake", help="the stop supervisor: status, or disarm/re-arm locally")

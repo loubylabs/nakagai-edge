@@ -90,11 +90,14 @@ Once connected, in order:
    `account_equity` and `day_pnl` together or not at all.
 3. `get_signals(since="today")` on the very first call to bootstrap your
    cursor; afterwards call it bare, the cursor is keyed to your token.
-4. While `directives.live_link` is true, loop `await_events(timeout_s,
-   cursor)`; an empty batch after ~50s is idle rhythm, not a disconnect.
-   Answer `owner_msg` events with `send_message(text)`. When `live_link` is
-   false, do not hold the line; self-schedule from
-   `directives.check_interval_minutes` and re-check the mandate on wake.
+4. Run `nakagai-edge listen` and answer each line it prints with
+   `send_message(text)`. It holds the channel for you, so there is no
+   `await_events` loop to write: one JSON object per owner message, on
+   stdout, with the `seq` you should dedupe on. Chat is never mandate-gated,
+   so keep answering even when halted; say that you are halted.
+   Delivery is at-least-once and `send_message` has no idempotency key, so
+   track which `seq` values you have already answered. `pending_messages` on
+   a check-in is the same set of messages; treat it as informational.
 
 ## Verify
 
