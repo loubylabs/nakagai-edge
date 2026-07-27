@@ -93,8 +93,8 @@ Once connected, in order:
 4. Run `nakagai-edge listen` and answer each line it prints with
    `send_message(text)`. It holds the channel for you, so there is no
    `await_events` loop to write: one JSON object per owner message, on
-   stdout, with the `seq` you should dedupe on. It parks itself when the
-   mandate says the link is dark, and resumes when it is not.
+   stdout, with the `seq` you should dedupe on. Chat is never mandate-gated,
+   so keep answering even when halted; say that you are halted.
    Delivery is at-least-once and `send_message` has no idempotency key, so
    track which `seq` values you have already answered. `pending_messages` on
    a check-in is the same set of messages; treat it as informational.

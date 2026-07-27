@@ -35,7 +35,6 @@ DEFAULT_REPLAY = 20
 DEFAULT_MAX_CATCHUP_REQUESTS = 50
 BACKOFF_START_S = 1.0
 BACKOFF_CAP_S = 60.0
-DARK_SLEEP_S = 60.0
 ANCHOR_NOW = -1
 
 
@@ -187,14 +186,11 @@ class ChannelListener:
                 continue
             backoff = BACKOFF_START_S
 
-            # Absent means up: an older platform predates the directive, and
-            # absent must never read as dark.
-            if not payload.get("live_link", True):
-                nap = float(payload.get("retry_after_s", DARK_SLEEP_S))
-                self.note(f"[listen] link is dark; sleeping {nap:g}s")
-                self.sleep(nap)
-                continue
-
+            # Deliberately no mandate gate here. Chat is never mandate-gated:
+            # a halted agent must still be able to say that it is halted, and
+            # parking the listener during a dark phase would strand exactly the
+            # messages this feature exists to deliver. The mandate governs
+            # trading authority, not whether the owner can reach their agent.
             events = payload.get("events") or []
             cursor = int(payload.get("cursor", cursor))
             budget = self._deliver(events, cursor, budget)

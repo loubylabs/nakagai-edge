@@ -226,22 +226,12 @@ def test_server_rate_limit_backs_off_without_dying(tmp_path):
 
 # --- mandate --------------------------------------------------------------
 
-def test_dark_link_sleeps_instead_of_re_arming(tmp_path):
+def test_chat_is_not_mandate_gated(tmp_path):
+    """Speech is never gated. A halted agent must still be able to say it is
+    halted, so the listener keeps delivering whatever the mandate says."""
     CursorStore(tmp_path).save(1)
-    slept = []
-    client = FakeClient([_payload([], 1, live_link=False, retry_after_s=30),
-                         _payload([_owner(2)], 2)])
-    emitted = []
-    ChannelListener(client, tmp_path, emit=emitted.append, sleep=slept.append).run(
-        should_continue=_stop_after(2))
-    assert 30 in slept
-    assert [e["seq"] for e in emitted] == [2]
-
-
-def test_absent_live_link_is_treated_as_up(tmp_path):
-    """Version skew: an older platform omits the key. Absent must not mean dark."""
-    CursorStore(tmp_path).save(1)
-    client = FakeClient([_payload([_owner(2)], 2)])
+    client = FakeClient([_payload([_owner(2)], 2, live_link=False,
+                                  kill_switch=True)])
     emitted = []
     _listener(tmp_path, client, emitted).run(should_continue=_stop_after(1))
     assert [e["seq"] for e in emitted] == [2]

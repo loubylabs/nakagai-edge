@@ -71,6 +71,8 @@ Notes that matter:
   runs is picked up on the next start, bounded by `--replay` (default 20).
 * Only owner messages are printed. Signals, briefings, and approval events are
   dropped rather than fed to an agent.
+* **Chat is never mandate-gated.** The kill switch halts trading authority, not
+  speech: a halted agent must still be able to tell you that it is halted.
 
 ## The write path
 
