@@ -113,10 +113,13 @@ def test_listener_emits_an_owner_message_through_the_real_stack(tmp_path, platfo
     web.post("/api/channel/message", json={"text": "owner says hi"},
              headers={**AUTH, "X-User": "chris@nakag.ai"})
 
+    # Two passes, not one: a resumed cursor means the listener is catching up,
+    # and a gap is buffered until a poll comes back empty so the trim can keep
+    # its NEWEST messages. The second pass is that empty poll, which flushes.
     emitted = []
-    once = iter([True, False])
+    passes = iter([True, True, False])
     ChannelListener(client, root, emit=emitted.append, sleep=lambda _s: None,
-                    timeout_s=0).run(should_continue=lambda: next(once, False))
+                    timeout_s=0).run(should_continue=lambda: next(passes, False))
 
     assert [e["text"] for e in emitted] == ["owner says hi"]
     assert emitted[0]["from"] == "chris@nakag.ai"
