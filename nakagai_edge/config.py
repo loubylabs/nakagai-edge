@@ -26,7 +26,6 @@ DEFAULT_WRITE_PREFIXES = [
     "send_", "notify_",
 ]
 
-TRANSPORTS = ("stdio", "http")
 KIND_TO_TRANSPORT = {"mcp-stdio": "stdio", "mcp-http": "http"}
 
 # The roles a connector may still have. `notify` was one until we deleted the
