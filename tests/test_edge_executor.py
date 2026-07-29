@@ -31,7 +31,7 @@ ARGS = {"account_number": "463605220", "qty": 1}
 
 def _bundle():
     return {"bundle_version": "v1", "connectors": {"connectors": []},
-            "watchlist": [], "mandate": {}, "strategy_configs": {},
+            "mandate": {}, "strategy_configs": {},
             "signing_public_key": PUB}
 
 
@@ -340,8 +340,6 @@ async def test_full_edge_autopilot_loop_closes(tmp_path, monkeypatch):
     (plat / "config" / "scan.yaml").write_text(
         'expressions:\n  swing: true\nrth:\n  start: "06:45"\n'
         '  end: "13:00"\n  tz: America/Los_Angeles\n')
-    (plat / "config" / "watchlist.yaml").write_text("symbols: [NVDA]\n")
-
     # The mandate is a per-workspace Postgres row now, not config/mandate.yaml.
     # autoapprove.py resolves the account off the approval record's
     # `requested_by`, which agent_routes.py sets to the agent's owner email
@@ -367,6 +365,23 @@ async def test_full_edge_autopilot_loop_closes(tmp_path, monkeypatch):
     # armed is runtime safety state with its own atomic setter; saving a
     # document with autopilot_state.armed=True would silently not arm it.
     mandate_store.set_armed(True)
+
+    # The auto-execute allowlist is per-workspace Postgres rows now, not
+    # config/watchlist.yaml. Same account as the mandate above, for the same
+    # reason: autoapprove resolves the fence off the approval record's owner
+    # email, so seeding a different workspace (or a file) leaves this one's
+    # fence empty, and the envelope's watchlist_only check declines the order
+    # as "not on your auto-execute allowlist". That reads as a pending order
+    # rather than an error, which is why the loop below would hang on
+    # `granted` with nothing obviously broken.
+    #
+    # It is NEVER seeded by the platform: an empty fence means autopilot
+    # trades nothing without a human, so a test that wants a grant has to say
+    # so explicitly.
+    from nakagai_platform.allowlist_store import AllowlistStore
+
+    AllowlistStore(plat, mandate_db, mandate_ctx).apply(
+        ["NVDA"], "seeded for the end-to-end autopilot loop")
 
     (plat / "config" / "connectors.yaml").write_text(_yaml.safe_dump({"connectors": [{
         "id": "broker", "kind": "mcp-http", "role": "broker",

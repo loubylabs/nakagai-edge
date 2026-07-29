@@ -13,9 +13,11 @@ user's brokerage, and if the platform holds the token and makes the broker
 call, the platform placed the trade. The fix is a custody split:
 
 - **Control plane: the platform (`api.nakag.ai`).** Source of truth for
-  everything that is not a broker secret: settings, mandate, watchlist,
-  strategy configs, the connector registry, guardrail policy, the approval
-  queue and its signing key, and audit ingest. It issues *signed decisions*.
+  everything that is not a broker secret: settings, the mandate, the monitor
+  watchlist (what an account watches) and the auto-execute allowlist (the
+  separate, smaller list autopilot may trade unattended), strategy configs, the
+  connector registry, guardrail policy, the approval queue and its signing key,
+  and audit ingest. It issues *signed decisions*.
   It never dials a broker and never executes an edge-origin trade.
 - **Data plane: the edge (this package, user-run).** Sole holder of broker
   credentials, stored locally under mode-0600 token files. Serves MCP on

@@ -79,7 +79,6 @@ def platform_root(tmp_path):
     root = tmp_path / "platform"
     (root / "config").mkdir(parents=True)
     (root / "config" / "scan.yaml").write_text("{}\n")
-    (root / "config" / "watchlist.yaml").write_text("symbols: [NVDA]\n")
     return root
 
 

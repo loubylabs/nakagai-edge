@@ -193,7 +193,7 @@ def _brake(tmp_path, hub, *, stale=False, client=None):
     state = EdgeState(tmp_path)
     state.save_agent("https://api.test", "ag1", "nk_agent_t")
     apply_bundle(state, {"bundle_version": "v1",
-                         "connectors": {"connectors": []}, "watchlist": [],
+                         "connectors": {"connectors": []},
                          "mandate": {}, "strategy_configs": {},
                          "signing_public_key": PUB}, "v1")
     if stale:
