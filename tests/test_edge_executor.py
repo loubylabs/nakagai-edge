@@ -344,11 +344,19 @@ async def test_full_edge_autopilot_loop_closes(tmp_path, monkeypatch):
         "guardrails": {"allow_writes": True, "read_only_tools": ["get_*"],
                        "approvals": {"require_for": ["place_*"], "ttl_s": 900},
                        "order_shape": order_shape}}]}))
+    # The signal must be STAMPED, not merely validated. The platform's
+    # suppression fence reads nakagai_platform.scan.evidence.is_stamped, which
+    # is `promoted` AND status == "validated", and autopilot refuses to
+    # auto-execute a suppressed signal. `status` alone is not a performance
+    # floor (a pair with profit factor 0.4 clears it), which is exactly why the
+    # platform stopped treating it as one. Seeding only `status` here makes the
+    # whole enqueue -> grant -> poll loop below unreachable.
     get_signal_store(plat, None).append([{
         "id": "abc123", "bar_ts": "2026-07-13T14:55:00+00:00",
         "detected_ts": "2026-07-13T14:55:00+00:00", "symbol": "NVDA",
         "strategy": "ict", "direction": "LONG", "entry": 118.4, "stop": 116.1,
-        "target": 124.0, "evidence": {"status": "validated", "oos_windows": 6},
+        "target": 124.0,
+        "evidence": {"status": "validated", "oos_windows": 6, "promoted": True},
         "stale_data": False, "expressions": {"swing": {"instrument": "shares"}}}])
 
     platform = TestClient(create_app(plat, with_mcp=False))
