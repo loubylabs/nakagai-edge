@@ -15,7 +15,7 @@ from nakagai_edge.edge.sync import (apply_bundle, cached_bundle, meta, policy_fr
 BUNDLE = {"bundle_version": "v1",
           "connectors": {"connectors": [{"id": "demo", "kind": "mcp-http",
                                          "url": "https://d.test/mcp", "enabled": True}]},
-          "watchlist": ["SPY"], "mandate": {}, "strategy_configs": {},
+          "mandate": {}, "strategy_configs": {},
           "signing_public_key": "PUBKEY"}
 
 
@@ -66,7 +66,7 @@ def test_sync_once_error_leaves_cache(tmp_path):
 NEW_BUNDLE = {"bundle_version": "v2",
               "connectors": {"connectors": [{"id": "other", "kind": "mcp-http",
                                              "url": "https://o.test/mcp", "enabled": True}]},
-              "watchlist": ["QQQ"], "mandate": {}, "strategy_configs": {},
+              "mandate": {}, "strategy_configs": {},
               "signing_public_key": "PUBKEY2"}
 
 
@@ -121,7 +121,7 @@ BUNDLE_WITH_NAKAGAI_MCP = {
          "enabled": True},
         {"id": "demo", "kind": "mcp-http", "url": "https://d.test/mcp", "enabled": True},
     ]},
-    "watchlist": ["SPY"], "mandate": {}, "strategy_configs": {},
+    "mandate": {}, "strategy_configs": {},
     "signing_public_key": "PUBKEY",
 }
 

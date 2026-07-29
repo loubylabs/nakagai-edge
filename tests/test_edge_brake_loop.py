@@ -21,7 +21,7 @@ def _state(tmp_path, mandate=None):
     state = EdgeState(tmp_path)
     state.save_agent("https://api.test", "ag1", "nk_agent_t")
     apply_bundle(state, {"bundle_version": "v1",
-                         "connectors": {"connectors": []}, "watchlist": [],
+                         "connectors": {"connectors": []},
                          "mandate": mandate or {}, "strategy_configs": {},
                          "signing_public_key": "k"}, "v1")
     return state
