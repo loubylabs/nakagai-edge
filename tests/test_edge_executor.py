@@ -309,6 +309,18 @@ async def test_full_edge_autopilot_loop_closes(tmp_path, monkeypatch):
     monkeypatch.setattr(pd.Timestamp, "now", staticmethod(lambda tz=None: NOW))
     monkeypatch.setattr(time, "time", lambda: NOW.timestamp())
 
+    # A fresh id every run, not the literal "abc123": the approvals queue is a
+    # real Postgres table now (workspace_mandate requires DATABASE_URL to grant
+    # anything, so this test runs on Postgres too), and autoapprove's
+    # already-executed fence (nakagai_platform/gateway/envelope.py) is keyed on
+    # signal_id alone, checked against every approval ever citing it, not just
+    # this test's own. A hardcoded id would auto-decline on the second run
+    # against the same database, exactly like a real signal_id (a sha256 of
+    # symbol|strategy|direction|bar_ts) is never reused, ever.
+    import uuid
+
+    signal_id = f"test-{uuid.uuid4().hex}"
+
     priv, pub = generate_keypair()
     monkeypatch.setenv("NAKAGAI_API_TOKEN", "api-secret")
     monkeypatch.setenv("NAKAGAI_APPROVER_TOKEN", "approver-secret")
@@ -329,15 +341,33 @@ async def test_full_edge_autopilot_loop_closes(tmp_path, monkeypatch):
         'expressions:\n  swing: true\nrth:\n  start: "06:45"\n'
         '  end: "13:00"\n  tz: America/Los_Angeles\n')
     (plat / "config" / "watchlist.yaml").write_text("symbols: [NVDA]\n")
-    (plat / "config" / "mandate.yaml").write_text(_yaml.safe_dump({
-        "preset": "autopilot",
-        # Not a loss-dial test: turned off explicitly so the on-by-default
-        # breaker doesn't decline this end-to-end grant on a missing equity
-        # report instead of proving the enqueue -> grant -> poll loop closes.
-        "overrides": {"rails": {"autopilot": {"daily_loss_pct_disarm": 0.0}}},
-        "kill_switch": {"engaged": False, "engaged_at": None},
-        "autopilot_state": {"armed": True, "disarmed_at": None,
-                          "disarmed_reason": ""}}))
+
+    # The mandate is a per-workspace Postgres row now, not config/mandate.yaml.
+    # autoapprove.py resolves the account off the approval record's
+    # `requested_by`, which agent_routes.py sets to the agent's owner email
+    # (the X-User the approver headers below carry, chris@x.com). Seed the
+    # SAME account here, through MandateStore, or the enqueue below resolves
+    # to a workspace-less context that reads the observer default and never
+    # arms anything.
+    from nakagai_platform.api.db import Database
+    from nakagai_platform.api.tenancy import resolve_workspace_for_email
+    from nakagai_platform.mandate_store import MandateStore
+
+    mandate_db = Database.from_env()
+    mandate_db.workspace_id("chris-x", "chris@x.com")
+    mandate_ctx = resolve_workspace_for_email(mandate_db, "chris@x.com")
+    mandate_store = MandateStore(plat, mandate_db, mandate_ctx)
+    doc = mandate_store.load()
+    doc["preset"] = "autopilot"
+    # Not a loss-dial test: turned off explicitly so the on-by-default
+    # breaker doesn't decline this end-to-end grant on a missing equity
+    # report instead of proving the enqueue -> grant -> poll loop closes.
+    doc["overrides"] = {"rails": {"autopilot": {"daily_loss_pct_disarm": 0.0}}}
+    mandate_store.save(doc)
+    # armed is runtime safety state with its own atomic setter; saving a
+    # document with autopilot_state.armed=True would silently not arm it.
+    mandate_store.set_armed(True)
+
     (plat / "config" / "connectors.yaml").write_text(_yaml.safe_dump({"connectors": [{
         "id": "broker", "kind": "mcp-http", "role": "broker",
         "url": "https://example.test/mcp", "enabled": True,
@@ -351,8 +381,16 @@ async def test_full_edge_autopilot_loop_closes(tmp_path, monkeypatch):
     # floor (a pair with profit factor 0.4 clears it), which is exactly why the
     # platform stopped treating it as one. Seeding only `status` here makes the
     # whole enqueue -> grant -> poll loop below unreachable.
-    get_signal_store(plat, None).append([{
-        "id": "abc123", "bar_ts": "2026-07-13T14:55:00+00:00",
+    #
+    # Seeded through the SAME Postgres `mandate_db` the running platform uses,
+    # not a file store: the mandate now requires DATABASE_URL to grant
+    # anything, so create_app's hub.database is set here too, and
+    # provenance() (nakagai_platform/gateway/hub.py) resolves the signal
+    # store off that same database. A signal written to the file store while
+    # the hub reads Postgres would never be found, and the enqueue below would
+    # decline as "no signal was cited".
+    get_signal_store(plat, mandate_db).append([{
+        "id": signal_id, "bar_ts": "2026-07-13T14:55:00+00:00",
         "detected_ts": "2026-07-13T14:55:00+00:00", "symbol": "NVDA",
         "strategy": "ict", "direction": "LONG", "entry": 118.4, "stop": 116.1,
         "target": 124.0,
@@ -387,7 +425,7 @@ async def test_full_edge_autopilot_loop_closes(tmp_path, monkeypatch):
                                  transport=httpx.MockTransport(forward))
     queue = RemoteApprovalQueue(edge_client, state, agent_id)
     rec = queue.enqueue("broker", "place_equity_order", order, ttl_s=900,
-                        signal_id="abc123")
+                        signal_id=signal_id)
     assert rec.status == "granted"          # the platform decided, in the envelope
 
     # ---- edge broker: a real downstream over the SDK memory transport ----
