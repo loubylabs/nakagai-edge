@@ -1,9 +1,16 @@
-"""Hold the platform's live channel open and emit owner messages as lines.
+"""Hold the platform's live channel open and emit its events as lines.
 
 The agent is turn-based and cannot be pushed to, so something local has to hold
-the line and turn an arriving message into a wake-up. That is this module.
+the line and turn an arriving event into a wake-up. That is this module.
 
-Three design points carry most of the weight:
+Two classes of line come out, and the difference is the whole contract. An
+owner message is addressed to the agent and carries `reply_expected: true`.
+Everything else, a signal, an approval decision, a mandate change, is context
+the agent absorbs silently: the scanner writes hundreds of signals a session
+and answering each one would bury the owner's conversation in their own pane.
+RENDERERS below decides what is delivered at all, and is a security boundary.
+
+Four design points carry most of the weight:
 
 * The hold is CONTINUOUS. Presence on the platform is `holds > 0`
   (nakagai/channel.py), true only while someone is actively holding a long poll,
@@ -20,6 +27,9 @@ Three design points carry most of the weight:
   then is the cursor written. A crash mid-catch-up re-does the gap, which is
   the right direction to fail (delivery is at-least-once and the consumer
   dedupes on seq).
+* Chat and context are TRIMMED SEPARATELY. They arrive orders of magnitude
+  apart, so one shared budget would let a quiet day of scanning evict the
+  question the owner typed a second before the restart.
 """
 
 import fcntl
@@ -46,6 +56,38 @@ ANCHOR_NOW = -1
 # How much of a gap may be held in memory before the oldest end is discarded.
 # Well above any sane --replay, so the trim is what bounds delivery, not this.
 MAX_BUFFERED = 500
+
+
+def _named(*fields):
+    """A renderer that copies named fields and nothing else."""
+    def render(body: dict) -> dict:
+        return {f: body.get(f) for f in fields}
+    return render
+
+
+# Which kinds reach the agent, and exactly which of their fields do.
+#
+# Naming fields rather than passing `body` through is a security boundary, and
+# so is the absence of an entry. `briefing` carries a headline written by an
+# external news feed, so rendering it would let an outsider write directly into
+# the agent's context; it has no renderer and so is dropped. A kind the
+# platform adds later lands here before anyone has judged its body, and is
+# dropped for the same reason. Fail closed, then widen deliberately.
+#
+# `owner_msg` is the only free text in the set, and its author is the owner.
+RENDERERS = {
+    "owner_msg": lambda b: {"text": b.get("text", ""), "from": b.get("from", "")},
+    "signal": _named("id", "symbol", "strategy", "direction", "timeframe",
+                     "bar_ts", "entry", "stop", "target", "rr"),
+    "approval_decided": _named("approval_id", "status", "decided_by",
+                               "connector_id", "tool", "signal_id"),
+    "mandate_changed": _named("preset", "kill_switch"),
+}
+
+# The kind the agent owes an answer to. Everything else is context it absorbs:
+# the scanner writes hundreds of signals a session, and replying to each would
+# bury the owner's own conversation in their pane.
+REPLY_EXPECTED = frozenset({"owner_msg"})
 
 # A malformed response is a data error, not a transport one: httpx.HTTPError
 # and EdgeClientError do not cover a 200 carrying a Cloudflare interstitial
@@ -208,8 +250,8 @@ class ChannelListener:
                 backoff = self._back_off(backoff)
                 continue
 
-            msgs = [self._envelope(e, moved) for e in events
-                    if isinstance(e, dict) and e.get("kind") == "owner_msg"]
+            msgs = [m for m in (self._envelope(e, moved) for e in events
+                                if isinstance(e, dict)) if m is not None]
 
             if not catching_up:
                 for msg in msgs:
@@ -264,25 +306,39 @@ class ChannelListener:
     # --- delivery -------------------------------------------------------
 
     @staticmethod
-    def _envelope(event: dict, cursor: int) -> dict:
-        body = event.get("body") or {}
-        return {"seq": event.get("seq"), "text": body.get("text", ""),
-                "from": body.get("from", ""), "at": event.get("created_at"),
-                "cursor": cursor}
+    def _envelope(event: dict, cursor: int) -> dict | None:
+        """Render one event, or None for a kind that must not be delivered."""
+        render = RENDERERS.get(event.get("kind"))
+        if render is None:
+            return None
+        kind = event["kind"]
+        return {"seq": event.get("seq"), "kind": kind,
+                "at": event.get("created_at"), "cursor": cursor,
+                "reply_expected": kind in REPLY_EXPECTED,
+                **render(event.get("body") or {})}
 
     def _flush(self, pending: list[dict], *, capped: bool, requests: int) -> None:
         """Deliver the end of a gap: the NEWEST `replay`, never the oldest.
 
         Someone restarting a listener wants the recent end of the conversation,
         and the newest message is the one most likely to still matter.
+
+        Chat and context are trimmed against separate budgets. They arrive at
+        wildly different rates, so one shared newest-N would let a day of
+        scanning evict the question the owner typed just before the restart,
+        which is the silent loss this module exists to remove.
         """
-        keep = pending[-self.replay:] if self.replay else []
+        chat = [i for i, m in enumerate(pending) if m["reply_expected"]]
+        context = [i for i, m in enumerate(pending) if not m["reply_expected"]]
+        keep_ix = (set(chat[-self.replay:]) | set(context[-self.replay:])
+                   if self.replay else set())
+        keep = [m for i, m in enumerate(pending) if i in keep_ix]
         dropped = len(pending) - len(keep)
         if capped:
             self.note(f"[listen] catch-up stopped after {requests} requests; "
                       "continuing live from here")
         if dropped:
-            self.note(f"[listen] gap held {len(pending)} owner messages; "
+            self.note(f"[listen] gap held {len(pending)} events; "
                       f"delivering the newest {len(keep)}, skipping {dropped}")
         for msg in keep:
             self.emit(msg)
