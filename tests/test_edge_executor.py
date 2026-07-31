@@ -268,20 +268,35 @@ def test_signal_id_travels_from_edge_to_platform(tmp_path):
     assert "signal" not in posted and "notional" not in posted
 
 
-async def test_full_edge_autopilot_loop_closes(tmp_path, monkeypatch):
-    """The whole point of the task, end to end: the edge posts an intent citing a
-    signal; the PLATFORM (holding the mandate + signing key) decides it is inside
-    the armed autopilot envelope and returns a SIGNED grant; the edge's poll_once
-    independently verifies that artifact and executes the trade at a real
-    (memory-transport) broker.
+async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
+    """The whole point of the task, end to end, in the two halves it now has.
 
-    Nothing security-critical is stubbed. The platform really auto-grants and
-    signs (real Ed25519); poll_once really verifies signature + args_hash +
-    agent_id + expiry; the broker call really runs over the MCP ClientSession.
-    Only the HTTP hop is a MockTransport, and it forwards to the real platform
-    FastAPI app, so this is a genuine enqueue → grant → poll, not a canned reply.
-    The mandate decides (`decided_by == "mandate:autopilot"`); the edge only
-    executes an artifact it verified; the agent's token never grants its order.
+    First: **the platform declines every auto-execution to the owner.** Its
+    envelope lost the evidence condition and has not yet gained the confluence
+    condition that replaces it, so autopilot refuses to act on one condition
+    fewer than it was designed for. Even this order (an armed autopilot mandate,
+    a signal the platform itself emitted, a symbol on the auto-execute fence,
+    inside every cap) comes back `pending` with no artifact, and a poll against
+    it puts nothing at the broker. That is the safety property, so it is pinned
+    here explicitly rather than left as a gap between two other assertions: no
+    order reaches a broker without a human.
+
+    Then: **the owner taps approve, and the edge closes the loop.** The
+    owner-action route (`POST /api/approvals/{id}`, guarded by
+    assert_owner_action's separate approver token) grants an edge-origin
+    approval by SIGNING an artifact rather than executing it, because the
+    platform holds no broker credentials. The edge's poll_once independently
+    verifies that artifact and places the trade at a real (memory-transport)
+    broker. That half is this repo's own responsibility and has not changed.
+
+    Nothing security-critical is stubbed. The platform really signs (real
+    Ed25519); poll_once really verifies signature + args_hash + agent_id +
+    expiry; the broker call really runs over the MCP ClientSession. Only the
+    HTTP hop is a MockTransport, and it forwards to the real platform FastAPI
+    app, so this is a genuine enqueue → decline → tap → grant → poll, not a
+    canned reply. The owner decides (`decided_by` is the approver's email); the
+    edge only executes an artifact it verified; the agent's token never grants
+    its own order.
     """
     pytest.importorskip("nakagai_platform")
 
@@ -389,14 +404,6 @@ async def test_full_edge_autopilot_loop_closes(tmp_path, monkeypatch):
         "guardrails": {"allow_writes": True, "read_only_tools": ["get_*"],
                        "approvals": {"require_for": ["place_*"], "ttl_s": 900},
                        "order_shape": order_shape}}]}))
-    # The signal must be STAMPED, not merely validated. The platform's
-    # suppression fence reads nakagai_platform.scan.evidence.is_stamped, which
-    # is `promoted` AND status == "validated", and autopilot refuses to
-    # auto-execute a suppressed signal. `status` alone is not a performance
-    # floor (a pair with profit factor 0.4 clears it), which is exactly why the
-    # platform stopped treating it as one. Seeding only `status` here makes the
-    # whole enqueue -> grant -> poll loop below unreachable.
-    #
     # Seeded through the SAME Postgres `mandate_db` the running platform uses,
     # not a file store: the mandate now requires DATABASE_URL to grant
     # anything, so create_app's hub.database is set here too, and
@@ -409,7 +416,6 @@ async def test_full_edge_autopilot_loop_closes(tmp_path, monkeypatch):
         "detected_ts": "2026-07-13T14:55:00+00:00", "symbol": "NVDA",
         "strategy": "ict", "direction": "LONG", "entry": 118.4, "stop": 116.1,
         "target": 124.0,
-        "evidence": {"status": "validated", "oos_windows": 6, "promoted": True},
         "stale_data": False, "expressions": {"swing": {"instrument": "shares"}}}])
 
     platform = TestClient(create_app(plat, with_mcp=False))
@@ -439,11 +445,11 @@ async def test_full_edge_autopilot_loop_closes(tmp_path, monkeypatch):
     edge_client = PlatformClient("https://api.test", token,
                                  transport=httpx.MockTransport(forward))
     queue = RemoteApprovalQueue(edge_client, state, agent_id)
-    rec = queue.enqueue("broker", "place_equity_order", order, ttl_s=900,
-                        signal_id=signal_id)
-    assert rec.status == "granted"          # the platform decided, in the envelope
 
     # ---- edge broker: a real downstream over the SDK memory transport ----
+    # Stood up BEFORE the enqueue so the pre-tap assertions below can look at a
+    # broker that was genuinely reachable and still took no order, rather than
+    # at one that did not exist yet.
     placed: list = []
     broker = FastMCP("broker")
 
@@ -470,15 +476,45 @@ async def test_full_edge_autopilot_loop_closes(tmp_path, monkeypatch):
                        "approvals": {"require_for": ["place_*"], "ttl_s": 900}}}]}))
     edge_hub = ConnectorHub(state.root, connect=connect, approvals=queue)
 
+    # ---- half one: the platform declines to the owner, and nothing executes ----
+    rec = queue.enqueue("broker", "place_equity_order", order, ttl_s=900,
+                        signal_id=signal_id)
+    assert rec.status == "pending"      # declined to a human tap, not auto-granted
+
+    from nakagai_platform.gateway import get_hub
+
+    undecided = get_hub(plat).approvals.get(rec.id)
+    assert undecided.status == "pending"
+    assert undecided.artifact is None   # nothing was signed, so nothing is executable
+    assert undecided.decided_by == ""
+
+    # A decline is not a denial: the intent stays on the edge, waiting. Polling
+    # it is the real proof that no order reaches the broker without a human,
+    # because it drives the same code path that would have executed a grant.
+    assert await poll_once(edge_hub, state, edge_client, EdgeAudit(state)) == 0
+    assert placed == []                 # the broker took nothing
+    assert rec.id in intents(state)     # still armed for the tap below
+
+    # ---- half two: the owner taps approve, and the edge closes the loop ----
+    # The real owner-action route, with the approver headers that
+    # assert_owner_action requires: the agent's own bearer token can never reach
+    # it. For an edge-origin approval this SIGNS an artifact rather than
+    # executing anything, because the broker credentials live out here.
+    decided = platform.post(f"/api/approvals/{rec.id}",
+                            json={"decision": "approve"}, headers=approver)
+    assert decided.status_code == 200
+    assert decided.json()["approval"]["status"] == "granted"
+
     n = await poll_once(edge_hub, state, edge_client, EdgeAudit(state))
     assert n == 1
     assert placed == [("NVDA", "buy", 10)]      # the trade really executed
     assert intents(state) == {}                 # nothing left to re-execute
 
-    # the platform's own record: decided by the mandate, then executed by the edge
-    from nakagai_platform.gateway import get_hub
+    # the platform's own record: decided by the owner, then executed by the edge.
+    # assert_owner_action returns the X-User it validated, lowercased, and that
+    # is what hub.decide() stamps on the record as decided_by.
     plat_rec = get_hub(plat).approvals.get(rec.id)
-    assert plat_rec.decided_by == "mandate:autopilot"
+    assert plat_rec.decided_by == "chris@x.com"
     assert plat_rec.status == "executed"
     await edge_hub.aclose()
 
