@@ -94,10 +94,19 @@ Once connected, in order:
    `await_events` loop to write: one JSON object per event, on stdout, with
    the `seq` you should dedupe on.
    **Answer a line only when `reply_expected` is true**, with
-   `send_message(text)`. That is `kind: "owner_msg"`. Every other kind, a
-   `signal`, an `approval_decided`, a `mandate_changed`, is context you absorb
-   silently; hundreds of signals a session means replying to each would bury
-   the owner's conversation in their own pane.
+   `send_message(text)`. Two kinds carry it:
+   - `owner_msg`, the owner talking to you.
+   - `signal_referred`, one setup someone put a question mark against. Either
+     the owner pressed "Ask the agent", or their own confluence dial cleared
+     on its own; `referred_by` is their email in the first case and the
+     literal `"confluence"` in the second. Answer it about that specific
+     setup, citing the `signal_id` it names. It grants you no authority: it
+     is a request to look, not to act, and the mandate still decides what you
+     may do about what you find.
+
+   Every other kind, a `signal`, an `approval_decided`, a `mandate_changed`,
+   is context you absorb silently; hundreds of signals a session means
+   replying to each would bury the owner's conversation in their own pane.
    Chat is never mandate-gated, so keep answering even when halted; say that
    you are halted. Delivery is at-least-once and `send_message` has no
    idempotency key, so track which `seq` values you have already answered.
