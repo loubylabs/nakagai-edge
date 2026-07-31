@@ -82,12 +82,28 @@ RENDERERS = {
     "approval_decided": _named("approval_id", "status", "decided_by",
                                "connector_id", "tool", "signal_id"),
     "mandate_changed": _named("preset", "kill_switch"),
+    # A signal someone put a question mark against: the owner pressing "Ask
+    # the agent", or their own confluence dial clearing on its own.
+    # `referred_by` says which, an email or the literal "confluence".
+    #
+    # `note` is free text, and it is admitted for the same reason `owner_msg`
+    # is: its author is the owner. That is the whole distinction from
+    # `briefing`, whose text an outside news feed writes.
+    "signal_referred": _named("signal_id", "symbol", "direction", "timeframe",
+                              "confluence", "stacked", "intent", "note",
+                              "referred_by"),
 }
 
-# The kind the agent owes an answer to. Everything else is context it absorbs:
+# The kinds the agent owes an answer to. Everything else is context it absorbs:
 # the scanner writes hundreds of signals a session, and replying to each would
 # bury the owner's own conversation in their pane.
-REPLY_EXPECTED = frozenset({"owner_msg"})
+#
+# `signal_referred` is the ONE piece of context that asks for an answer, and
+# that is the point of it rather than an exception to the rule: a signal is
+# context, and a referred signal is a question. Being in this set also puts it
+# on the chat side of _flush's split trim, so a gap full of signals cannot
+# evict it.
+REPLY_EXPECTED = frozenset({"owner_msg", "signal_referred"})
 
 # A malformed response is a data error, not a transport one: httpx.HTTPError
 # and EdgeClientError do not cover a 200 carrying a Cloudflare interstitial
