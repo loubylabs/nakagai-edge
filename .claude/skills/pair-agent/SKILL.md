@@ -90,14 +90,19 @@ Once connected, in order:
    `account_equity` and `day_pnl` together or not at all.
 3. `get_signals(since="today")` on the very first call to bootstrap your
    cursor; afterwards call it bare, the cursor is keyed to your token.
-4. Run `nakagai-edge listen` and answer each line it prints with
-   `send_message(text)`. It holds the channel for you, so there is no
-   `await_events` loop to write: one JSON object per owner message, on
-   stdout, with the `seq` you should dedupe on. Chat is never mandate-gated,
-   so keep answering even when halted; say that you are halted.
-   Delivery is at-least-once and `send_message` has no idempotency key, so
-   track which `seq` values you have already answered. `pending_messages` on
-   a check-in is the same set of messages; treat it as informational.
+4. Run `nakagai-edge listen`. It holds the channel for you, so there is no
+   `await_events` loop to write: one JSON object per event, on stdout, with
+   the `seq` you should dedupe on.
+   **Answer a line only when `reply_expected` is true**, with
+   `send_message(text)`. That is `kind: "owner_msg"`. Every other kind, a
+   `signal`, an `approval_decided`, a `mandate_changed`, is context you absorb
+   silently; hundreds of signals a session means replying to each would bury
+   the owner's conversation in their own pane.
+   Chat is never mandate-gated, so keep answering even when halted; say that
+   you are halted. Delivery is at-least-once and `send_message` has no
+   idempotency key, so track which `seq` values you have already answered.
+   `pending_messages` on a check-in is the same set of messages; treat it as
+   informational.
 
 ## Verify
 
