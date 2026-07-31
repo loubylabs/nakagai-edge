@@ -52,11 +52,12 @@ class RemoteApprovalQueue:
                 signal_id: str = "", signal: dict | None = None,
                 notional: float = 0.0) -> Approval:
         # Forward `signal_id` to the platform: it is what the platform resolves
-        # to a frozen signal + notional and checks against the autopilot envelope,
-        # so an in-envelope order comes back `granted` (signed) for the edge to
-        # execute. We do NOT send `signal`/`notional`: the edge holds no
-        # authority to vouch for a signal it did not itself emit; the platform
-        # recomputes both from the id against its own signal store. The edge
+        # to a frozen signal + notional and checks against the autopilot
+        # envelope. What it decides is the platform's business, and today it
+        # declines every order to the owner's tap, so a `pending` reply is the
+        # ordinary case, not a fault. We do NOT send `signal`/`notional`: the
+        # edge holds no authority to vouch for a signal it did not itself emit;
+        # the platform recomputes both from the id against its own store. The edge
         # stays a dumb executor of a granted artifact it independently verifies
         # (see nakagai_edge/edge/executor.py); the platform decides, the edge never
         # does. `signal_id` is also carried onto the local record below so it is
