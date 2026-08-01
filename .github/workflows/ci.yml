@@ -65,6 +65,10 @@ jobs:
 
       - name: Has this version already been published?
         id: gate
+        env:
+          # Fastly caches the simple index by full URL. A unique query string per
+          # run is therefore always a cache MISS, which is the point: see below.
+          CACHE_BUSTER: ${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           uv run --no-project --python 3.12 python - <<'PY'
           import json
@@ -77,9 +81,16 @@ jobs:
           # line changed in this commit". A diff against the parent breaks on a
           # workflow re-run, on the first publish, and on any squash that
           # rewrites the parent. Asking the index holds however the commit got here.
+          #
+          # The query string is not decoration. PyPI's CDN was observed serving a
+          # cached 404 for this project for minutes after 0.1.0 went live. Read
+          # that stale 404 and the gate concludes "nothing is published", so an
+          # ordinary merge that does not touch `version` stops being a no-op and
+          # becomes a duplicate upload, which fails and reddens main. A unique URL
+          # per run cannot be served from cache, so the gate always sees origin.
           version = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]
           req = urllib.request.Request(
-              "https://pypi.org/simple/nakagai-edge/",
+              f"https://pypi.org/simple/nakagai-edge/?_={os.environ['CACHE_BUSTER']}",
               headers={"Accept": "application/vnd.pypi.simple.v1+json"})
           try:
               with urllib.request.urlopen(req, timeout=30) as r:
