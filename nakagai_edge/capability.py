@@ -152,3 +152,94 @@ def coerce(field: str, value: Any, cap: Capability) -> Any | None:
             return None
         return parsed
     return value
+
+
+def _outbound(field: str, value: Any, cap: Capability) -> Any:
+    """A canonical argument value in the broker's own spelling.
+
+    Only `side` needs translating. The first alias a connector lists is the
+    spelling it gets, which is why the order of `values.side.buy` matters.
+    """
+    if COERCIONS.get(field) is not SIDE:
+        return value
+    aliases = (cap.values.get("side") or {}).get(str(value).lower()) or []
+    if not aliases:
+        raise CapabilityError(
+            f"connector declares no {value!r} spelling for `side`")
+    return aliases[0]
+
+
+def resolve(name: str, cap: Capability, args: dict) -> tuple[str, dict]:
+    """The downstream tool and arguments for one capability call.
+
+    A canonical argument the connector never declared is refused rather than
+    dropped: silently discarding an account or a stop would send the broker a
+    materially different order than the caller asked for.
+    """
+    vocab = CAPABILITIES.get(name)
+    if vocab is None:
+        raise CapabilityError(f"unknown capability {name!r}")
+    out: dict = {}
+    for canonical, value in (args or {}).items():
+        if value is None:
+            continue
+        if canonical not in vocab.args:
+            raise CapabilityError(
+                f"capability {name!r} takes no argument {canonical!r}")
+        key = cap.args.get(canonical)
+        if not key:
+            raise CapabilityError(
+                f"connector does not declare where {canonical!r} goes for "
+                f"{name!r}")
+        out[key] = _outbound(canonical, value, cap)
+    return cap.tool, out
+
+
+def read_partial(name: str, cap: Capability, node: Any) -> dict:
+    """Every canonical field that coerced, with no required-field check.
+
+    The portfolio sweep needs this: a position whose quantity is unreadable
+    must still be keyable by symbol so supervision.unreadable() can name it,
+    rather than vanishing and reading as a position that closed.
+    """
+    vocab = CAPABILITIES[name]
+    out: dict = {}
+    for field in vocab.required + vocab.optional:
+        paths = cap.fields.get(field)
+        if not paths:
+            continue
+        raw = first(node, paths)
+        if raw is None:
+            continue
+        value = coerce(field, raw, cap)
+        if value is None:
+            continue
+        out[field] = value
+    return out
+
+
+def read_row(name: str, cap: Capability, node: Any) -> dict | None:
+    """One node read into canonical fields, or None if a required one is
+    missing. None means unreadable, never zero and never absent-so-default."""
+    out = read_partial(name, cap, node)
+    if any(field not in out for field in CAPABILITIES[name].required):
+        return None
+    return out
+
+
+def extract(name: str, cap: Capability, payload: Any) -> dict | list[dict] | None:
+    """A broker response read back into canonical fields.
+
+    A list capability drops rows it cannot read rather than folding them in as
+    zero; a scalar capability returns None for the same reason. See coerce().
+    """
+    vocab = CAPABILITIES.get(name)
+    if vocab is None:
+        raise CapabilityError(f"unknown capability {name!r}")
+    if not vocab.is_list:
+        return read_row(name, cap, payload)
+    rows = first(payload, cap.items) if cap.items else payload
+    if not isinstance(rows, list):
+        return []
+    read = (read_row(name, cap, row) for row in rows)
+    return [row for row in read if row is not None]
