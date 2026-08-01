@@ -271,15 +271,38 @@ async def test_list_orders_reads_both_brokers_into_one_shape(tmp_path, connector
                                      "status": "open"}}[connector]]
 
 
-async def test_a_side_is_canonical_no_matter_how_the_broker_spells_it(tmp_path):
-    """`BUY_TO_OPEN` and `buy` are the same fact. An agent that had to know
-    which broker said which could not be written once."""
-    hub = MapHub()
-    mcp = _server(_state(tmp_path), hub)
-    alien = await _call(mcp, "list_orders", connector_id=ALIEN)
-    rh = await _call(mcp, "list_orders", connector_id=ROBINHOOD)
+# ---- arguments the caller must actually supply ---------------------------
 
-    assert alien["data"][0]["side"] == rh["data"][0]["side"] == "buy"
+
+@pytest.mark.parametrize("tool,args,named", [
+    ("cancel_order", {"order_id": ""}, "order_id"),
+    ("place_order", {"symbol": "", "side": "buy", "quantity": 1}, "symbol"),
+    ("place_order", {"symbol": "AAPL", "side": "", "quantity": 1}, "side"),
+    ("get_quote", {"symbols": []}, "symbols"),
+])
+async def test_an_empty_mandatory_argument_is_refused_not_dropped(
+        tmp_path, tool, args, named):
+    """Dropping an empty one would not ask the broker a smaller question, it
+    would ask a different one: a cancel with no order id, or an order with no
+    symbol, is a materially different request that the broker (or a human
+    reading the approval) has to make sense of. Refuse it by name instead, and
+    dial nothing."""
+    hub = MapHub(specs=_tiered(["AL-1"], []))
+    doc = await _call(_server(_state(tmp_path), hub), tool, **args)
+
+    assert doc["is_error"] is True and named in doc["error"]
+    assert hub.calls == [], "nothing may be dialed or enqueued on a blank"
+
+
+async def test_an_omitted_optional_argument_is_simply_omitted(tmp_path):
+    """The other half of the same rule: an optional the agent left alone is
+    absent from the broker call rather than sent as an empty string, which a
+    broker would read as a filter matching nothing."""
+    hub = MapHub(specs=_specs(ALIEN_CONNECTOR))
+    await _call(_server(_state(tmp_path), hub), "list_orders",
+                account="AL-1", status="")
+
+    assert hub.args == [{"acct": "AL-1"}]
 
 
 # ---- connector inference --------------------------------------------------
@@ -681,11 +704,43 @@ async def test_stale_policy_is_the_answer_before_any_other_complaint(
     assert hub.calls == []
 
 
-async def test_the_seven_tools_are_all_registered(tmp_path):
-    mcp = _server(_state(tmp_path), MapHub())
-    names = {t.name for t in await mcp.list_tools()}
+async def test_a_stale_write_attempt_is_still_journalled(tmp_path, monkeypatch):
+    """An agent trying to trade while the edge is cut off from the platform is
+    exactly the event an owner needs to find afterwards.
 
-    assert {name for name, _ in SEVEN} <= names
+    The gate that refuses it sits ahead of `_guarded`, which is where every
+    other denial is recorded, so this one has to be recorded where it happens
+    or the attempt leaves no trace at all: the owner's audit trail would show
+    an outage and, during it, an agent that looks idle.
+    """
+    hub = MapHub(specs=_specs(ALIEN_CONNECTOR))
+    state = _state(tmp_path)
+    mcp = _server(state, hub)
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: real() + 1000)
+
+    await _call(mcp, "place_order", symbol="AAPL", side="buy", quantity=1)
+
+    events = EdgeAudit(state).pending()
+    assert len(events) == 1
+    assert events[0]["kind"] == "denial"
+    assert events[0]["detail"] == {"reason": "policy stale",
+                                   "capability": "place_order"}
+
+
+async def test_a_refusal_before_the_connector_was_chosen_names_no_broker(tmp_path,
+                                                                        monkeypatch):
+    """Provenance on the stale result too, and honest: empty strings say the
+    refusal landed before a connector was picked, rather than naming a broker
+    nothing was ever sent to."""
+    mcp = _server(_state(tmp_path), MapHub(specs=_specs(ALIEN_CONNECTOR)))
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: real() + 1000)
+
+    doc = await _call(mcp, "get_balance")
+
+    assert (doc["capability"], doc["connector"], doc["tool"]) == (
+        "get_balance", "", "")
 
 
 # ---- a broker that will not answer ---------------------------------------

@@ -43,6 +43,24 @@ def freshness_error() -> str:
     return json.dumps(STALE_POLICY)
 
 
+def _given(value) -> bool:
+    """Did the caller actually supply this argument?
+
+    An MCP tool cannot tell an omitted optional from one passed as its own
+    default, because FastMCP fills both with the same `""` or `None`. So an
+    empty string, an empty list and None all read as "not supplied", and the
+    caller's own signature (via `_capability_call`'s `required`) is what
+    decides whether that is allowed.
+
+    `0` and `0.0` ARE supplied values: a zero price is a fact, not a blank.
+    """
+    if value is None:
+        return False
+    if isinstance(value, (str, list, tuple, dict)):
+        return bool(value)
+    return True
+
+
 def build_hub(state: EdgeState, client: PlatformClient):
     from nakagai_edge.hub import ConnectorHub
 
@@ -158,12 +176,20 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
 
     async def _capability_call(capability: str, connector_id: str = "",
                                args: dict | None = None, *,
+                               required: tuple[str, ...] = (),
                                signal_id: str = "") -> dict:
         """One semantic call: pick the connector, resolve, dial, read back.
 
-        The result carries its own provenance (`capability`, `connector`,
-        `tool`), so both the agent and the audit trail record what actually
-        ran rather than what was asked for in the abstract.
+        Every result carries its own provenance (`capability`, `connector`,
+        `tool`), so both the agent and the audit trail record what actually ran
+        rather than what was asked for in the abstract. A refusal that landed
+        before the connector was chosen says so with empty strings; it never
+        names a broker nothing was sent to.
+
+        `required` names the arguments this tool's own signature makes
+        mandatory. An empty value for one of those is refused rather than
+        dropped: omitting an order id or a symbol does not ask the broker a
+        smaller question, it asks a different one.
 
         A READ comes back with `data` replaced by the canonical fields
         `extract` read out of the broker's payload. A WRITE comes back
@@ -173,12 +199,25 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         """
         from nakagai_edge.hub import ConnectorError
         if _gate() is not None:
-            return dict(STALE_POLICY)
+            # Journalled HERE because this refusal never reaches `_guarded`,
+            # which is where every other denial is recorded. An agent trying to
+            # trade while the edge is cut off from the platform is exactly the
+            # event an owner needs to find in the audit trail afterwards, and
+            # without this line it would leave no trace at all.
+            audit.record("denial", connector_id, "",
+                         {"reason": "policy stale", "capability": capability})
+            return {**STALE_POLICY, "capability": capability,
+                    "connector": connector_id, "tool": ""}
         try:
             cid = _pick_connector(capability, connector_id)
             spec = hub.spec(cid)
             cap = spec.capability(capability)
-            wanted = {k: v for k, v in (args or {}).items() if v not in (None, "")}
+            wanted = {k: v for k, v in (args or {}).items() if _given(v)}
+            if missing := [name for name in required if name not in wanted]:
+                raise CapabilityError(
+                    f"{capability} needs a value for {', '.join(missing)}; an "
+                    f"empty one would change what the broker is asked to do, "
+                    f"rather than ask it less")
             if "account" in CAPABILITIES[capability].args and not wanted.get("account"):
                 if inferred := await _infer_account(capability, spec):
                     wanted["account"] = inferred
@@ -338,7 +377,8 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         """
         return json.dumps(
             await _capability_call("get_quote", connector_id,
-                                   {"symbols": list(symbols or [])}), default=str)
+                                   {"symbols": list(symbols or [])},
+                                   required=("symbols",)), default=str)
 
     @mcp.tool()
     async def list_orders(connector_id: str = "", account: str = "",
@@ -368,16 +408,26 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
                           price: float | None = None, stop: float | None = None,
                           connector_id: str = "", account: str = "",
                           signal_id: str = "") -> str:
-        """Ask to place an order. THIS DOES NOT PLACE IT.
+        """Place an order, or ask the owner for permission to. WHICH ONE
+        HAPPENED IS IN THE RESPONSE: branch on `approval_required`, never on
+        an assumption.
 
-        The order is translated into this broker's own words and enqueued for
-        the owner to approve. What comes back is the intent, not a fill:
-        `approval_required: true`, an `approval_id`, a `status`, and an
-        `expires_at` after which the request lapses untouched. Poll
-        `get_approval(approval_id)` for the outcome. Nothing reaches the broker
-        until a human (or, inside the owner's autopilot envelope, the mandate)
-        says yes, and the edge then executes the arguments captured HERE, so
-        there is no second chance to change them.
+        `approval_required: true` means NOTHING reached the broker. You get an
+        `approval_id`, a `status`, and an `expires_at` after which the request
+        lapses untouched. Poll `get_approval(approval_id)` for the outcome.
+        When the owner (or, inside their autopilot envelope, the mandate) says
+        yes, the edge executes the arguments captured HERE, so there is no
+        second chance to change them.
+
+        No `approval_required` means the order WAS placed, right then, and what
+        you are holding under `data` is the broker's own answer, order
+        reference and all. Do not call again on the belief that it was merely
+        queued: that is how one intent becomes two real orders on a real
+        account.
+
+        Which of the two you get is the owner's configuration, not your
+        choice: it depends on whether this connector's approval policy covers
+        the tool your order maps to. Do not assume either.
 
         `side` is canonical: pass `buy` or `sell`, never the broker's own
         spelling. `quantity` is in shares. `price` makes it a limit order and
@@ -404,18 +454,24 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
                                    {"symbol": symbol, "side": side,
                                     "quantity": quantity, "price": price,
                                     "stop": stop, "account": account},
+                                   required=("symbol", "side", "quantity"),
                                    signal_id=signal_id), default=str)
 
     @mcp.tool()
     async def cancel_order(order_id: str, connector_id: str = "",
                            account: str = "") -> str:
-        """Ask to cancel a working order. THIS DOES NOT CANCEL IT.
+        """Cancel a working order, or ask the owner for permission to. Branch on
+        `approval_required` exactly as for `place_order`.
 
-        Like `place_order`, this is an intent: it comes back with
-        `approval_required: true` and an `approval_id` to poll on
-        `get_approval`, and the cancel reaches the broker only after the owner
-        approves it. An order can fill in that window, so treat a cancel as
-        requested rather than done until `list_orders` says otherwise.
+        `approval_required: true` means the cancel is only requested: poll
+        `get_approval(approval_id)`, and expect the broker to hear about it
+        only once the owner approves. Otherwise the cancel went through as you
+        asked and `data` holds the broker's own answer.
+
+        Either way, treat the order as still live until `list_orders` says
+        otherwise. An order can fill while a cancel is in flight, and it can
+        fill while one waits for a human; a cancel is a request to the broker,
+        never a guarantee about what already happened there.
 
         `order_id` is the `order_id` from `list_orders` on the same connector;
         ids are not portable between brokers. `connector_id` and `account`
@@ -424,7 +480,8 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         """
         return json.dumps(
             await _capability_call("cancel_order", connector_id,
-                                   {"order_id": order_id, "account": account}),
+                                   {"order_id": order_id, "account": account},
+                                   required=("order_id",)),
             default=str)
 
     @mcp.tool()
