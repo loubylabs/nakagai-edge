@@ -4,10 +4,14 @@ The agent is turn-based and cannot be pushed to, so something local has to hold
 the line and turn an arriving event into a wake-up. That is this module.
 
 Two classes of line come out, and the difference is the whole contract. An
-owner message is addressed to the agent and carries `reply_expected: true`.
-Everything else, a signal, an approval decision, a mandate change, is context
-the agent absorbs silently: the scanner writes hundreds of signals a session
-and answering each one would bury the owner's conversation in their own pane.
+owner message is addressed to the agent and carries `reply_expected: true`, and
+so does a referred signal, the one piece of context someone has attached a
+question to. Everything else, a plain signal, a market event, an approval
+decision, a mandate change, is context the agent absorbs silently: the scanner
+writes hundreds of signals and events a session and answering each one would
+bury the owner's conversation in their own pane. A market event names what
+fired in `detector` and nothing about direction or size of trade, because it
+authorizes nothing.
 RENDERERS below decides what is delivered at all, and is a security boundary.
 
 Four design points carry most of the weight:
@@ -92,6 +96,24 @@ RENDERERS = {
     "signal_referred": _named("signal_id", "symbol", "direction", "timeframe",
                               "confluence", "stacked", "intent", "note",
                               "referred_by"),
+    # One recorded observation about one symbol on one bar: a sharp move, a
+    # volume surge, a new range extreme, an opening gap. `detector` names which
+    # of those fired. It gives no direction and no geometry, no entry, stop,
+    # target or RR, so it authorizes nothing. It is context, and it is
+    # deliberately absent from REPLY_EXPECTED.
+    #
+    # `magnitude` is admitted where `briefing` is not, and the difference is
+    # authorship rather than shape. It holds numbers computed off OHLCV bars by
+    # a platform-authored detector spec, so there is no outsider-written text
+    # anywhere inside it. A briefing headline is prose an external news feed
+    # wrote, which is the one thing this registry exists to keep out.
+    #
+    # The detector is `detector` and not `kind` because `kind` is the
+    # envelope's word for which event this is. One vocabulary, one meaning per
+    # word: a body that shadowed an envelope key would be dropped on delivery
+    # (_envelope's own fields win), and the detector name would vanish.
+    "market_event": _named("symbol", "detector", "bar_ts", "timeframe",
+                           "magnitude"),
 }
 
 # The kinds the agent owes an answer to. Everything else is context it absorbs:
@@ -323,15 +345,24 @@ class ChannelListener:
 
     @staticmethod
     def _envelope(event: dict, cursor: int) -> dict | None:
-        """Render one event, or None for a kind that must not be delivered."""
+        """Render one event, or None for a kind that must not be delivered.
+
+        The render is spread FIRST so the envelope's own fields always win. A
+        body naming `reply_expected` would otherwise decide for itself that the
+        agent owes it an answer, and one naming `kind` would relabel its line in
+        a stream the agent sorts by kind. No renderer names either today; the
+        ordering is what keeps that a fact about the registry rather than a
+        thing the next entry can quietly undo. Fail closed, then widen
+        deliberately, applies to the envelope too.
+        """
         render = RENDERERS.get(event.get("kind"))
         if render is None:
             return None
         kind = event["kind"]
-        return {"seq": event.get("seq"), "kind": kind,
+        return {**render(event.get("body") or {}),
+                "seq": event.get("seq"), "kind": kind,
                 "at": event.get("created_at"), "cursor": cursor,
-                "reply_expected": kind in REPLY_EXPECTED,
-                **render(event.get("body") or {})}
+                "reply_expected": kind in REPLY_EXPECTED}
 
     def _flush(self, pending: list[dict], *, capped: bool, requests: int) -> None:
         """Deliver the end of a gap: the NEWEST `replay`, never the oldest.
