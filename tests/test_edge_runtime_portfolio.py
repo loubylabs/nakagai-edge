@@ -17,7 +17,7 @@ from nakagai_edge.edge.brake import Brake
 from nakagai_edge.edge.client import PlatformClient
 from nakagai_edge.edge.runtime import _loops, create_edge_mcp
 from nakagai_edge.edge.state import EdgeState
-from nakagai_edge.edge.sync import apply_bundle
+from nakagai_edge.edge.sync import BUNDLE_SCHEMA, apply_bundle
 
 pytestmark = pytest.mark.anyio
 
@@ -28,7 +28,7 @@ def anyio_backend():
 
 
 BUNDLE = {
-    "bundle_version": "v1",
+    "bundle_version": "v1", "schema_version": BUNDLE_SCHEMA,
     "connectors": {"connectors": [
         {"id": "robinhood-trading", "name": "Robinhood", "kind": "mcp-http",
          "role": "broker", "url": "https://demo.test/mcp", "enabled": True},

@@ -21,7 +21,7 @@ from nakagai_edge.edge.audit import EdgeAudit
 from nakagai_edge.edge.brake import Brake
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.supervision import load, record
-from nakagai_edge.edge.sync import apply_bundle
+from nakagai_edge.edge.sync import BUNDLE_SCHEMA, apply_bundle
 from nakagai_edge.hub import GuardrailDenied
 from nakagai_edge.signing import generate_keypair, sign_artifact
 from nakagai_edge.warrant import TRIGGER_BELOW, build_warrant_payload
@@ -258,7 +258,7 @@ class ThreadRecordingClient(FakeClient):
 def _brake(tmp_path, hub, *, stale=False, client=None):
     state = EdgeState(tmp_path)
     state.save_agent("https://api.test", "ag1", "nk_agent_t")
-    apply_bundle(state, {"bundle_version": "v1",
+    apply_bundle(state, {"bundle_version": "v1", "schema_version": BUNDLE_SCHEMA,
                          "connectors": {"connectors": []},
                          "mandate": {}, "strategy_configs": {},
                          "signing_public_key": PUB}, "v1")

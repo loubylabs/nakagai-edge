@@ -29,7 +29,7 @@ from nakagai_edge.edge.client import PlatformClient
 from nakagai_edge.edge.remote import RemoteApprovalQueue
 from nakagai_edge.edge.runtime import create_edge_mcp
 from nakagai_edge.edge.state import EdgeState
-from nakagai_edge.edge.sync import apply_bundle
+from nakagai_edge.edge.sync import BUNDLE_SCHEMA, apply_bundle
 from nakagai_edge.hub import ConnectorError, ConnectorHub
 from tests.fixtures.alien_registry import ALIEN_CONNECTOR, ROBINHOOD_CONNECTOR
 
@@ -164,7 +164,7 @@ class _Reporter:
 def _state(tmp_path, *entries):
     state = EdgeState(tmp_path)
     state.save_agent("https://api.test", "ag1", "nk_agent_t")
-    apply_bundle(state, {"bundle_version": "v1",
+    apply_bundle(state, {"bundle_version": "v1", "schema_version": BUNDLE_SCHEMA,
                          "connectors": {"connectors": list(entries)},
                          "signing_public_key": "k"}, "v1")
     return state

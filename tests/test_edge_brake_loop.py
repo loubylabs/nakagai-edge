@@ -14,13 +14,13 @@ from nakagai_edge.edge.brake import (
     armed, clear_local_disarm, disarmed_positions, set_local_disarm,
 )
 from nakagai_edge.edge.state import EdgeState
-from nakagai_edge.edge.sync import apply_bundle
+from nakagai_edge.edge.sync import BUNDLE_SCHEMA, apply_bundle
 
 
 def _state(tmp_path, mandate=None):
     state = EdgeState(tmp_path)
     state.save_agent("https://api.test", "ag1", "nk_agent_t")
-    apply_bundle(state, {"bundle_version": "v1",
+    apply_bundle(state, {"bundle_version": "v1", "schema_version": BUNDLE_SCHEMA,
                          "connectors": {"connectors": []},
                          "mandate": mandate or {}, "strategy_configs": {},
                          "signing_public_key": "k"}, "v1")

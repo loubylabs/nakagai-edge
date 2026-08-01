@@ -14,7 +14,7 @@ from nakagai_edge.edge.client import PlatformClient
 from nakagai_edge.edge.executor import poll_once
 from nakagai_edge.edge.remote import RemoteApprovalQueue, intents
 from nakagai_edge.edge.state import EdgeState
-from nakagai_edge.edge.sync import apply_bundle
+from nakagai_edge.edge.sync import BUNDLE_SCHEMA, apply_bundle
 from nakagai_edge.signing import build_payload, generate_keypair, sign_artifact
 
 pytestmark = pytest.mark.anyio
@@ -30,7 +30,8 @@ ARGS = {"account_number": "463605220", "qty": 1}
 
 
 def _bundle():
-    return {"bundle_version": "v1", "connectors": {"connectors": []},
+    return {"bundle_version": "v1", "schema_version": BUNDLE_SCHEMA,
+            "connectors": {"connectors": []},
             "mandate": {}, "strategy_configs": {},
             "signing_public_key": PUB}
 
@@ -436,7 +437,8 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
     # ---- edge: its state + a bundle carrying the platform's public key ----
     state = EdgeState(tmp_path / "edge")
     state.save_agent("https://api.test", agent_id, token)
-    apply_bundle(state, {"bundle_version": "v1", "connectors": {"connectors": []},
+    apply_bundle(state, {"bundle_version": "v1", "schema_version": BUNDLE_SCHEMA,
+                         "connectors": {"connectors": []},
                          "signing_public_key": public_key_for(priv)}, "v1")
 
     def forward(req):

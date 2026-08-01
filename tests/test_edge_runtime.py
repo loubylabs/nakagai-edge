@@ -16,7 +16,7 @@ from nakagai_edge.edge.brake import Brake
 from nakagai_edge.edge.client import PlatformClient
 from nakagai_edge.edge.runtime import build_hub, create_edge_mcp, freshness_error
 from nakagai_edge.edge.state import EdgeState
-from nakagai_edge.edge.sync import apply_bundle
+from nakagai_edge.edge.sync import BUNDLE_SCHEMA, apply_bundle, sync_once
 from tests.fixtures.alien_registry import ALIEN_CONNECTOR, ROBINHOOD_CONNECTOR
 
 pytestmark = pytest.mark.anyio
@@ -30,7 +30,7 @@ def anyio_backend():
 def _state(tmp_path):
     s = EdgeState(tmp_path)
     s.save_agent("https://api.test", "ag1", "nk_agent_t")
-    apply_bundle(s, {"bundle_version": "v1",
+    apply_bundle(s, {"bundle_version": "v1", "schema_version": BUNDLE_SCHEMA,
                      "connectors": {"connectors": []},
                      "signing_public_key": "k"}, "v1")
     return s
@@ -88,7 +88,32 @@ async def test_status_tool_works_even_stale(tmp_path, monkeypatch):
     monkeypatch.setattr(time, "time", lambda: real() + 1000)
     result = await mcp.call_tool("get_connector_status", {})
     text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
-    assert "connectors" in json.loads(text)
+    doc = json.loads(text)
+    assert "connectors" in doc
+    assert doc["schema_error"] == ""
+
+
+async def test_status_tool_carries_the_schema_error(tmp_path):
+    """The one tool that answers on stale policy, so it is the one place an
+    agent can learn WHY the rest is refusing. `policy_fresh: false` alone reads
+    as a network problem; a refused bundle needs the owner, not a retry."""
+    state = _state(tmp_path)
+    client = PlatformClient(
+        "https://api.test", "t",
+        transport=httpx.MockTransport(lambda r: httpx.Response(
+            200, json={"bundle_version": "v2", "connectors": {"connectors": []}},
+            headers={"etag": "v2"})))
+    assert sync_once(state, client) is False
+
+    hub = build_hub(state, client)
+    audit = EdgeAudit(state)
+    mcp = create_edge_mcp(state, hub, client, audit, _Reporter(),
+                          Brake(state, hub, client, audit))
+    result = await mcp.call_tool("get_connector_status", {})
+    text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+    doc = json.loads(text)
+    assert "upgrade the platform" in doc["schema_error"].lower()
+    assert str(BUNDLE_SCHEMA) in doc["schema_error"]
 
 
 def test_build_hub_exports_agent_token_env(tmp_path, monkeypatch):

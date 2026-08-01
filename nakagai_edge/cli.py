@@ -70,12 +70,17 @@ def _sync_step(state) -> int:
     import yaml as _yaml
 
     from nakagai_edge.edge.client import EdgeClientError
-    from nakagai_edge.edge.sync import fetched_at, sync_once
+    from nakagai_edge.edge.sync import fetched_at, schema_error, sync_once
     client = _edge_client(state)
     if client is None:
         raise EdgeClientError("edge is not paired")
     before = fetched_at(state)
     sync_once(state, client)
+    # A refused bundle is the more specific fault, and it has to be named
+    # first: it leaves fetched_at exactly where a dead platform would, so the
+    # generic message below would send the owner checking a URL that is fine.
+    if (refused := schema_error(state)):
+        raise EdgeClientError(f"sync failed: {refused}")
     path = state.root / "config" / "connectors.yaml"
     if not path.exists():
         raise EdgeClientError(
@@ -250,14 +255,22 @@ def _cmd_status(args) -> int:
     import json as _json
 
     from nakagai_edge.edge.state import EdgeState, default_root
-    from nakagai_edge.edge.sync import meta, policy_fresh
+    from nakagai_edge.edge.sync import meta, policy_fresh, schema_error
     state = EdgeState(default_root())
     agent = state.agent()
-    print(_json.dumps({"paired": agent is not None,
-                       "agent_id": (agent or {}).get("agent_id", ""),
-                       "platform_url": (agent or {}).get("platform_url", ""),
-                       "policy_fresh": policy_fresh(state),
-                       "meta": meta(state), "root": str(state.root)}, indent=2))
+    out = {"paired": agent is not None,
+           "agent_id": (agent or {}).get("agent_id", ""),
+           "platform_url": (agent or {}).get("platform_url", ""),
+           "policy_fresh": policy_fresh(state),
+           "meta": meta(state), "root": str(state.root)}
+    # Only when there is one, and up beside policy_fresh rather than buried in
+    # meta: a refused bundle otherwise shows up here as nothing but
+    # `policy_fresh: false`, which reads as an unreachable platform and sends
+    # the owner debugging the network instead of upgrading it. The message
+    # carries its own fix.
+    if (refused := schema_error(state)):
+        out["schema_error"] = refused
+    print(_json.dumps(out, indent=2))
     return 0
 
 

@@ -25,7 +25,7 @@ from nakagai_edge.edge.brake import Brake  # noqa: E402
 from nakagai_edge.edge.client import PlatformClient  # noqa: E402
 from nakagai_edge.edge.runtime import build_hub, create_edge_mcp  # noqa: E402
 from nakagai_edge.edge.state import EdgeState  # noqa: E402
-from nakagai_edge.edge.sync import apply_bundle  # noqa: E402
+from nakagai_edge.edge.sync import BUNDLE_SCHEMA, apply_bundle  # noqa: E402
 
 pytestmark = pytest.mark.anyio
 
@@ -66,7 +66,8 @@ class _Reporter:
 def _edge_mcp(edge_root, platform_client: PlatformClient):
     state = EdgeState(edge_root)
     state.save_agent("https://platform.test", "ag1", "nk_agent_t")
-    apply_bundle(state, {"bundle_version": "v1", "connectors": {"connectors": []},
+    apply_bundle(state, {"bundle_version": "v1", "schema_version": BUNDLE_SCHEMA,
+                         "connectors": {"connectors": []},
                          "signing_public_key": "k"}, "v1")
     hub = build_hub(state, platform_client)
     audit = EdgeAudit(state)

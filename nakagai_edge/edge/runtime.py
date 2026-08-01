@@ -27,7 +27,8 @@ from nakagai_edge.edge.supervision import (
     TERMINAL, apply_renewals, load as load_positions, reconcile,
     recover_interrupted, renewal_request,
 )
-from nakagai_edge.edge.sync import POLICY_TTL_S, SYNC_INTERVAL_S, policy_fresh, sync_once
+from nakagai_edge.edge.sync import (POLICY_TTL_S, SYNC_INTERVAL_S, policy_fresh,
+                                    schema_error, sync_once)
 
 EXECUTOR_INTERVAL_S = 5
 AUDIT_SHIP_INTERVAL_S = 30
@@ -273,9 +274,15 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
     @mcp.tool()
     async def get_connector_status() -> str:
         """Runtime state of every connector. Works even on stale policy, because
-        an agent needs to see WHY everything else is refusing."""
+        an agent needs to see WHY everything else is refusing.
+
+        `policy_fresh` false with a non-empty `schema_error` means the platform
+        is answering but sending policy this edge cannot fully read, so it is
+        refusing that bundle rather than half-applying it. Waiting will not fix
+        that one; the message says what will."""
         status = hub.status()
         status["policy_fresh"] = policy_fresh(state, POLICY_TTL_S)
+        status["schema_error"] = schema_error(state)
         return json.dumps(status, default=str)
 
     @mcp.tool()
