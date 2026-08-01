@@ -1,6 +1,12 @@
 """The snapshot loop's assembly and push. Fixture-driven: a fake hub, no
 network, no broker. The numbers only ever originate from the edge's own
-broker calls; an agent poke carries no data."""
+broker calls; an agent poke carries no data.
+
+Every assembly test runs against two brokers that agree on nothing: Robinhood,
+which wraps every response in its own envelope, and the alien fixture, which
+wraps nothing and spells account, symbol and quantity differently. A sweep that
+still had a Robinhood field name baked into it would pass the first and fail
+the second."""
 
 import asyncio
 
@@ -8,15 +14,18 @@ import httpx
 import pytest
 import yaml
 
+from nakagai_edge.config import ConnectorSpec, load_specs
 from nakagai_edge.edge.client import PlatformClient
 from nakagai_edge.edge.portfolio import (
     PORTFOLIO_INTERVAL_S, REFRESH_MIN_INTERVAL_S, PortfolioReporter,
     broker_specs, connector_snapshot, mark_guarded, tiered_accounts)
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.supervision import record
-from nakagai_edge.config import ConnectorSpec
+from tests.fixtures.alien_registry import ALIEN_CONNECTOR, ROBINHOOD_CONNECTOR
 
 pytestmark = pytest.mark.anyio
+
+SPECS = load_specs({"connectors": [ALIEN_CONNECTOR, ROBINHOOD_CONNECTOR]})
 
 
 @pytest.fixture
@@ -27,6 +36,7 @@ def anyio_backend():
 def _spec(**over):
     base = dict(id="robinhood-trading", kind="mcp-http", role="broker",
                 url="https://x.test/mcp", enabled=True,
+                capabilities=ROBINHOOD_CONNECTOR["capabilities"],
                 guardrails={"tools": {"allow": ["get_*"]},
                             "read_only_tools": ["get_*"],
                             "accounts": {"allow": ["463605220"],
@@ -39,6 +49,10 @@ ACCOUNTS = {"accounts": [
     {"account_number": "5QU41901", "type": "margin", "is_default": True},
     {"account_number": "463605220", "type": "cash", "nickname": "Agentic"},
 ]}
+# What list_accounts extracts from ACCOUNTS. tiered_accounts is handed the
+# normalized rows, not the broker's, so it keys off `account`.
+LISTED = [{"account": "5QU41901", "type": "margin"},
+          {"account": "463605220", "type": "cash", "nickname": "Agentic"}]
 PORTFOLIO = {"total_value": "1000", "cash": "1000", "currency": "USD",
              "buying_power": {"buying_power": "1000.0000"}}
 POSITIONS = {"positions": [{"symbol": "SPY", "quantity": "10",
@@ -48,7 +62,9 @@ POSITIONS = {"positions": [{"symbol": "SPY", "quantity": "10",
 class FakeHub:
     """hub.call's contract: {"data": <downstream>}, raising on refusal.
     Robinhood nests its own {"data": ..., "guide": ...} envelope, so the
-    canned responses here nest one too, to prove _unwrap peels it."""
+    canned responses here nest one too. Nothing in portfolio.py peels it any
+    more: the map roots every Robinhood capability at `data`, and these
+    responses prove the map is actually being followed."""
 
     def __init__(self, responses):
         self.responses = responses
@@ -64,6 +80,18 @@ class FakeHub:
                 "is_error": False, "data": {"data": out, "guide": "ignore me"}}
 
 
+class AlienHub:
+    """The same contract for a broker with no envelope of its own: one canned
+    response per tool, handed back as hub.call's `data` and nothing more."""
+
+    def __init__(self, responses):
+        self.responses, self.calls = responses, []
+
+    async def call(self, connector_id, tool, args):
+        self.calls.append((connector_id, tool, dict(args)))
+        return {"data": self.responses[tool]}
+
+
 def _hub_ok():
     return FakeHub({
         ("get_accounts", ""): ACCOUNTS,
@@ -77,22 +105,22 @@ def _hub_ok():
 # ---- tiering -------------------------------------------------------------
 
 def test_tiered_accounts_unions_both_tiers_with_their_labels():
-    got = tiered_accounts(_spec(), ACCOUNTS["accounts"])
-    by_num = {a["account_number"]: tier for a, tier in got}
+    got = tiered_accounts(_spec(), LISTED)
+    by_num = {a["account"]: tier for a, tier in got}
     assert by_num == {"463605220": "full", "5QU41901": "read"}
 
 
 def test_no_account_lists_means_every_listed_account_at_full_tier():
     s = _spec(guardrails={"tools": {"allow": ["get_*"]},
                           "read_only_tools": ["get_*"]})
-    got = tiered_accounts(s, ACCOUNTS["accounts"])
-    assert [(a["account_number"], t) for a, t in got] == [
+    got = tiered_accounts(s, LISTED)
+    assert [(a["account"], t) for a, t in got] == [
         ("5QU41901", "full"), ("463605220", "full")]
 
 
 def test_a_configured_account_the_broker_did_not_list_is_still_fetched():
     got = tiered_accounts(_spec(), [])
-    assert {a["account_number"] for a, _ in got} == {"463605220", "5QU41901"}
+    assert {a["account"] for a, _ in got} == {"463605220", "5QU41901"}
 
 
 # ---- assembly ------------------------------------------------------------
@@ -122,11 +150,83 @@ async def test_one_accounts_failure_does_not_blank_its_siblings():
     assert by_num["463605220"]["error"] == ""
 
 
-async def test_a_dead_get_accounts_degrades_to_a_connector_level_error():
+async def test_a_dead_account_list_degrades_to_a_connector_level_error():
     hub = FakeHub({("get_accounts", ""): RuntimeError("token expired")})
     entry = await connector_snapshot(hub, _spec())
     assert "token expired" in entry["error"]
     assert entry["accounts"] == []
+
+
+def _alien_hub(**over):
+    responses = {
+        "accounts_list": {"accounts": [{"acct": "AL-1", "label": "Main",
+                                        "kind": "margin"}]},
+        "balances": {"net_liq": "104238.55"},
+        "holdings": {"holdings": [{"ticker": "aapl", "qty": "25",
+                                   "cost": "187.20"}]}}
+    responses.update(over)
+    return AlienHub(responses)
+
+
+async def test_snapshot_dials_the_alien_brokers_own_tool_names():
+    hub = _alien_hub()
+    entry = await connector_snapshot(hub, SPECS["alien-broker"])
+    assert [c[1] for c in hub.calls] == ["accounts_list", "balances", "holdings"]
+    assert entry["accounts"][0]["account_number"] == "AL-1"
+    assert entry["accounts"][0]["nickname"] == "Main"
+
+
+async def test_snapshot_normalizes_symbol_and_quantity_onto_raw_rows():
+    entry = await connector_snapshot(_alien_hub(), SPECS["alien-broker"])
+    row = entry["accounts"][0]["positions"][0]
+    assert row["symbol"] == "AAPL"       # normalized, overwrites nothing here
+    assert row["quantity"] == 25.0
+    assert row["cost"] == "187.20"       # raw fields survive untouched
+
+
+async def test_snapshot_keeps_broker_figures_verbatim():
+    hub = _alien_hub(balances={"net_liq": "104,238.55", "denom": "USD"},
+                     holdings={"holdings": []})
+    entry = await connector_snapshot(hub, SPECS["alien-broker"])
+    assert entry["accounts"][0]["portfolio"] == {"net_liq": "104,238.55",
+                                                 "denom": "USD"}
+
+
+async def test_a_connector_missing_a_capability_reports_the_error():
+    spec = SPECS["alien-broker"].model_copy(deep=True)
+    del spec.capabilities["list_accounts"]
+    entry = await connector_snapshot(AlienHub({}), spec)
+    assert "list_accounts" in entry["error"]
+    assert entry["accounts"] == []
+
+
+async def test_a_position_whose_quantity_is_unreadable_keeps_its_symbol():
+    """The row stays, named, with no `quantity`. Dropping it would read as a
+    position that closed, and the brake releases what it cannot see: a live
+    position would silently lose its stop. supervision.unreadable() exists to
+    tell those two apart, and this is the shape it reads."""
+    hub = _alien_hub(holdings={"holdings": [
+        {"ticker": "spy", "qty": "many"},
+        {"ticker": "aapl", "qty": "25"}]})
+    entry = await connector_snapshot(hub, SPECS["alien-broker"])
+    rows = entry["accounts"][0]["positions"]
+    assert [r["symbol"] for r in rows] == ["SPY", "AAPL"]
+    assert "quantity" not in rows[0]
+    assert rows[1]["quantity"] == 25.0
+
+
+async def test_an_unreadable_row_does_not_shift_its_neighbours_quantity():
+    """The zip trap. `extract` drops what it cannot read, so pairing its output
+    against the raw list positionally would hand row 2's quantity to row 1 and
+    put a real stop on the wrong symbol. Rows are read one at a time."""
+    hub = _alien_hub(holdings={"holdings": [
+        {"ticker": "spy"},                      # no qty at all
+        {"ticker": "aapl", "qty": "25"},
+        {"ticker": "msft", "qty": "7"}]})
+    entry = await connector_snapshot(hub, SPECS["alien-broker"])
+    rows = entry["accounts"][0]["positions"]
+    assert [(r["symbol"], r.get("quantity")) for r in rows] == [
+        ("SPY", None), ("AAPL", 25.0), ("MSFT", 7.0)]
 
 
 # ---- the guarded marker ---------------------------------------------------
@@ -241,6 +341,9 @@ def _reporter(tmp_path, hub, handler):
         {"connectors": [{
             "id": "robinhood-trading", "kind": "mcp-http", "role": "broker",
             "url": "https://x.test/mcp", "enabled": True,
+            # Through the file and back, so the reporter proves the sweep works
+            # off a parsed registry and not off a spec a test hand-built.
+            "capabilities": ROBINHOOD_CONNECTOR["capabilities"],
             "guardrails": {"tools": {"allow": ["get_*"]},
                            "read_only_tools": ["get_*"],
                            "accounts": {"allow": ["463605220"],

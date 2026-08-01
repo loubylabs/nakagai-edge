@@ -86,6 +86,12 @@ class Capability(BaseModel):
     """
     tool: str
     args: dict[str, str] = Field(default_factory=dict)
+    # Where this capability's result sits inside the response, first path
+    # winning. `fields` are then read relative to it: relative to each element
+    # for a list capability, relative to the object itself for a scalar one.
+    # One meaning for one word, so a map author never has to remember which
+    # paths are rooted and which are absolute. Empty means the response root,
+    # which is how a broker that wraps nothing at all maps.
     items: list[str] = Field(default_factory=list)
     fields: dict[str, list[str]] = Field(default_factory=dict)
     values: dict[str, dict[str, list[str]]] = Field(default_factory=dict)
@@ -230,16 +236,22 @@ def read_row(name: str, cap: Capability, node: Any) -> dict | None:
 def extract(name: str, cap: Capability, payload: Any) -> dict | list[dict] | None:
     """A broker response read back into canonical fields.
 
+    `cap.items` roots both kinds of capability, because a broker that wraps its
+    lists in an envelope wraps its scalars in the same one. Robinhood's
+    {"data": ..., "guide": ...} is exactly that, and naming the node once per
+    capability is what lets the portfolio sweep's hardcoded peel be deleted
+    rather than generalized into a second rule.
+
     A list capability drops rows it cannot read rather than folding them in as
     zero; a scalar capability returns None for the same reason. See coerce().
     """
     vocab = CAPABILITIES.get(name)
     if vocab is None:
         raise CapabilityError(f"unknown capability {name!r}")
+    node = first(payload, cap.items) if cap.items else payload
     if not vocab.is_list:
-        return read_row(name, cap, payload)
-    rows = first(payload, cap.items) if cap.items else payload
-    if not isinstance(rows, list):
+        return read_row(name, cap, node)
+    if not isinstance(node, list):
         return []
-    read = (read_row(name, cap, row) for row in rows)
+    read = (read_row(name, cap, row) for row in node)
     return [row for row in read if row is not None]

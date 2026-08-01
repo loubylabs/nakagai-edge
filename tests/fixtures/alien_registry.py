@@ -81,14 +81,19 @@ ROBINHOOD_CONNECTOR = {
             "items": ["data.accounts"],
             "fields": {"account": ["account_number"], "nickname": ["nickname"],
                        "type": ["type", "brokerage_account_type"]}},
+        # Rooted at `data` like its five siblings, rather than repeating that
+        # prefix on every field path. The portfolio sweep hands this node
+        # straight to the web as raw figures, so the root has to be somewhere
+        # the map states once and both readers agree on.
         "get_balance": {
             "tool": "get_portfolio",
             "args": {"account": "account_number"},
-            "fields": {"equity": ["data.total_value", "data.equity"],
-                       "cash": ["data.cash"],
-                       "buying_power": ["data.buying_power.buying_power",
-                                        "data.buying_power"],
-                       "currency": ["data.currency"]}},
+            "items": ["data"],
+            "fields": {"equity": ["total_value", "equity"],
+                       "cash": ["cash"],
+                       "buying_power": ["buying_power.buying_power",
+                                        "buying_power"],
+                       "currency": ["currency"]}},
         "list_positions": {
             "tool": "get_equity_positions",
             "args": {"account": "account_number"},

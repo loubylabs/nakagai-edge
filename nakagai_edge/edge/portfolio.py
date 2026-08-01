@@ -18,20 +18,12 @@ from pathlib import Path
 
 import yaml
 
+from nakagai_edge.capability import extract, first, read_partial, resolve
+
 PORTFOLIO_INTERVAL_S = 300      # the timer loop's cadence
 REFRESH_MIN_INTERVAL_S = 15     # a poke inside this window is not a sweep
 
 log = logging.getLogger("nakagai.edge")
-
-
-def _unwrap(out: dict):
-    """hub.call returns {"data": <downstream result>}; Robinhood nests its own
-    {"data": ..., "guide": ...} envelope inside that. Peel both, drop the
-    guide: figures only."""
-    payload = out.get("data")
-    if isinstance(payload, dict) and "data" in payload:
-        payload = payload["data"]
-    return payload
 
 
 def broker_specs(root) -> list:
@@ -48,6 +40,9 @@ def broker_specs(root) -> list:
 def tiered_accounts(spec, listed: list[dict]) -> list[tuple[dict, str]]:
     """(account, tier) pairs the snapshot should fetch.
 
+    `listed` has already been through the map, so its rows carry the canonical
+    `account` field whatever the broker calls its own account number.
+
     No account lists configured means no restriction (check_accounts
     semantics), so every listed account is fetched at the full tier. With
     lists, the union of both tiers is fetched, each under its own label; a
@@ -57,43 +52,100 @@ def tiered_accounts(spec, listed: list[dict]) -> list[tuple[dict, str]]:
     g = spec.guardrails.accounts
     if not g.allow and not g.read:
         return [(a, "full") for a in listed]
-    by_number = {str(a.get("account_number", "")): a for a in listed}
+    by_number = {str(a.get("account", "")): a for a in listed}
     pairs = []
     for tier, numbers in (("full", g.allow), ("read", g.read)):
         for num in numbers:
-            pairs.append((by_number.get(num, {"account_number": num}), tier))
+            pairs.append((by_number.get(num, {"account": num}), tier))
     return pairs
 
 
 async def connector_snapshot(hub, spec) -> dict:
     """One connector's snapshot document. Failures degrade to the smallest
-    honest unit: a dead account keeps its siblings, a dead get_accounts keeps
-    the other connectors (the caller assembles those)."""
+    honest unit: a dead account keeps its siblings, a dead account list keeps
+    the other connectors (the caller assembles those).
+
+    The map chooses which tools to dial and locates the fields the edge itself
+    decides on. Nothing else is reshaped: this document's key names are the
+    web's contract, so `account_number`, `nickname` and `type` keep their
+    spelling here while their values now arrive through `list_accounts`.
+    """
     entry: dict = {"id": spec.id, "error": "", "accounts": []}
     try:
-        listed = _unwrap(await hub.call(spec.id, "get_accounts", {}))
-        accounts = listed.get("accounts", []) if isinstance(listed, dict) else []
+        cap = spec.capability("list_accounts")
+        tool, args = resolve("list_accounts", cap, {})
+        payload = (await hub.call(spec.id, tool, args)).get("data")
+        listed = extract("list_accounts", cap, payload)
     except Exception as e:  # noqa: BLE001 (per-connector degradation, by design)
+        # CapabilityError arrives here too. A connector that never declared
+        # list_accounts says so in its own entry and contributes no accounts,
+        # rather than taking the other brokers' sweep down with it.
         entry["error"] = f"{type(e).__name__}: {e}"
         return entry
-    for account, tier in tiered_accounts(spec, accounts):
-        num = str(account.get("account_number", ""))
+    for account, tier in tiered_accounts(spec, listed):
+        num = str(account.get("account", ""))
         row = {"account_number": num,
                "nickname": account.get("nickname") or "",
                "type": account.get("type") or "",
                "tier": tier, "error": "", "portfolio": {}, "positions": []}
         try:
-            args = {"account_number": num}
-            figures = _unwrap(await hub.call(spec.id, "get_portfolio", args))
-            row["portfolio"] = figures if isinstance(figures, dict) else {}
-            held = _unwrap(await hub.call(spec.id, "get_equity_positions", args))
-            if isinstance(held, dict):
-                held = held.get("positions") or held.get("results") or []
-            row["positions"] = held if isinstance(held, list) else []
+            row["portfolio"] = await _figures(hub, spec, num)
+            row["positions"] = await _positions(hub, spec, num)
         except Exception as e:  # noqa: BLE001 (per-account degradation, by design)
             row["error"] = f"{type(e).__name__}: {e}"
         entry["accounts"].append(row)
     return entry
+
+
+async def _figures(hub, spec, account: str) -> dict:
+    """The broker's own balance payload, verbatim.
+
+    The map picks the tool and names the node the figures sit at; nothing is
+    extracted. The web renders these keys directly today, so reshaping them
+    here would break the Portfolio page a release before its own migration
+    lands.
+
+    `cap.items` is what replaced the hardcoded peel this module used to do.
+    Robinhood nests a {"data": ..., "guide": ...} envelope inside hub.call's
+    own, and the map now says where that sits instead of this module knowing
+    the word "data". A broker that wraps nothing declares no items, and the
+    whole payload is the figures.
+    """
+    cap = spec.capability("get_balance")
+    tool, args = resolve("get_balance", cap, {"account": account})
+    payload = (await hub.call(spec.id, tool, args)).get("data")
+    figures = first(payload, cap.items) if cap.items else payload
+    return figures if isinstance(figures, dict) else {}
+
+
+async def _positions(hub, spec, account: str) -> list:
+    """Raw position rows carrying normalized `symbol` and `quantity`.
+
+    Both keys deliberately overwrite whatever the broker called them, because
+    supervision and mark_guarded key off exactly these two and must not go on
+    guessing. Every other field the broker sent survives for the web.
+
+    Two things here are load-bearing and easy to get wrong:
+
+    Rows are normalized ONE AT A TIME rather than by zipping the raw list
+    against `extract`'s output. `extract` drops what it cannot read, so the two
+    lists would fall out of alignment and attach one position's quantity to
+    another position's symbol.
+
+    `read_partial`, not `read_row`: a row whose quantity is unreadable KEEPS
+    its symbol and stays in the list without a `quantity`. Dropping it would
+    make the position look gone, which releases the brake and leaves something
+    live without a stop. That is exactly the mistake supervision.unreadable()
+    exists to prevent.
+    """
+    cap = spec.capability("list_positions")
+    tool, args = resolve("list_positions", cap, {"account": account})
+    payload = (await hub.call(spec.id, tool, args)).get("data")
+    rows = first(payload, cap.items) if cap.items else payload
+    if not isinstance(rows, list):
+        return []
+    return [{**row, **read_partial("list_positions", cap, row)}
+            for row in rows if isinstance(row, dict)]
 
 
 def mark_guarded(state, connectors: list[dict], *, brake_armed: bool = True,
