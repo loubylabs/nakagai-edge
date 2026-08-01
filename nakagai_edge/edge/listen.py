@@ -92,6 +92,26 @@ RENDERERS = {
     "signal_referred": _named("signal_id", "symbol", "direction", "timeframe",
                               "confluence", "stacked", "intent", "note",
                               "referred_by"),
+    # One recorded observation about one symbol on one bar: a sharp move, a
+    # volume surge, a new range extreme, an opening gap. It names no direction
+    # and carries no geometry, no entry, stop, target or RR, so it authorizes
+    # nothing. It is context, and it is deliberately absent from REPLY_EXPECTED.
+    #
+    # `magnitude` is admitted where `briefing` is not, and the difference is
+    # authorship rather than shape. It holds numbers computed off OHLCV bars by
+    # a platform-authored detector spec, so there is no outsider-written text
+    # anywhere inside it. A briefing headline is prose an external news feed
+    # wrote, which is the one thing this registry exists to keep out.
+    #
+    # The body names its detector in a field also called `kind`, which is the
+    # envelope's word for something else. Copied verbatim it would land on top
+    # of the envelope's kind (_envelope spreads the render over its own keys),
+    # and the agent would sort a mixed stream by a kind it has never been told
+    # about. It is delivered as `event` so both survive.
+    "market_event": lambda b: {"symbol": b.get("symbol"), "event": b.get("kind"),
+                               "bar_ts": b.get("bar_ts"),
+                               "timeframe": b.get("timeframe"),
+                               "magnitude": b.get("magnitude")},
 }
 
 # The kinds the agent owes an answer to. Everything else is context it absorbs:
