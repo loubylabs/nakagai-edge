@@ -60,3 +60,24 @@ def test_load_specs_carries_capabilities_through_the_registry():
             "items": ["data.quotes"],
             "fields": {"symbol": ["symbol"], "price": ["last_trade_price"]}}}}]})
     assert specs["demo"].capability("get_quote").tool == "get_quotes"
+
+
+def test_a_capability_that_takes_no_account_gets_no_account_key():
+    spec = ConnectorSpec(**BASE, capabilities={
+        "list_accounts": {"tool": "get_accounts",
+                          "items": ["data.accounts"],
+                          "fields": {"account": ["account_number"]}}})
+    assert "account" not in spec.capability("list_accounts").args
+
+
+def test_two_specs_sharing_a_capability_object_each_get_their_own_account_key():
+    from nakagai_edge.capability import Capability
+    shared = Capability(tool="get_equity_positions",
+                        items=["data.positions"],
+                        fields={"symbol": ["symbol"], "quantity": ["quantity"]})
+    first = ConnectorSpec(**BASE, capabilities={"list_positions": shared})
+    second = ConnectorSpec(**{**BASE, "id": "other"},
+                           guardrails={"accounts": {"arg_names": ["acct"]}},
+                           capabilities={"list_positions": shared})
+    assert first.capability("list_positions").args["account"] == "account_number"
+    assert second.capability("list_positions").args["account"] == "acct"

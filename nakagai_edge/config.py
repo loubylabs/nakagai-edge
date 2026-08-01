@@ -199,12 +199,21 @@ class ConnectorSpec(BaseModel):
         # The map says where the account goes; check_accounts hunts for it in
         # arbitrary args on the raw call_connector path. Different jobs, and
         # they must not disagree about the key name, so the map inherits it.
+        #
+        # Copy rather than mutate: a caller may pass an already-constructed
+        # Capability instance and reuse that same object across two specs, and
+        # pydantic keeps the identical reference rather than copying it. An
+        # in-place write to cap.args would then leak the FIRST spec's account
+        # key into the SECOND spec's map, since both specs would be looking at
+        # the same dict. Building a new Capability keeps each spec's map its
+        # own.
         names = self.guardrails.accounts.arg_names
         if not names:
             return self
         for name, cap in self.capabilities.items():
             if "account" in CAPABILITIES[name].args and "account" not in cap.args:
-                cap.args["account"] = names[0]
+                self.capabilities[name] = cap.model_copy(
+                    update={"args": {**cap.args, "account": names[0]}})
         return self
 
     @property
