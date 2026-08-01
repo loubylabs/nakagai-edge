@@ -9,6 +9,7 @@ import json
 import sys
 
 from nakagai_edge.edge.state import EdgeState, default_root
+from nakagai_edge.identity import package_version
 
 
 def _gateway_run(coro):
@@ -329,6 +330,10 @@ def main(argv=None) -> int:
         prog="nakagai-edge",
         description="Run a Nakagai edge: it holds your broker credentials, and "
                     "executes only what the platform has signed.")
+    # Before the subparsers, and deliberately not a subcommand: the version is
+    # what a bug report opens with, and asking for it should not require knowing
+    # which subcommand to hang it off.
+    p.add_argument("--version", action="version", version=package_version())
     sub = p.add_subparsers(dest="cmd", required=True)
 
     p_pair = sub.add_parser("pair", help="exchange a pairing code for an agent token")

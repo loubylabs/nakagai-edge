@@ -6,6 +6,20 @@ readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.12"
+keywords = ["trading", "brokerage", "mcp", "agent", "credentials"]
+# No `License ::` classifier: `license` above is a PEP 639 SPDX expression, and
+# modern build backends reject carrying both. Only 3.12 is claimed because only
+# 3.12 is what CI runs.
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business :: Financial :: Investment",
+    "Topic :: Security",
+]
 dependencies = [
     "mcp>=1.9",
     "cryptography>=42",
@@ -16,6 +30,7 @@ dependencies = [
 [project.urls]
 Homepage = "https://nakag.ai"
 Repository = "https://github.com/loubylabs/nakagai-edge"
+Issues = "https://github.com/loubylabs/nakagai-edge/issues"
 
 [project.scripts]
 nakagai-edge = "nakagai_edge.cli:main"
@@ -29,6 +44,12 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["nakagai_edge"]
+
+[tool.hatch.build.targets.sdist]
+# What ships is a choice, not whatever happened to be tracked. `tests/` and the
+# lockfile earn their place (someone building from source can verify it); agent
+# scaffolding and CI config do not.
+exclude = [".claude", ".github"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -36,7 +36,7 @@ connector through it.
 
 # One command: pairs, syncs the registry, and (after you confirm at the
 # prompt) opens a browser to log you into your broker, then serves.
-uvx --from git+https://github.com/loubylabs/nakagai-edge nakagai-edge setup <code> --platform https://api.nakag.ai
+uvx nakagai-edge setup <code> --platform https://api.nakag.ai
 ```
 
 `setup` is idempotent: re-running it on a healthy edge just starts the server,
