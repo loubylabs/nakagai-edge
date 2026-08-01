@@ -45,9 +45,6 @@ TERMINAL = ("firing", "fired", "outcome_unknown", "released")
 
 CORRUPT_LEDGER_NAME = "supervised.corrupt.json"
 
-_SYMBOL_KEYS = ("symbol", "ticker", "instrument_symbol")
-_QUANTITY_KEYS = ("quantity", "qty", "shares", "position_size")
-
 
 def _corrupt_path(state: EdgeState):
     return state.supervised_path.with_name(CORRUPT_LEDGER_NAME)
@@ -185,11 +182,69 @@ def recover_interrupted(state: EdgeState) -> list[str]:
     return recovered
 
 
-def _scalar(row: dict, keys) -> str:
-    for key in keys:
-        if row.get(key) not in (None, ""):
-            return str(row[key])
-    return ""
+def _reading(row: dict) -> tuple[str, float | None]:
+    """One position row as (symbol, quantity), quantity None when unreadable.
+
+    `symbol` and `quantity` are read straight off the row and nothing else is
+    consulted, because portfolio._positions has already written the canonical
+    pair over whatever the broker spelled them. This module used to walk a list
+    of candidate key names; a map that says where a field lives beats a reader
+    guessing at it, and the guess quietly read the wrong field for any broker
+    whose own spelling happened to collide with a candidate.
+
+    A `quantity` that is not a real number is None, which is this module's word
+    for unreadable and never for zero. Three shapes land here, and all three
+    mean the sweep did not normalize this row:
+
+    - no `quantity` key at all: `read_partial` dropped the field it could not
+      coerce and kept the row, which is the ordinary unreadable case;
+    - a leftover string: the raw broker value survived under the canonical
+      name because the field the map actually pointed at failed to read, so
+      parsing it would report a number no capability map ever chose;
+    - a non-finite float: capability.coerce refuses these for the reason
+      warrant.py does, and every NaN comparison being False is exactly how a
+      clamp stops clamping.
+
+    ONE helper, read by both `held_quantities` and `unreadable`, so the two can
+    never disagree about what "readable" means. If they ever did, a row could
+    be skipped by the first and missed by the second, and reconcile would read
+    that silence as a closed position and release a live one.
+    """
+    symbol = str(row.get("symbol", "")).strip().upper()
+    qty = row.get("quantity")
+    if (isinstance(qty, (int, float)) and not isinstance(qty, bool)
+            and math.isfinite(qty)):
+        return symbol, float(qty)
+    return symbol, None
+
+
+def _accounts(portfolio_doc: dict):
+    """(connector_id, account_number, positions) for every account that
+    ANSWERED, in document order.
+
+    A connector or account carrying an error is skipped: a failed snapshot
+    proves nothing about what the broker holds, and see the module docstring
+    for what contributing zeros instead would do.
+
+    An account with no readable identifier is skipped too. The sweep now keeps
+    such a row visible rather than dropping it, and it always carries an error
+    saying why, so the check above already covers today's producer; this is the
+    second lock on the same door. An account nobody can name cannot answer for
+    a position, and letting it into `answered()` would make a record whose own
+    account is "" look confirmed-absent, which releases it, and `released` is
+    TERMINAL.
+    """
+    for entry in (portfolio_doc or {}).get("connectors") or []:
+        if entry.get("error"):
+            continue
+        cid = entry.get("id", "")
+        for account in entry.get("accounts") or []:
+            if account.get("error"):
+                continue
+            number = str(account.get("account_number", ""))
+            if not number:
+                continue
+            yield cid, number, account.get("positions") or []
 
 
 def held_quantities(portfolio_doc: dict) -> dict:
@@ -202,40 +257,23 @@ def held_quantities(portfolio_doc: dict) -> dict:
     keep that distinction visible to `reconcile`.
     """
     out: dict = {}
-    for entry in (portfolio_doc or {}).get("connectors") or []:
-        if entry.get("error"):
-            continue
-        cid = entry.get("id", "")
-        for account in entry.get("accounts") or []:
-            if account.get("error"):
+    for cid, number, positions in _accounts(portfolio_doc):
+        for row in positions:
+            if not isinstance(row, dict):
                 continue
-            number = str(account.get("account_number", ""))
-            for row in account.get("positions") or []:
-                if not isinstance(row, dict):
-                    continue
-                symbol = _scalar(row, _SYMBOL_KEYS).upper()
-                if not symbol:
-                    continue
-                try:
-                    qty = float(_scalar(row, _QUANTITY_KEYS))
-                except (TypeError, ValueError):
-                    continue              # unreadable(), not zero
-                out[(cid, number, symbol)] = qty
+            symbol, qty = _reading(row)
+            if not symbol:
+                continue
+            if qty is None:
+                continue                  # unreadable(), not zero
+            out[(cid, number, symbol)] = qty
     return out
 
 
 def answered(portfolio_doc: dict) -> set:
     """(connector, account) pairs whose snapshot succeeded. Absence from a
     successful snapshot is what proves a position is gone."""
-    out = set()
-    for entry in (portfolio_doc or {}).get("connectors") or []:
-        if entry.get("error"):
-            continue
-        for account in entry.get("accounts") or []:
-            if account.get("error"):
-                continue
-            out.add((entry.get("id", ""), str(account.get("account_number", ""))))
-    return out
+    return {(cid, number) for cid, number, _ in _accounts(portfolio_doc)}
 
 
 def unreadable(portfolio_doc: dict) -> set:
@@ -245,26 +283,19 @@ def unreadable(portfolio_doc: dict) -> set:
     A row we cannot read is not a row reporting zero. Treating it as zero
     releases the position and disarms the brake: the same mistake as trusting a
     failed snapshot, arriving through a different door.
+
+    The row is still named, which is the whole reason the sweep keeps it: the
+    position can be pointed at, so reconcile can leave that one record alone
+    instead of treating the account's whole answer as suspect.
     """
     out = set()
-    for entry in (portfolio_doc or {}).get("connectors") or []:
-        if entry.get("error"):
-            continue
-        cid = entry.get("id", "")
-        for account in entry.get("accounts") or []:
-            if account.get("error"):
+    for cid, number, positions in _accounts(portfolio_doc):
+        for row in positions:
+            if not isinstance(row, dict):
                 continue
-            number = str(account.get("account_number", ""))
-            for row in account.get("positions") or []:
-                if not isinstance(row, dict):
-                    continue
-                symbol = _scalar(row, _SYMBOL_KEYS).upper()
-                if not symbol:
-                    continue
-                try:
-                    float(_scalar(row, _QUANTITY_KEYS))
-                except (TypeError, ValueError):
-                    out.add((cid, number, symbol))
+            symbol, qty = _reading(row)
+            if symbol and qty is None:
+                out.add((cid, number, symbol))
     return out
 
 
