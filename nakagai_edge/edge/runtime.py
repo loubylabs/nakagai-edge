@@ -15,7 +15,7 @@ import time
 
 import httpx
 
-from nakagai_edge.capability import extract, resolve
+from nakagai_edge.capability import CAPABILITIES, CapabilityError, extract, resolve
 from nakagai_edge.edge.audit import EdgeAudit
 from nakagai_edge.edge.brake import BRAKE_INTERVAL_S, Brake, normalize_quote
 from nakagai_edge.edge.client import EdgeClientError, PlatformClient
@@ -33,11 +33,14 @@ EXECUTOR_INTERVAL_S = 5
 AUDIT_SHIP_INTERVAL_S = 30
 
 
+STALE_POLICY = {"is_error": True, "error":
+    "policy stale: the edge cannot reach the platform and its cached "
+    "policy is past TTL; every connector call is refused until a sync "
+    "succeeds"}
+
+
 def freshness_error() -> str:
-    return json.dumps({"is_error": True, "error":
-        "policy stale: the edge cannot reach the platform and its cached "
-        "policy is past TTL; every connector call is refused until a sync "
-        "succeeds"})
+    return json.dumps(STALE_POLICY)
 
 
 def build_hub(state: EdgeState, client: PlatformClient):
@@ -63,33 +66,149 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
     def _gate() -> str | None:
         return None if policy_fresh(state, POLICY_TTL_S) else freshness_error()
 
-    async def _guarded(connector_id: str, tool: str, args: dict) -> str:
-        if (stale := _gate()) is not None:
-            audit.record("denial", connector_id, tool, {"reason": "policy stale"})
-            return stale
+    async def _guarded(connector_id: str, tool: str, args: dict, *,
+                       signal_id: str = "", capability: str = "") -> dict:
+        """The one door every connector call goes through, semantic or raw.
+
+        `capability` is the name the semantic tools came in under. It is
+        recorded on the audit event and nothing else: it never reaches
+        `hub.call`, and it never changes a verdict. The guardrails classify the
+        downstream tool, not the intent that produced it, so a call that
+        arrives here through `get_balance` is judged identically to the same
+        call typed by hand through `call_connector`.
+        """
+        origin = {"capability": capability} if capability else {}
         from nakagai_edge.hub import ConnectorError, GuardrailDenied
+        if _gate() is not None:
+            audit.record("denial", connector_id, tool,
+                         {"reason": "policy stale", **origin})
+            return dict(STALE_POLICY)
         try:
-            out = await hub.call(connector_id, tool, args)
+            out = await hub.call(connector_id, tool, args, signal_id=signal_id)
             kind = "call" if not out.get("approval_required") else "intent"
-            audit.record(kind, connector_id, tool, {"is_write": out.get("is_write")})
-            return json.dumps(out, default=str)
+            audit.record(kind, connector_id, tool,
+                         {"is_write": out.get("is_write"), **origin})
+            return out
         except GuardrailDenied as e:
-            audit.record("denial", connector_id, tool, {"reason": str(e)})
-            return json.dumps({"is_error": True, "error": str(e)})
+            audit.record("denial", connector_id, tool, {"reason": str(e), **origin})
+            return {"is_error": True, "error": str(e)}
         except (ConnectorError, ValueError, EdgeClientError, httpx.HTTPError) as e:
-            audit.record("error", connector_id, tool, {"error": str(e)})
-            return json.dumps({"is_error": True, "error": str(e)})
+            audit.record("error", connector_id, tool, {"error": str(e), **origin})
+            return {"is_error": True, "error": str(e)}
+
+    def _pick_connector(capability: str, connector_id: str) -> str:
+        """The connector to serve this capability, or raise.
+
+        Ambiguity is an error naming the candidates. Picking one would make
+        which broker received an order depend on registry ordering, which is
+        not a decision an agent can review or an owner can predict.
+        """
+        if connector_id:
+            return connector_id
+        specs = hub.load_specs()
+        candidates = sorted(s.id for s in specs.values()
+                            if s.enabled and s.role == "broker"
+                            and capability in s.capabilities)
+        if len(candidates) == 1:
+            return candidates[0]
+        if not candidates:
+            raise CapabilityError(
+                f"no enabled broker declares {capability!r}; name one with "
+                f"connector_id, or add the capability to its registry entry")
+        raise CapabilityError(
+            f"{len(candidates)} brokers declare {capability!r} "
+            f"({', '.join(candidates)}); name one with connector_id")
+
+    async def _infer_account(capability: str, spec) -> str:
+        """The account a call acts on when the agent named none, or "".
+
+        This FILLS an argument. It never authorizes one: whatever it returns
+        goes into the args `check_accounts` evaluates, exactly as if the agent
+        had typed it, and "" leaves the call account-less so the guardrails
+        refuse it on their own terms rather than on this function's.
+
+        Three rules, and the third never runs while the first two apply:
+
+        * A WRITE infers only from `guardrails.accounts.allow`, and only when
+          that tier holds exactly one account. The `read` tier is deliberately
+          not consulted: those accounts may be viewed, never acted on.
+        * A READ infers from `allow` and `read` together, again only when the
+          two hold exactly one account between them.
+        * With NO tiers configured at all, the owner has stated no preference,
+          so a broker holding exactly one account has answered the question
+          itself and that account is used.
+
+        The broker's own list is never consulted while tiers exist, in either
+        direction. Tiers are the owner's statement of authority and a broker's
+        list is not, so falling back to it would let the account the owner
+        walled off be the one an order lands on: the default-account hole
+        `check_accounts` was written to close.
+
+        No recursion risk in the third rule: `list_accounts` takes no `account`
+        argument, so it never reaches this function.
+        """
+        accounts = spec.guardrails.accounts
+        if accounts.allow or accounts.read:
+            tier = (list(accounts.allow) if CAPABILITIES[capability].is_write
+                    else [*accounts.allow, *accounts.read])
+            return tier[0] if len(tier) == 1 else ""
+        listed = await _capability_call("list_accounts", spec.id)
+        rows = listed.get("data") or []
+        return str(rows[0].get("account") or "") if len(rows) == 1 else ""
+
+    async def _capability_call(capability: str, connector_id: str = "",
+                               args: dict | None = None, *,
+                               signal_id: str = "") -> dict:
+        """One semantic call: pick the connector, resolve, dial, read back.
+
+        The result carries its own provenance (`capability`, `connector`,
+        `tool`), so both the agent and the audit trail record what actually
+        ran rather than what was asked for in the abstract.
+
+        A READ comes back with `data` replaced by the canonical fields
+        `extract` read out of the broker's payload. A WRITE comes back
+        VERBATIM: `place_order` and `cancel_order` declare no readable fields,
+        so `extract` would return `{}` for them by construction and take the
+        approval envelope (`approval_id` above all) with it.
+        """
+        from nakagai_edge.hub import ConnectorError
+        if _gate() is not None:
+            return dict(STALE_POLICY)
+        try:
+            cid = _pick_connector(capability, connector_id)
+            spec = hub.spec(cid)
+            cap = spec.capability(capability)
+            wanted = {k: v for k, v in (args or {}).items() if v not in (None, "")}
+            if "account" in CAPABILITIES[capability].args and not wanted.get("account"):
+                if inferred := await _infer_account(capability, spec):
+                    wanted["account"] = inferred
+            tool, broker_args = resolve(capability, cap, wanted)
+        except (CapabilityError, ConnectorError, ValueError) as e:
+            return {"is_error": True, "error": str(e), "capability": capability}
+        out = await _guarded(cid, tool, broker_args, signal_id=signal_id,
+                             capability=capability)
+        # Provenance first, the call's own answer second: an envelope always
+        # wins its own fields, and provenance only fills what an error payload
+        # left blank.
+        found = {"capability": capability, "connector": cid, "tool": tool, **out}
+        if out.get("is_error") or CAPABILITIES[capability].is_write:
+            return found
+        return {**found, "data": extract(capability, cap, out.get("data"))}
 
     @mcp.tool()
     async def call_connector(connector_id: str, tool: str, args_json: str = "{}") -> str:
-        """Call one tool on a configured connector (broker or platform). Writes
-        enqueue for human approval on the platform; poll get_approval for the
-        outcome."""
+        """Call one tool on a configured connector (broker or platform), in
+        that connector's OWN vocabulary. The seven capability tools
+        (list_accounts, get_balance, list_positions, get_quote, list_orders,
+        place_order, cancel_order) do the same work in one shared vocabulary
+        and are what you want unless a broker offers something they do not
+        cover. Writes enqueue for human approval on the platform; poll
+        get_approval for the outcome."""
         try:
             args = json.loads(args_json or "{}")
         except json.JSONDecodeError as e:
             return json.dumps({"is_error": True, "error": f"bad args_json: {e}"})
-        return await _guarded(connector_id, tool, args)
+        return json.dumps(await _guarded(connector_id, tool, args), default=str)
 
     @mcp.tool()
     async def list_connector_tools(connector_id: str) -> str:
@@ -104,7 +223,10 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
 
     @mcp.tool()
     async def list_connectors() -> str:
-        """Every configured connector and whether it is enabled."""
+        """Every configured connector, whether it is enabled, and what it can be
+        asked to do: `capabilities` lists which of the seven capability tools
+        that connector serves. Read it before calling one, rather than
+        discovering the gap as a refusal."""
         if (stale := _gate()) is not None:
             return stale
         return json.dumps(hub.status(), default=str)
@@ -119,13 +241,191 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
 
     @mcp.tool()
     async def get_approval(approval_id: str) -> str:
-        """Status of a write intent you enqueued via call_connector."""
+        """Status of a write intent you enqueued: place_order, cancel_order, or
+        a write through call_connector. This is how you learn whether the owner
+        approved it and what the broker then answered."""
         if (stale := _gate()) is not None:
             return stale
         rec = hub.approvals.get(approval_id)
         if rec is None:
             return json.dumps({"is_error": True, "error": f"no approval {approval_id!r}"})
         return json.dumps(rec.public(), default=str)
+
+    # ---- the seven capability tools ------------------------------------
+    #
+    # One vocabulary, learned once, spoken to any broker. Each tool resolves
+    # to (connector, tool, args) through that connector's own map and then
+    # goes down `_guarded` like everything else: same guardrail
+    # classification, same approval enqueue, same audit record. These decide
+    # WHAT to call and never WHETHER it is allowed.
+
+    @mcp.tool()
+    async def list_accounts(connector_id: str = "") -> str:
+        """Every account a broker holds, in canonical form.
+
+        Returns `data`: a list of `{"account", "nickname", "type"}`, where
+        `account` is the identifier every other tool here takes as `account`,
+        and nickname/type appear only when that broker publishes them. Call
+        this first when you do not know which account to name.
+
+        `connector_id` may be omitted when exactly one enabled broker declares
+        this capability; with two, you get an error naming both rather than a
+        guess about which brokerage you meant.
+
+        The list is the BROKER's, not the owner's policy: an account can be
+        listed here and still be refused for a write, or refused entirely. See
+        `list_connectors` for what each connector allows.
+        """
+        return json.dumps(await _capability_call("list_accounts", connector_id),
+                          default=str)
+
+    @mcp.tool()
+    async def get_balance(connector_id: str = "", account: str = "") -> str:
+        """What one account is worth right now.
+
+        Returns `data`: `{"equity", "cash", "buying_power", "currency"}`, with
+        anything the broker does not publish simply absent. The figures are
+        relayed exactly as the broker worded them, as display strings; the edge
+        does no arithmetic on them and neither should you assume a unit it did
+        not state.
+
+        `connector_id` may be omitted when exactly one enabled broker declares
+        this capability. `account` may be omitted when it is unambiguous: one
+        account across the owner's allow and read tiers, or, when no tiers are
+        configured at all, one account on the broker. Otherwise name it, using
+        `list_accounts`.
+
+        This is a live broker read, not a cached figure. For the owner's own
+        portfolio document (totals and positions across every broker, pushed to
+        their Portfolio page) use `refresh_portfolio` instead.
+        """
+        return json.dumps(
+            await _capability_call("get_balance", connector_id,
+                                   {"account": account}), default=str)
+
+    @mcp.tool()
+    async def list_positions(connector_id: str = "", account: str = "") -> str:
+        """What one account is holding.
+
+        Returns `data`: a list of `{"symbol", "quantity", "avg_price",
+        "market_value"}`, symbols upper-cased and quantities as numbers. A row
+        the broker answered but this connector's map cannot read is DROPPED
+        rather than reported as zero, so an empty list means "the broker says
+        nothing is held", never "something went wrong".
+
+        `connector_id` and `account` follow the same rules as `get_balance`.
+
+        This says what the BROKER holds. It does not say what is protected: a
+        position with a live stop and one with nothing watching it look
+        identical here. `get_open_risk` is the tool that tells those apart.
+        """
+        return json.dumps(
+            await _capability_call("list_positions", connector_id,
+                                   {"account": account}), default=str)
+
+    @mcp.tool()
+    async def get_quote(symbols: list[str], connector_id: str = "") -> str:
+        """Current prices for one or more symbols, from a broker's own feed.
+
+        Returns `data`: a list of `{"symbol", "price", "bid", "ask"}`, one row
+        per symbol the broker answered for. A symbol it did not answer for is
+        absent rather than present with a null price, so check for what you
+        asked for rather than assuming the list lines up with your input.
+
+        `connector_id` may be omitted when exactly one enabled broker declares
+        this capability. Quotes are per broker: two connectors may disagree,
+        and neither is authoritative here.
+        """
+        return json.dumps(
+            await _capability_call("get_quote", connector_id,
+                                   {"symbols": list(symbols or [])}), default=str)
+
+    @mcp.tool()
+    async def list_orders(connector_id: str = "", account: str = "",
+                          status: str = "") -> str:
+        """Orders on one account, open or otherwise.
+
+        Returns `data`: a list of `{"order_id", "symbol", "side", "quantity",
+        "status"}`. `side` is canonical (`buy` or `sell`) however the broker
+        spells it; `status` is the broker's own word, relayed verbatim, because
+        brokers do not agree on what the states mean and inventing a shared
+        set here would flatten a distinction you may need.
+
+        `order_id` is what `cancel_order` takes.
+
+        `connector_id` and `account` follow the same rules as `get_balance`.
+        `status` is an optional filter passed through to the broker in its own
+        spelling; omit it to accept whatever that broker returns by default,
+        which is usually working orders only.
+        """
+        return json.dumps(
+            await _capability_call("list_orders", connector_id,
+                                   {"account": account, "status": status}),
+            default=str)
+
+    @mcp.tool()
+    async def place_order(symbol: str, side: str, quantity: float,
+                          price: float | None = None, stop: float | None = None,
+                          connector_id: str = "", account: str = "",
+                          signal_id: str = "") -> str:
+        """Ask to place an order. THIS DOES NOT PLACE IT.
+
+        The order is translated into this broker's own words and enqueued for
+        the owner to approve. What comes back is the intent, not a fill:
+        `approval_required: true`, an `approval_id`, a `status`, and an
+        `expires_at` after which the request lapses untouched. Poll
+        `get_approval(approval_id)` for the outcome. Nothing reaches the broker
+        until a human (or, inside the owner's autopilot envelope, the mandate)
+        says yes, and the edge then executes the arguments captured HERE, so
+        there is no second chance to change them.
+
+        `side` is canonical: pass `buy` or `sell`, never the broker's own
+        spelling. `quantity` is in shares. `price` makes it a limit order and
+        `stop` sets the stop, both in the account's currency; only the fields
+        you name are sent, and the edge never adds an order type of its own, so
+        a broker that needs one will say so in its own error.
+
+        `connector_id` may be omitted when exactly one enabled broker declares
+        this capability. `account` may be omitted only when the owner allows
+        exactly ONE account for writes; anything less certain is refused by the
+        guardrails naming the accounts you may choose between. That refusal is
+        deliberate: an order that names no account lands on the broker's
+        default, which may be an account the owner allows you to read and never
+        to act on.
+
+        `signal_id` is the id of a Nakagai signal this order claims to execute.
+        Pass it whenever one exists. The platform resolves it, freezes the
+        evidence onto the approval so the owner sees what you are acting on,
+        and checks it against the autopilot envelope: an order citing nothing
+        never auto-executes, it waits for a human tap.
+        """
+        return json.dumps(
+            await _capability_call("place_order", connector_id,
+                                   {"symbol": symbol, "side": side,
+                                    "quantity": quantity, "price": price,
+                                    "stop": stop, "account": account},
+                                   signal_id=signal_id), default=str)
+
+    @mcp.tool()
+    async def cancel_order(order_id: str, connector_id: str = "",
+                           account: str = "") -> str:
+        """Ask to cancel a working order. THIS DOES NOT CANCEL IT.
+
+        Like `place_order`, this is an intent: it comes back with
+        `approval_required: true` and an `approval_id` to poll on
+        `get_approval`, and the cancel reaches the broker only after the owner
+        approves it. An order can fill in that window, so treat a cancel as
+        requested rather than done until `list_orders` says otherwise.
+
+        `order_id` is the `order_id` from `list_orders` on the same connector;
+        ids are not portable between brokers. `connector_id` and `account`
+        follow the same rules as `place_order`, and a cancel is a write, so the
+        account (when the broker's map needs one) must be write-allowed.
+        """
+        return json.dumps(
+            await _capability_call("cancel_order", connector_id,
+                                   {"order_id": order_id, "account": account}),
+            default=str)
 
     @mcp.tool()
     async def agent_checkin(status: str, note: str = "",

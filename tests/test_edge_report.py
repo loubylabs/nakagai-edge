@@ -127,13 +127,19 @@ async def test_syncer_reports_hub_status_connectors_each_cycle(tmp_path, monkeyp
     # field and leave ConnectorReport.tool_count at its default of 0. The edge
     # sends server_info as an extra key (deliberately dropped by extra="ignore"),
     # so we allow it as an exception to the field-set check.
+    #
+    # `capabilities` is the second such exception: the edge reports what each
+    # connector can be asked to do in the shared vocabulary, and the platform
+    # drops it until ConnectorReport carries a field for it. Delete it from
+    # this set (not from to_dict) once the platform reads it.
+    extras = {"server_info", "capabilities"}
     connector_on_wire = seen[0]["connectors"][0]
     expected_keys = set(ConnectorReport.model_fields)
     wire_keys = set(connector_on_wire)
     assert expected_keys <= wire_keys, (
         f"missing required fields: {expected_keys - wire_keys}")
-    assert wire_keys <= expected_keys | {"server_info"}, (
-        f"unexpected fields on wire: {wire_keys - expected_keys - {'server_info'}}")
+    assert wire_keys <= expected_keys | extras, (
+        f"unexpected fields on wire: {wire_keys - expected_keys - extras}")
 
     # No credential can ride along: only the label-shaped fields hub.status()
     # produces are on the wire, never a token, header, or auth value.

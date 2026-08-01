@@ -51,9 +51,15 @@ def submit(acct: str, ticker: str, action: str, qty: float,
 
 @mcp.tool()
 def orders(acct: str, state: str = "") -> dict:
-    """Working orders."""
+    """Working orders.
+
+    The row's own status key is `stage`, deliberately NOT the `state` this tool
+    takes as an argument and NOT the `state` Robinhood puts it under. A field
+    both fixtures spelled the same way would let a hardcoded path pass on both
+    connectors, which is the one thing this fixture exists to catch.
+    """
     return {"working": [{"ref": "AL-ORD-1", "tkr": "aapl", "action": "BUY_TO_OPEN",
-                         "qty": "25", "state": "working"}]}
+                         "qty": "25", "stage": "working"}]}
 
 
 @mcp.tool()

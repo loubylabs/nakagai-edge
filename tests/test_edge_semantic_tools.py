@@ -1,0 +1,731 @@
+"""The seven semantic tools: one vocabulary an agent learns once, any broker.
+
+Each tool picks the connector, resolves the call through that connector's own
+map, and then goes down the SAME `_guarded` path `call_connector` uses. The
+capability layer decides WHAT to call; it never decides WHETHER it is allowed.
+
+Both halves are pinned below: the identical canonical shape out of two brokers
+that agree on nothing, and the fact that every refusal still comes from the
+guardrails rather than from this layer. The account-inference tests are the
+sharp end of the second half. Inference FILLS an argument so `check_accounts`
+can then evaluate it; a version that inferred a little more freely would be
+choosing an account the owner never authorized, which is exactly what
+`check_accounts` exists to stop.
+"""
+
+import contextlib
+import json
+import time
+
+import httpx
+import pytest
+
+pytest.importorskip("mcp")
+
+from nakagai_edge.config import load_specs
+from nakagai_edge.edge.audit import EdgeAudit
+from nakagai_edge.edge.brake import Brake
+from nakagai_edge.edge.client import PlatformClient
+from nakagai_edge.edge.remote import RemoteApprovalQueue
+from nakagai_edge.edge.runtime import create_edge_mcp
+from nakagai_edge.edge.state import EdgeState
+from nakagai_edge.edge.sync import apply_bundle
+from nakagai_edge.hub import ConnectorError, ConnectorHub
+from tests.fixtures.alien_registry import ALIEN_CONNECTOR, ROBINHOOD_CONNECTOR
+
+pytestmark = pytest.mark.anyio
+
+ALIEN, ROBINHOOD = "alien-broker", "robinhood-trading"
+ACCOUNTS = {ALIEN: "AL-1", ROBINHOOD: "463605220"}
+BOTH = [ALIEN, ROBINHOOD]
+
+
+@pytest.fixture
+def anyio_backend():
+    return "asyncio"
+
+
+# ---- the two brokers, and what they answer --------------------------------
+#
+# Every payload here is the broker's OWN shape, keyed by the broker's OWN tool
+# name. Nothing in these dicts is canonical, which is the point: a test that
+# passes against one connector and fails against the other has found something
+# upstream that is still hardcoded.
+
+PAYLOADS = {
+    # The alien broker wraps nothing and spells every field its own way.
+    "accounts_list": {"accounts": [{"acct": "AL-1", "label": "Alien Main",
+                                    "kind": "margin"}]},
+    "balances": {"net_liq": "104238.55", "settled_cash": "50.00",
+                 "power": "12038.10", "denom": "USD"},
+    "holdings": {"holdings": [{"ticker": "aapl", "qty": "25",
+                               "cost": "187.20"}]},
+    "ticker": {"ticks": [{"tkr": "aapl", "last": "190.00"}]},
+    "orders": {"working": [{"ref": "AL-ORD-1", "tkr": "aapl",
+                            "action": "BUY_TO_OPEN", "qty": "25",
+                            "stage": "working"}]},
+    "submit": {"order_ref": "AL-ORD-1", "state": "accepted"},
+    "scrub": {"ref": "AL-ORD-1", "state": "cancelled"},
+    # Robinhood nests its own {"data": ...} envelope, which each map roots at.
+    "get_accounts": {"data": {"accounts": [{"account_number": "463605220",
+                                            "nickname": "Main",
+                                            "type": "margin"}]}},
+    "get_portfolio": {"data": {"total_value": "104238.55", "cash": "50.00",
+                               "buying_power": {"buying_power": "12038.10"},
+                               "currency": "USD"}},
+    "get_equity_positions": {"data": {"positions": [
+        {"symbol": "AAPL", "quantity": "25", "average_buy_price": "187.20"}]}},
+    "get_quotes": {"data": {"quotes": [{"symbol": "AAPL",
+                                        "last_trade_price": "190.00"}]}},
+    "get_orders": {"data": {"orders": [{"id": "RH-ORD-9", "symbol": "AAPL",
+                                        "side": "buy", "quantity": "25",
+                                        "state": "confirmed"}]}},
+    "place_equity_order": {"id": "RH-ORD-9", "state": "confirmed"},
+    "cancel_order": {"id": "RH-ORD-9", "state": "cancelled"},
+}
+
+
+def _specs(*entries, over: dict | None = None):
+    """Registry specs, with per-connector overrides merged in.
+
+    `over` is {connector_id: {...}}, merged one level deep for `guardrails` so
+    a test can retier the accounts or drop a capability without restating the
+    whole map.
+    """
+    built = []
+    for entry in entries or (ALIEN_CONNECTOR, ROBINHOOD_CONNECTOR):
+        patch = (over or {}).get(entry["id"]) or {}
+        merged = {**entry, **patch}
+        if "guardrails" in patch:
+            merged["guardrails"] = {**entry["guardrails"], **patch["guardrails"]}
+        built.append(merged)
+    return load_specs({"connectors": built})
+
+
+def _tiered(allow, read, entry=ALIEN_CONNECTOR):
+    """One connector with its account tiers rewritten."""
+    accounts = {**entry["guardrails"]["accounts"],
+                "allow": list(allow), "read": list(read)}
+    return _specs(entry, over={entry["id"]: {"guardrails": {"accounts": accounts}}})
+
+
+def _without(entry, capability):
+    """The same connector, minus one capability from its map."""
+    caps = {k: v for k, v in entry["capabilities"].items() if k != capability}
+    return _specs(entry, over={entry["id"]: {"capabilities": caps}})
+
+
+class MapHub:
+    """A hub that answers through the REAL connector maps, keyed by tool name.
+
+    Task 6's FakeHub shape: every call lands on `self.calls`, so a test can pin
+    the tool name AND the argument keys the map produced. A broker handed the
+    right tool under the wrong key answers about nothing at all.
+    """
+
+    def __init__(self, specs=None, fail=None, payloads=None):
+        self.calls: list[tuple] = []
+        self.kwargs: list[dict] = []
+        self.specs = _specs() if specs is None else specs
+        self.fail = fail
+        self.payloads = {**PAYLOADS, **(payloads or {})}
+        self.approvals = None
+
+    def load_specs(self):
+        return self.specs
+
+    def spec(self, connector_id):
+        if connector_id not in self.specs:
+            raise ConnectorError(f"no connector {connector_id!r}")
+        return self.specs[connector_id]
+
+    async def call(self, connector_id, tool, args, **kw):
+        self.calls.append((connector_id, tool, dict(args)))
+        self.kwargs.append(kw)
+        if self.fail is not None:
+            raise self.fail
+        return {"connector": connector_id, "tool": tool, "is_write": False,
+                "is_error": False, "data": self.payloads[tool]}
+
+    @property
+    def tools(self) -> list[str]:
+        return [tool for _, tool, _ in self.calls]
+
+    @property
+    def args(self) -> list[dict]:
+        return [args for _, _, args in self.calls]
+
+
+class _Reporter:
+    async def snapshot_and_push(self):
+        return {"connectors": []}
+
+
+def _state(tmp_path, *entries):
+    state = EdgeState(tmp_path)
+    state.save_agent("https://api.test", "ag1", "nk_agent_t")
+    apply_bundle(state, {"bundle_version": "v1",
+                         "connectors": {"connectors": list(entries)},
+                         "signing_public_key": "k"}, "v1")
+    return state
+
+
+def _dead_platform():
+    return PlatformClient("https://api.test", "t",
+                          transport=httpx.MockTransport(
+                              lambda r: httpx.Response(500)))
+
+
+def _server(state, hub, client=None):
+    client = client or _dead_platform()
+    audit = EdgeAudit(state)
+    return create_edge_mcp(state, hub, client, audit, _Reporter(),
+                           Brake(state, hub, client, audit))
+
+
+async def _call(mcp, tool, **args):
+    result = await mcp.call_tool(tool, args)
+    text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+    return json.loads(text)
+
+
+# ---- the reads: the same canonical fields out of two alien shapes ---------
+
+
+@pytest.mark.parametrize("connector", BOTH)
+async def test_list_accounts_reads_both_brokers_into_one_shape(tmp_path, connector):
+    hub = MapHub()
+    doc = await _call(_server(_state(tmp_path), hub), "list_accounts",
+                      connector_id=connector)
+
+    assert doc["data"] == [{"account": ACCOUNTS[connector],
+                            "nickname": {ALIEN: "Alien Main",
+                                         ROBINHOOD: "Main"}[connector],
+                            "type": "margin"}]
+    assert doc["capability"] == "list_accounts"
+    assert doc["connector"] == connector
+    assert doc["tool"] == {ALIEN: "accounts_list",
+                           ROBINHOOD: "get_accounts"}[connector]
+
+
+@pytest.mark.parametrize("connector", BOTH)
+async def test_get_balance_reads_both_brokers_into_one_shape(tmp_path, connector):
+    """The worked example: `104238.55` sits under `net_liq` on one broker and
+    under `data.total_value` on the other, and the agent sees `equity` either
+    way. Verbatim, never re-typed: the edge relays this figure and does no
+    arithmetic on it."""
+    hub = MapHub()
+    doc = await _call(_server(_state(tmp_path), hub), "get_balance",
+                      connector_id=connector, account=ACCOUNTS[connector])
+
+    assert doc["data"] == {"equity": "104238.55", "cash": "50.00",
+                           "buying_power": "12038.10", "currency": "USD"}
+    assert (doc["capability"], doc["connector"]) == ("get_balance", connector)
+    assert doc["tool"] == {ALIEN: "balances", ROBINHOOD: "get_portfolio"}[connector]
+    # The tool name AND the account key both came out of the map.
+    assert hub.calls == [(connector, doc["tool"],
+                          {{ALIEN: "acct", ROBINHOOD: "account_number"}[connector]:
+                           ACCOUNTS[connector]})]
+
+
+@pytest.mark.parametrize("connector", BOTH)
+async def test_list_positions_reads_both_brokers_into_one_shape(tmp_path, connector):
+    hub = MapHub()
+    doc = await _call(_server(_state(tmp_path), hub), "list_positions",
+                      connector_id=connector, account=ACCOUNTS[connector])
+
+    assert doc["data"] == [{"symbol": "AAPL", "quantity": 25.0,
+                            "avg_price": 187.20}]
+    assert doc["tool"] == {ALIEN: "holdings",
+                           ROBINHOOD: "get_equity_positions"}[connector]
+
+
+@pytest.mark.parametrize("connector", BOTH)
+async def test_get_quote_reads_both_brokers_into_one_shape(tmp_path, connector):
+    hub = MapHub()
+    doc = await _call(_server(_state(tmp_path), hub), "get_quote",
+                      connector_id=connector, symbols=["AAPL"])
+
+    assert doc["data"] == [{"symbol": "AAPL", "price": 190.0}]
+    assert hub.args == [{{ALIEN: "tickers", ROBINHOOD: "symbols"}[connector]:
+                         ["AAPL"]}]
+
+
+@pytest.mark.parametrize("connector", BOTH)
+async def test_list_orders_reads_both_brokers_into_one_shape(tmp_path, connector):
+    """The status axis tests divergence only because the fixtures disagree
+    about it: `stage` on the alien broker, `state` on Robinhood, and neither is
+    the argument key the status filter goes under."""
+    hub = MapHub()
+    doc = await _call(_server(_state(tmp_path), hub), "list_orders",
+                      connector_id=connector, account=ACCOUNTS[connector],
+                      status="open")
+
+    assert doc["data"] == [{"order_id": {ALIEN: "AL-ORD-1",
+                                         ROBINHOOD: "RH-ORD-9"}[connector],
+                            "symbol": "AAPL", "side": "buy", "quantity": 25.0,
+                            "status": {ALIEN: "working",
+                                       ROBINHOOD: "confirmed"}[connector]}]
+    assert hub.args == [{ALIEN: {"acct": "AL-1", "state": "open"},
+                         ROBINHOOD: {"account_number": "463605220",
+                                     "status": "open"}}[connector]]
+
+
+async def test_a_side_is_canonical_no_matter_how_the_broker_spells_it(tmp_path):
+    """`BUY_TO_OPEN` and `buy` are the same fact. An agent that had to know
+    which broker said which could not be written once."""
+    hub = MapHub()
+    mcp = _server(_state(tmp_path), hub)
+    alien = await _call(mcp, "list_orders", connector_id=ALIEN)
+    rh = await _call(mcp, "list_orders", connector_id=ROBINHOOD)
+
+    assert alien["data"][0]["side"] == rh["data"][0]["side"] == "buy"
+
+
+# ---- connector inference --------------------------------------------------
+
+
+async def test_two_brokers_declaring_a_capability_is_an_error_naming_both(tmp_path):
+    """Never a pick. Which broker received an order must not depend on
+    registry ordering."""
+    hub = MapHub()
+    doc = await _call(_server(_state(tmp_path), hub), "get_balance")
+
+    assert doc["is_error"] is True
+    assert ALIEN in doc["error"] and ROBINHOOD in doc["error"]
+    assert "connector_id" in doc["error"]
+    assert hub.calls == [], "an ambiguous connector must never be dialed"
+
+
+async def test_one_broker_declaring_a_capability_is_inferred(tmp_path):
+    hub = MapHub(specs=_specs(ALIEN_CONNECTOR))
+    doc = await _call(_server(_state(tmp_path), hub), "get_balance")
+
+    assert doc["connector"] == ALIEN
+    assert doc["data"]["equity"] == "104238.55"
+
+
+@pytest.mark.parametrize("disqualify", [{"enabled": False}, {"role": "data"}])
+async def test_only_an_enabled_broker_is_a_candidate(tmp_path, disqualify):
+    """A disabled connector, and one that is not a broker at all, are both out
+    of the running: inference must not resolve to something the owner turned
+    off, or to a data feed that happens to declare a map."""
+    hub = MapHub(specs=_specs(ALIEN_CONNECTOR, ROBINHOOD_CONNECTOR,
+                              over={ROBINHOOD: disqualify}))
+    doc = await _call(_server(_state(tmp_path), hub), "get_balance")
+
+    assert doc["connector"] == ALIEN
+
+
+async def test_no_broker_declaring_a_capability_is_an_error_naming_it(tmp_path):
+    hub = MapHub(specs=_without(ALIEN_CONNECTOR, "get_quote"))
+    doc = await _call(_server(_state(tmp_path), hub), "get_quote",
+                      symbols=["AAPL"])
+
+    assert doc["is_error"] is True and "get_quote" in doc["error"]
+    assert hub.calls == []
+
+
+async def test_an_unknown_connector_id_is_an_error_not_a_fallback(tmp_path):
+    hub = MapHub()
+    doc = await _call(_server(_state(tmp_path), hub), "get_balance",
+                      connector_id="nope")
+
+    assert doc["is_error"] is True and "nope" in doc["error"]
+    assert hub.calls == []
+
+
+# ---- an unmapped capability ----------------------------------------------
+
+
+async def test_a_capability_the_connector_never_declared_names_both(tmp_path):
+    """`ConnectorSpec.capability()` refuses rather than guessing a tool name,
+    and the agent is told which connector is missing which entry."""
+    hub = MapHub(specs=_without(ALIEN_CONNECTOR, "list_positions"))
+    doc = await _call(_server(_state(tmp_path), hub), "list_positions",
+                      connector_id=ALIEN, account="AL-1")
+
+    assert doc["is_error"] is True
+    assert ALIEN in doc["error"] and "list_positions" in doc["error"]
+    assert hub.calls == [], "an unmapped capability must not be dialed on a guess"
+
+
+# ---- account inference ----------------------------------------------------
+#
+# Inference FILLS the argument; `check_accounts` then evaluates it exactly as
+# it evaluates one the agent named. These tests pin what reaches the broker,
+# and the guardrail tests further down pin that an argument inference declined
+# to fill is refused by the guardrails, not by this layer.
+
+
+async def test_a_write_infers_the_single_allowed_account(tmp_path):
+    hub = MapHub(specs=_tiered(["AL-1"], []))
+    await _call(_server(_state(tmp_path), hub), "place_order",
+                symbol="AAPL", side="buy", quantity=1)
+
+    assert hub.args == [{"ticker": "AAPL", "action": "BUY_TO_OPEN", "qty": 1.0,
+                         "acct": "AL-1"}]
+
+
+async def test_a_write_does_not_infer_when_two_accounts_are_allowed(tmp_path):
+    """Two allowed accounts is a choice the agent has to make out loud. The
+    call still goes down, carrying no account, and `check_accounts` refuses it
+    there."""
+    hub = MapHub(specs=_tiered(["AL-1", "AL-2"], []))
+    await _call(_server(_state(tmp_path), hub), "place_order",
+                symbol="AAPL", side="buy", quantity=1)
+
+    assert "acct" not in hub.args[0]
+
+
+async def test_a_write_never_infers_the_read_tiers_account(tmp_path):
+    """`read` accounts may be viewed, never acted on. A write infers from
+    `allow` alone, so the account it fills is one that could have been named."""
+    hub = MapHub(specs=_tiered(["AL-2"], ["AL-1"]))
+    await _call(_server(_state(tmp_path), hub), "place_order",
+                symbol="AAPL", side="buy", quantity=1)
+
+    assert hub.args[0]["acct"] == "AL-2"
+
+
+async def test_a_read_infers_across_the_allow_and_read_tiers(tmp_path):
+    """One account between the two tiers is unambiguous for a read, even when
+    it is the tier a write may never touch."""
+    hub = MapHub(specs=_tiered([], ["AL-1"]))
+    await _call(_server(_state(tmp_path), hub), "get_balance")
+
+    assert hub.args == [{"acct": "AL-1"}]
+
+
+async def test_a_read_does_not_infer_when_the_tiers_hold_two_accounts(tmp_path):
+    hub = MapHub(specs=_tiered(["AL-2"], ["AL-1"]))
+    await _call(_server(_state(tmp_path), hub), "get_balance")
+
+    assert hub.args == [{}]
+
+
+async def test_with_no_tiers_the_account_comes_from_the_brokers_own_list(tmp_path):
+    """No tiers configured means the owner stated no preference, so a broker
+    holding exactly one account has answered the question itself."""
+    hub = MapHub(specs=_tiered([], []))
+    doc = await _call(_server(_state(tmp_path), hub), "get_balance")
+
+    assert hub.tools == ["accounts_list", "balances"]
+    assert hub.args[1] == {"acct": "AL-1"}
+    assert doc["data"]["equity"] == "104238.55"
+
+
+async def test_with_no_tiers_and_two_listed_accounts_nothing_is_inferred(tmp_path):
+    hub = MapHub(specs=_tiered([], []),
+                 payloads={"accounts_list": {"accounts": [{"acct": "AL-1"},
+                                                          {"acct": "AL-2"}]}})
+    await _call(_server(_state(tmp_path), hub), "get_balance")
+
+    assert hub.args[1] == {}, "an ambiguous list is not an answer"
+
+
+async def test_the_brokers_account_list_is_never_consulted_when_tiers_exist(tmp_path):
+    """The one rule that would reintroduce the default-account hole.
+
+    Tiers are the OWNER's statement of authority; the broker's list is not.
+    Here the broker holds exactly one account and it is the read-tier one, so a
+    layer that fell back to the broker's list would fill in the very account
+    the owner walled off from writes. It must not even ask.
+    """
+    hub = MapHub(specs=_tiered(["AL-2", "AL-3"], ["AL-1"]))
+    await _call(_server(_state(tmp_path), hub), "place_order",
+                symbol="AAPL", side="buy", quantity=1)
+
+    assert hub.tools == ["submit"], "the broker's account list was consulted"
+    assert "acct" not in hub.args[0]
+
+
+async def test_an_account_the_agent_named_is_never_overridden(tmp_path):
+    """Inference only ever FILLS. What the agent said reaches `check_accounts`
+    unchanged, including an account it is about to be refused for."""
+    hub = MapHub(specs=_tiered(["AL-1"], []))
+    await _call(_server(_state(tmp_path), hub), "get_balance", account="AL-9")
+
+    assert hub.args == [{"acct": "AL-9"}]
+
+
+async def test_a_capability_with_no_account_argument_infers_nothing(tmp_path):
+    """`get_quote` takes symbols and nothing else, so there is no account to
+    fill and the broker's account list is never dialed for one."""
+    hub = MapHub(specs=_tiered([], []))
+    await _call(_server(_state(tmp_path), hub), "get_quote",
+                connector_id=ALIEN, symbols=["AAPL"])
+
+    assert hub.tools == ["ticker"]
+
+
+# ---- the writes go through the one authorization path ---------------------
+
+
+def _platform(posted):
+    def handler(req):
+        if req.url.path == "/api/agent/approvals" and req.method == "POST":
+            posted.append(json.loads(req.content))
+            return httpx.Response(200, json={"ok": True, "approval_id": "ap_live",
+                                             "status": "pending",
+                                             "expires_at": time.time() + 900})
+        return httpx.Response(404, json={"detail": "?"})
+
+    return PlatformClient("https://api.test", "nk_agent_t",
+                          transport=httpx.MockTransport(handler))
+
+
+def _live_hub(state, client):
+    """A REAL ConnectorHub over the real alien broker, in memory.
+
+    Nothing is stubbed between the tool and the guardrails: this is the path
+    that classifies the write, enqueues the approval, and hands back the
+    envelope the agent has to poll on.
+    """
+    from mcp.shared.memory import create_connected_server_and_client_session
+
+    from tests.fixtures.alien_broker_mcp import mcp as alien_server
+
+    async def connect(spec):
+        @contextlib.asynccontextmanager
+        async def _open():
+            async with create_connected_server_and_client_session(
+                    alien_server._mcp_server) as session:
+                yield session
+
+        return _open()
+
+    queue = RemoteApprovalQueue(client, state, "ag1")
+    return ConnectorHub(state.root, connect=connect, approvals=queue)
+
+
+async def test_place_order_returns_the_approval_envelope_intact(tmp_path):
+    """The whole envelope, verbatim. Running a write through `extract` would
+    return `{}` (place_order maps no readable fields by construction) and throw
+    away the approval id the agent must poll."""
+    posted = []
+    state, client = _state(tmp_path, ALIEN_CONNECTOR), _platform(posted)
+    hub = _live_hub(state, client)
+    try:
+        doc = await _call(_server(state, hub, client), "place_order",
+                          symbol="AAPL", side="buy", quantity=1, price=190.0,
+                          account="AL-1")
+    finally:
+        await hub.aclose()
+
+    assert doc["approval_required"] is True
+    assert doc["approval_id"] == "ap_live"
+    assert doc["status"] == "pending"
+    assert doc["expires_at"] > time.time()
+    assert doc["is_write"] is True
+    assert "get_approval" in doc["message"]
+    assert (doc["capability"], doc["connector"], doc["tool"]) == (
+        "place_order", ALIEN, "submit")
+    # Translated on the way down: the broker's own words are what the human
+    # sees on the approval screen and what the edge later executes.
+    assert posted[0]["args"] == {"acct": "AL-1", "ticker": "AAPL",
+                                 "action": "BUY_TO_OPEN", "qty": 1.0,
+                                 "limit": 190.0}
+
+
+async def test_place_order_forwards_signal_id_to_the_platform(tmp_path):
+    """autopilot's envelope checks the cited signal: an order citing nothing
+    never auto-executes. Dropping it here would disable that check silently,
+    from the platform's side, with everything still looking normal."""
+    posted = []
+    state, client = _state(tmp_path, ALIEN_CONNECTOR), _platform(posted)
+    hub = _live_hub(state, client)
+    try:
+        await _call(_server(state, hub, client), "place_order",
+                    symbol="AAPL", side="buy", quantity=1, account="AL-1",
+                    signal_id="sig-42")
+    finally:
+        await hub.aclose()
+
+    assert posted[0]["signal_id"] == "sig-42"
+
+
+async def test_cancel_order_returns_the_approval_envelope_intact(tmp_path):
+    posted = []
+    state, client = _state(tmp_path, ALIEN_CONNECTOR), _platform(posted)
+    hub = _live_hub(state, client)
+    try:
+        doc = await _call(_server(state, hub, client), "cancel_order",
+                          order_id="AL-ORD-1", account="AL-1")
+    finally:
+        await hub.aclose()
+
+    assert doc["approval_required"] is True and doc["approval_id"] == "ap_live"
+    assert doc["tool"] == "scrub"
+    assert posted[0]["args"] == {"acct": "AL-1", "ref": "AL-ORD-1"}
+
+
+async def test_an_executed_write_returns_the_brokers_own_answer(tmp_path):
+    """A write that needs no approval still comes back verbatim: the broker's
+    order reference is what the agent has to hold on to, and `extract` would
+    hand back `{}` in its place."""
+    hub = MapHub()
+    doc = await _call(_server(_state(tmp_path), hub), "place_order",
+                      connector_id=ALIEN, symbol="AAPL", side="buy",
+                      quantity=1, account="AL-1")
+
+    assert doc["data"] == {"order_ref": "AL-ORD-1", "state": "accepted"}
+    assert doc["capability"] == "place_order"
+
+
+async def test_a_side_the_connector_cannot_spell_is_refused(tmp_path):
+    """The vocabulary is closed at the edge of this layer too. `resolve`
+    refuses a side it cannot translate rather than passing the agent's own word
+    down, because a broker that read `short` as something else would open the
+    opposite position."""
+    hub = MapHub(specs=_specs(ALIEN_CONNECTOR))
+    doc = await _call(_server(_state(tmp_path), hub), "place_order",
+                      symbol="AAPL", side="short", quantity=1, account="AL-1")
+
+    assert doc["is_error"] is True and "side" in doc["error"]
+    assert hub.calls == []
+
+
+async def test_an_uninferable_write_is_refused_by_the_guardrails(tmp_path):
+    """The proof that this layer holds no authority of its own.
+
+    Two allowed accounts, so nothing is inferred and the call reaches
+    `check_accounts` naming no account. What comes back is `check_accounts`'
+    own sentence, through the same door `call_connector` uses. A capability
+    layer that refused this itself would be a second authorization path, and
+    the two would drift.
+    """
+    entry = {**ALIEN_CONNECTOR,
+             "guardrails": {**ALIEN_CONNECTOR["guardrails"],
+                            "accounts": {**ALIEN_CONNECTOR["guardrails"]["accounts"],
+                                         "allow": ["AL-1", "AL-2"]}}}
+    state, client = _state(tmp_path, entry), _platform([])
+    hub = _live_hub(state, client)
+    try:
+        doc = await _call(_server(state, hub, client), "place_order",
+                          symbol="AAPL", side="buy", quantity=1)
+    finally:
+        await hub.aclose()
+
+    assert doc["is_error"] is True
+    assert "names no account" in doc["error"]
+    assert "AL-1, AL-2" in doc["error"]
+
+
+async def test_a_write_to_a_read_only_connector_is_refused_by_the_guardrails(
+        tmp_path):
+    """`allow_writes: false` is the owner's word, and the capability layer
+    cannot spend it. Same denial, same sentence, through the semantic tool."""
+    entry = {**ALIEN_CONNECTOR,
+             "guardrails": {**ALIEN_CONNECTOR["guardrails"], "allow_writes": False}}
+    state, client = _state(tmp_path, entry), _platform([])
+    hub = _live_hub(state, client)
+    try:
+        doc = await _call(_server(state, hub, client), "place_order",
+                          symbol="AAPL", side="buy", quantity=1, account="AL-1")
+    finally:
+        await hub.aclose()
+
+    assert doc["is_error"] is True and "read-only" in doc["error"]
+
+
+# ---- the stale-policy gate ------------------------------------------------
+
+
+SEVEN = [
+    ("list_accounts", {}),
+    ("get_balance", {}),
+    ("list_positions", {}),
+    ("get_quote", {"symbols": ["AAPL"]}),
+    ("list_orders", {}),
+    ("place_order", {"symbol": "AAPL", "side": "buy", "quantity": 1}),
+    ("cancel_order", {"order_id": "AL-ORD-1"}),
+]
+
+
+@pytest.mark.parametrize("tool,args", SEVEN)
+async def test_every_semantic_tool_refuses_on_stale_policy(tmp_path, monkeypatch,
+                                                           tool, args):
+    """Fail closed exactly like `call_connector`: policy past its TTL refuses
+    every connector call, and the refusal lands before anything is dialed."""
+    hub = MapHub(specs=_specs(ALIEN_CONNECTOR))
+    mcp = _server(_state(tmp_path), hub)
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: real() + 1000)  # past the 900s TTL
+
+    doc = await _call(mcp, tool, **args)
+
+    assert doc["is_error"] is True and "policy stale" in doc["error"]
+    assert hub.calls == []
+
+
+async def test_stale_policy_is_the_answer_before_any_other_complaint(
+        tmp_path, monkeypatch):
+    """Staleness is the outermost rule, so it is what the agent hears.
+
+    Two brokers are configured here, which on a fresh edge would come back as
+    "name one with connector_id". While policy is stale that answer would be a
+    lie of emphasis: the agent would go and name a connector, and be refused
+    again for the real reason. `_guarded` refuses either way, so nothing is
+    dialed; this is about which sentence the agent is sent away with.
+    """
+    hub = MapHub()
+    mcp = _server(_state(tmp_path), hub)
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: real() + 1000)
+
+    doc = await _call(mcp, "get_balance")
+
+    assert "policy stale" in doc["error"]
+    assert "connector_id" not in doc["error"]
+    assert hub.calls == []
+
+
+async def test_the_seven_tools_are_all_registered(tmp_path):
+    mcp = _server(_state(tmp_path), MapHub())
+    names = {t.name for t in await mcp.list_tools()}
+
+    assert {name for name, _ in SEVEN} <= names
+
+
+# ---- a broker that will not answer ---------------------------------------
+
+
+async def test_a_broker_error_comes_back_as_an_error_with_its_provenance(tmp_path):
+    """The connector and tool that failed are named: an agent holding five
+    connectors needs to know which one went dark."""
+    hub = MapHub(fail=ConnectorError("connection reset mid-call"))
+    doc = await _call(_server(_state(tmp_path), hub), "get_balance",
+                      connector_id=ALIEN, account="AL-1")
+
+    assert doc["is_error"] is True and "connection reset" in doc["error"]
+    assert (doc["capability"], doc["connector"], doc["tool"]) == (
+        "get_balance", ALIEN, "balances")
+
+
+# ---- what an agent can see before it calls -------------------------------
+
+
+async def test_list_connectors_says_what_each_connector_can_do(tmp_path):
+    state = _state(tmp_path, ALIEN_CONNECTOR, ROBINHOOD_CONNECTOR)
+    doc = await _call(_server(state, ConnectorHub(state.root)), "list_connectors")
+
+    by_id = {c["id"]: c for c in doc["connectors"]}
+    assert by_id[ALIEN]["capabilities"] == sorted(ALIEN_CONNECTOR["capabilities"])
+    assert by_id[ROBINHOOD]["capabilities"] == sorted(
+        ROBINHOOD_CONNECTOR["capabilities"])
+
+
+async def test_get_connector_status_says_so_too_even_on_stale_policy(
+        tmp_path, monkeypatch):
+    """The one tool that works on stale policy, because an agent needs to see
+    WHY everything else is refusing. It must still say what exists."""
+    state = _state(tmp_path, ALIEN_CONNECTOR)
+    mcp = _server(state, ConnectorHub(state.root))
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: real() + 1000)
+
+    doc = await _call(mcp, "get_connector_status")
+
+    assert doc["policy_fresh"] is False
+    assert "get_balance" in doc["connectors"][0]["capabilities"]

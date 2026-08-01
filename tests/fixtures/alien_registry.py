@@ -53,7 +53,7 @@ ALIEN_CONNECTOR = {
             "args": {"account": "acct", "status": "state"},
             "items": ["working"],
             "fields": {"order_id": ["ref"], "symbol": ["tkr"], "side": ["action"],
-                       "quantity": ["qty"], "status": ["state"]},
+                       "quantity": ["qty"], "status": ["stage"]},
             "values": {"side": {"buy": ["BUY_TO_OPEN", "BUY_TO_COVER"],
                                 "sell": ["SELL_TO_CLOSE", "SELL_SHORT"]}}},
         "cancel_order": {

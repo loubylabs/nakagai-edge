@@ -75,6 +75,10 @@ class Connection:
             "server_info": self.server_info,
             "allow_writes": self.spec.guardrails.allow_writes,
             "auth_mode": self.spec.auth.mode,
+            # What this connector can be asked to DO, in the shared vocabulary.
+            # An agent reads this to know which broker serves `place_order`
+            # before it calls one, rather than discovering the gap as a refusal.
+            "capabilities": self.spec.capability_names,
         }
 
 

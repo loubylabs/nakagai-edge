@@ -49,9 +49,11 @@ def test_the_two_connectors_spell_a_buy_differently():
 
 
 def test_the_two_connectors_extract_the_same_orders_from_different_shapes():
+    # `stage` on one side, `state` on the other: the status axis only tests
+    # divergence if the two connectors disagree about where the status lives.
     alien_payload = {"working": [{"ref": "AL-ORD-1", "tkr": "aapl",
                                   "action": "BUY_TO_OPEN", "qty": "25",
-                                  "state": "working"}]}
+                                  "stage": "working"}]}
     rh_payload = {"data": {"orders": [{"id": "AL-ORD-1", "symbol": "AAPL",
                                        "side": "buy", "quantity": "25",
                                        "state": "working"}]}}
