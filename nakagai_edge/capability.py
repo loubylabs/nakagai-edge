@@ -14,6 +14,7 @@ This module must not import from config.py. config.py imports Capability and
 CAPABILITIES from here, and the dependency stays one-directional.
 """
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -135,7 +136,19 @@ def coerce(field: str, value: Any, cap: Capability) -> Any | None:
         return str(value).strip().upper() or None
     if kind is FLOAT:
         try:
-            return float(value)
+            parsed = float(value)
         except (TypeError, ValueError):
             return None
+        if not math.isfinite(parsed):
+            # float() accepts "nan", "inf", "-inf", "infinity" (and json.loads
+            # accepts bare NaN/Infinity as an extension), so a malformed
+            # broker payload can hand us a real non-finite float here, and it
+            # already passed the SCALARS check above. A NaN price or quantity
+            # would sail through coerce and reach warrant.py's breached(),
+            # where every comparison against NaN is False: the stop is never
+            # seen as broken, the brake never fires, and the display keeps
+            # reporting the position as guarded. Refuse it here instead, the
+            # same fail-closed posture warrant.py's max_qty check uses.
+            return None
+        return parsed
     return value

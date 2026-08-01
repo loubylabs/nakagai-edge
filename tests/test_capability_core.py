@@ -42,6 +42,12 @@ def test_coerce_float_rejects_an_unparseable_value():
     assert coerce("quantity", "many", cap) is None
 
 
+def test_coerce_float_refuses_a_non_finite_value():
+    cap = Capability(tool="t")
+    for bad in ("nan", "inf", "-inf", "Infinity", float("nan"), float("inf")):
+        assert coerce("quantity", bad, cap) is None
+
+
 def test_coerce_side_resolves_through_the_connector_alias_map():
     cap = Capability(tool="t", values={"side": {
         "buy": ["buy", "buy_to_open"], "sell": ["sell", "sell_short"]}})
