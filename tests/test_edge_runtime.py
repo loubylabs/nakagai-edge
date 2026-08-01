@@ -1,6 +1,7 @@
 """Edge runtime surface: freshness gate, tool passthrough, hub wiring."""
 
 import json
+import logging
 import time
 
 import httpx
@@ -8,12 +9,15 @@ import pytest
 
 pytest.importorskip("mcp")
 
+from nakagai_edge.capability import Capability
+from nakagai_edge.config import ConnectorSpec, load_specs
 from nakagai_edge.edge.audit import EdgeAudit
 from nakagai_edge.edge.brake import Brake
 from nakagai_edge.edge.client import PlatformClient
 from nakagai_edge.edge.runtime import build_hub, create_edge_mcp, freshness_error
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.sync import apply_bundle
+from tests.fixtures.alien_registry import ALIEN_CONNECTOR, ROBINHOOD_CONNECTOR
 
 pytestmark = pytest.mark.anyio
 
@@ -183,6 +187,13 @@ async def test_write_tool_edge_client_error_returns_is_error_json(tmp_path):
     assert "revoked" in doc["error"]
 
 
+DEMO_SPEC = ConnectorSpec(
+    id="demo", kind="mcp-http", role="broker",
+    capabilities={"get_quote": Capability(
+        tool="get_quotes", args={"symbols": "symbols"}, items=["quotes"],
+        fields={"symbol": ["symbol"], "price": ["price"]})})
+
+
 def _supervised_position(**over) -> dict:
     # expires_at is an epoch float, the way warrant.build_warrant_payload
     # writes it, because `guarded` reads it now: an ISO string is not a clock
@@ -206,6 +217,9 @@ async def test_get_open_risk_reports_positions_with_live_prices(tmp_path):
     record(state, _supervised_position())
 
     class QuoteHub:
+        def spec(self, connector_id):
+            return DEMO_SPEC
+
         async def call(self, connector_id, tool, args, **kw):
             assert tool == "get_quotes"
             return {"data": {"quotes": [{"symbol": "AAPL", "price": 92.0}]}}
@@ -230,26 +244,119 @@ async def test_get_open_risk_reports_positions_with_live_prices(tmp_path):
     assert out["portfolio_heat"] == row["open_risk"]
 
 
-async def test_the_quote_read_goes_through_the_named_constant(tmp_path, monkeypatch):
-    """The one tool name the brake's whole existence depends on lives in a
-    single named place, because it has to be classified read-only in the
-    guardrail config or the read is denied and the brake goes blind in
-    silence."""
-    import nakagai_edge.edge.runtime as runtime
+# ---- the quote feed goes through each connector's own map -----------------
+#
+# The read the brake's whole existence depends on. Whatever tool a connector's
+# `get_quote` entry names must still be classified read-only, or the edge's own
+# guardrails deny it and the brake goes blind in silence; brake.tick's famine
+# signal is what makes that audible.
+
+QUOTE_SPECS = load_specs({"connectors": [ALIEN_CONNECTOR, ROBINHOOD_CONNECTOR]})
+
+QUOTE_PAYLOADS = {
+    # The alien broker wraps nothing and spells every field its own way.
+    "ticker": {"ticks": [{"tkr": "aapl", "last": "92.00"}]},
+    # Robinhood nests its own {"data": ..., "guide": ...} envelope, which the
+    # map roots at rather than anything in runtime.py peeling it.
+    "get_quotes": {
+        "data": {"quotes": [{"symbol": "MSFT",
+                             "last_trade_price": "310.50"}]},
+        "guide": "ignore me"},
+}
+
+
+class MapQuoteHub:
+    """Answers through the real connector maps, keyed by the tool asked for."""
+
+    def __init__(self, payloads=None, fail=frozenset()):
+        self.calls = []
+        self.payloads = QUOTE_PAYLOADS if payloads is None else payloads
+        self.fail = fail
+
+    def spec(self, connector_id):
+        return QUOTE_SPECS[connector_id]
+
+    async def call(self, connector_id, tool, args, **kw):
+        self.calls.append((connector_id, tool, dict(args)))
+        if connector_id in self.fail:
+            raise RuntimeError(f"{connector_id} is not answering")
+        return {"data": self.payloads[tool]}
+
+
+def _two_brokers(tmp_path):
+    """One supervised position on each connector, distinct symbols."""
     from nakagai_edge.edge.supervision import record
     state = _state(tmp_path)
-    record(state, _supervised_position())
-    monkeypatch.setattr(runtime, "QUOTE_TOOL", "get_market_quotes")
+    record(state, _supervised_position(connector_id="alien-broker",
+                                       symbol="AAPL", account="AL-1"))
+    record(state, _supervised_position(position_id="ap_2",
+                                       connector_id="robinhood-trading",
+                                       symbol="MSFT", account="463605220"))
+    return state
 
-    asked = []
 
-    class QuoteHub:
-        async def call(self, connector_id, tool, args, **kw):
-            asked.append(tool)
-            return {"data": {"quotes": []}}
+async def test_quotes_dial_each_connectors_own_quote_tool(tmp_path):
+    """`ticker` with `tickers` for the alien broker, `get_quotes` with
+    `symbols` for Robinhood, and the same canonical quote shape out of both.
 
-    await runtime._quotes(QuoteHub(), state, ["AAPL"])
-    assert asked == ["get_market_quotes"]
+    The tool name and the argument key both come from the map, and both are
+    asserted: a broker handed the right tool under the wrong argument key
+    answers about nothing at all, and the brake then goes quiet in exactly the
+    way a working brake looks from outside.
+    """
+    import nakagai_edge.edge.runtime as runtime
+    state = _two_brokers(tmp_path)
+    hub = MapQuoteHub()
+
+    quotes = await runtime._quotes(hub, state, ["AAPL", "MSFT"])
+
+    by_tool = {tool: args for _, tool, args in hub.calls}
+    assert by_tool == {"ticker": {"tickers": ["AAPL"]},
+                       "get_quotes": {"symbols": ["MSFT"]}}
+    assert set(quotes) == {"AAPL", "MSFT"}
+    assert quotes["AAPL"]["price"] == 92.00
+    assert quotes["MSFT"]["price"] == 310.50
+    for quote in quotes.values():
+        # The full normalized shape, not a bare price: usable() needs the
+        # receipt time and the book to judge freshness and spread.
+        assert set(quote) == {"price", "bid", "ask", "ts"}
+        assert quote["ts"] > 0
+
+
+async def test_a_connector_that_will_not_answer_costs_only_its_own_symbols(
+        tmp_path):
+    """No quote means no tick for that symbol, which means no fire. That is
+    the safe direction but not a quiet one: the missing symbol is what
+    brake.tick counts toward its famine signal. The other connector's
+    positions must still be priced."""
+    import nakagai_edge.edge.runtime as runtime
+    state = _two_brokers(tmp_path)
+    hub = MapQuoteHub(fail={"alien-broker"})
+
+    quotes = await runtime._quotes(hub, state, ["AAPL", "MSFT"])
+
+    assert set(quotes) == {"MSFT"}, "the sweep survives one dead connector"
+
+
+async def test_a_connector_declaring_no_get_quote_is_skipped_with_a_reason(
+        tmp_path, caplog):
+    """A connector with no `get_quote` entry cannot be asked to guess one. It
+    is skipped by name in the log, not dialed on a hopeful tool name, and it
+    does not take the other connectors' quotes down with it."""
+    import nakagai_edge.edge.runtime as runtime
+    state = _two_brokers(tmp_path)
+    hub = MapQuoteHub()
+    hub.spec = lambda cid: (
+        ConnectorSpec(id=cid, kind="mcp-http", role="broker")
+        if cid == "alien-broker" else QUOTE_SPECS[cid])
+
+    with caplog.at_level(logging.WARNING, logger="nakagai.edge"):
+        quotes = await runtime._quotes(hub, state, ["AAPL", "MSFT"])
+
+    assert set(quotes) == {"MSFT"}
+    assert [c[0] for c in hub.calls] == ["robinhood-trading"], (
+        "an unmapped connector must not be dialed on a guessed tool name")
+    assert "alien-broker" in caplog.text and "get_quote" in caplog.text
 
 
 async def test_get_open_risk_keeps_terminal_records_out_of_the_heat(tmp_path):

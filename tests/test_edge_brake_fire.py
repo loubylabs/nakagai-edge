@@ -15,7 +15,7 @@ import pytest
 pytest.importorskip("cryptography")
 
 from nakagai_edge.capability import Capability
-from nakagai_edge.config import ConnectorSpec
+from nakagai_edge.config import ConnectorSpec, load_specs
 from nakagai_edge.edge import brake as brake_module
 from nakagai_edge.edge.audit import EdgeAudit
 from nakagai_edge.edge.brake import Brake
@@ -25,10 +25,13 @@ from nakagai_edge.edge.sync import apply_bundle
 from nakagai_edge.hub import GuardrailDenied
 from nakagai_edge.signing import generate_keypair, sign_artifact
 from nakagai_edge.warrant import TRIGGER_BELOW, build_warrant_payload
+from tests.fixtures.alien_registry import ALIEN_CONNECTOR, ROBINHOOD_CONNECTOR
 
 pytestmark = pytest.mark.anyio
 
 PRIV, PUB = generate_keypair()
+
+SPECS = load_specs({"connectors": [ALIEN_CONNECTOR, ROBINHOOD_CONNECTOR]})
 
 PLACE_ORDER = Capability(
     tool="place_equity_order",
@@ -38,8 +41,25 @@ PLACE_ORDER = Capability(
                      "sell": ["sell", "sell_to_open", "sell_short"]}},
     market_args={"order_type": "market"})
 
+# The pre-fire position re-read now goes through the map like everything else.
+# Rooted at `positions` rather than Robinhood's real `data.positions` because
+# the FakeHub below answers without Robinhood's inner envelope; the two real
+# maps are exercised against their real shapes further down.
+LIST_POSITIONS = Capability(
+    tool="get_equity_positions",
+    args={"account": "account_number"},
+    items=["positions"],
+    fields={"symbol": ["symbol"], "quantity": ["quantity"]})
+
 ENTRY_ARGS = {"account_number": "463605220", "symbol": "AAPL", "side": "buy",
               "quantity": 100, "limit_price": 47.55, "stop_price": 46.20}
+
+
+def _demo_spec(**caps) -> ConnectorSpec:
+    """The demo connector's map. `list_positions` is always present, because a
+    connector that cannot be asked what it holds can never fire at all."""
+    return ConnectorSpec(id="demo", kind="mcp-http", role="broker",
+                         capabilities={"list_positions": LIST_POSITIONS, **caps})
 
 
 @pytest.fixture
@@ -52,9 +72,7 @@ class FakeHub:
         self.calls = []
         self.held = held
         self.fail = fail
-        self._spec = ConnectorSpec(
-            id="demo", kind="mcp-http", role="broker",
-            capabilities={"place_order": PLACE_ORDER})
+        self._spec = _demo_spec(place_order=PLACE_ORDER)
 
     def spec(self, connector_id):
         return self._spec
@@ -82,8 +100,10 @@ class MalformedPositionsHub(FakeHub):
 
 
 class NoQtyKeyHub(FakeHub):
-    """The symbol's row is there, but under a quantity key the brake does not
-    recognize."""
+    """The symbol's row is there, but its size is not where the map says.
+
+    The row reads far enough to name the position and no further, which is "I
+    found it and cannot size it", never "it is gone"."""
 
     async def call(self, connector_id, tool, args, **kw):
         self.calls.append((tool, args, kw))
@@ -104,9 +124,7 @@ class NoMarketExitHub(FakeHub):
 
     def __init__(self, held=100.0, fail=None):
         super().__init__(held=held, fail=fail)
-        self._spec = ConnectorSpec(
-            id="demo", kind="mcp-http", role="broker",
-            capabilities={"place_order": NO_MARKET_CAP})
+        self._spec = _demo_spec(place_order=NO_MARKET_CAP)
 
 
 class NoPlaceOrderHub(FakeHub):
@@ -119,7 +137,41 @@ class NoPlaceOrderHub(FakeHub):
 
     def __init__(self, held=100.0, fail=None):
         super().__init__(held=held, fail=fail)
-        self._spec = ConnectorSpec(id="demo", kind="mcp-http", role="broker")
+        self._spec = _demo_spec()
+
+
+class NoListPositionsHub(FakeHub):
+    """A connector whose map lost `list_positions` before the stop was touched.
+
+    There is no position read left to make, and inventing one is exactly what
+    this layer exists to stop. The answer has to be None ("do not fire blind"),
+    never 0.0, which fire() would mark `released` and never look at again.
+    """
+
+    def __init__(self, held=100.0, fail=None):
+        super().__init__(held=held, fail=fail)
+        self._spec = ConnectorSpec(id="demo", kind="mcp-http", role="broker",
+                                   capabilities={"place_order": PLACE_ORDER})
+
+
+class MappedHub:
+    """A hub that answers through the REAL connector maps, not a canned shape.
+
+    `spec` hands back the actual registry entry, so the tool name and the
+    argument key both have to come out of the map rather than out of this
+    module's memory of what Robinhood calls things.
+    """
+
+    def __init__(self, payloads: dict):
+        self.calls = []
+        self.payloads = payloads
+
+    def spec(self, connector_id):
+        return SPECS[connector_id]
+
+    async def call(self, connector_id, tool, args, **kw):
+        self.calls.append((tool, dict(args)))
+        return {"data": self.payloads[tool]}
 
 
 class OtherSymbolsHub(FakeHub):
@@ -353,6 +405,77 @@ async def test_a_symbol_row_with_no_recognizable_quantity_key_does_not_release(t
     assert "not firing blind" in reason
     assert [c[0] for c in hub.calls] == ["get_equity_positions"]
     assert load(state)["ap_1"]["state"] == "armed"
+
+
+# ---- the position re-read goes through the connector's own map ------------
+#
+# Two brokers that agree on nothing. A re-read with a Robinhood tool name or a
+# Robinhood argument key still baked into it passes the second of these and
+# fails the first, which is the whole point of running both.
+
+
+@pytest.mark.parametrize(
+    "connector_id, account, tool, key, payload",
+    [("alien-broker", "AL-1", "holdings", "acct",
+      {"holdings": [{"ticker": "aapl", "qty": "25"}]}),
+     ("robinhood-trading", "463605220", "get_equity_positions", "account_number",
+      {"data": {"positions": [{"symbol": "AAPL", "quantity": "25"}]}})],
+    ids=["alien", "robinhood"])
+async def test_held_now_dials_each_connectors_own_position_tool(
+        tmp_path, connector_id, account, tool, key, payload):
+    # BOTH halves are asserted on purpose. Getting the tool right and the
+    # argument key wrong is a real and silent failure: the broker is asked
+    # about an account nobody named, and a perfectly readable answer that does
+    # not contain our symbol reads as 0.0 held, which marks a live position
+    # `released`. That is TERMINAL.
+    hub = MappedHub({tool: payload})
+    state, client, brake = _brake(tmp_path, hub)
+    held = await brake._held_now(_rec(connector_id=connector_id,
+                                      account=account))
+    assert held == 25.0
+    assert hub.calls == [(tool, {key: account})]
+
+
+async def test_an_unreadable_position_answer_is_none_and_never_zero(tmp_path):
+    # The distinction the whole function exists for, asserted on the function
+    # itself rather than only through fire(). 0.0 means "the broker answered
+    # and the symbol is not in the list", and fire() releases on it. None means
+    # "there was no answer to read", and fire() refuses on it. A broker that
+    # sent prose is the second one.
+    hub = MalformedPositionsHub()
+    state, client, brake = _brake(tmp_path, hub)
+    assert await brake._held_now(_rec()) is None
+
+
+async def test_a_readable_list_without_our_symbol_is_zero_and_never_none(tmp_path):
+    # The other side of the same coin: a genuinely readable list that simply
+    # does not name the symbol IS evidence the position closed, and refusing
+    # here would strand a closed position `armed` forever.
+    hub = OtherSymbolsHub()
+    state, client, brake = _brake(tmp_path, hub)
+    assert await brake._held_now(_rec()) == 0.0
+
+
+async def test_a_connector_that_declares_no_list_positions_asks_nothing(tmp_path):
+    hub = NoListPositionsHub()
+    state, client, brake = _brake(tmp_path, hub)
+    assert await brake._held_now(_rec()) is None
+    assert hub.calls == [], "with no map there is no question to ask"
+
+
+async def test_a_connector_that_declares_no_list_positions_does_not_fire_blind(
+        tmp_path):
+    # The map is read at firing time, so it can be gone by then. An unmapped
+    # position read must come out as a named refusal the owner hears, never as
+    # a release and never as an uncaught raise.
+    hub = NoListPositionsHub()
+    state, client, brake = _brake(tmp_path, hub)
+    record(state, _rec())
+    reason = await brake.fire(load(state)["ap_1"])
+    assert "not firing blind" in reason
+    assert load(state)["ap_1"]["state"] == "armed"
+    assert client.messages, "the owner must hear the position is unguarded"
+    assert "denial" in [e["kind"] for e in brake.audit.pending()]
 
 
 # ---- fix round 1: one-shot under concurrency, and loud refusals ----------

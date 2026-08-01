@@ -15,6 +15,7 @@ import time
 
 import httpx
 
+from nakagai_edge.capability import extract, resolve
 from nakagai_edge.edge.audit import EdgeAudit
 from nakagai_edge.edge.brake import BRAKE_INTERVAL_S, Brake, normalize_quote
 from nakagai_edge.edge.client import EdgeClientError, PlatformClient
@@ -30,16 +31,6 @@ from nakagai_edge.edge.sync import POLICY_TTL_S, SYNC_INTERVAL_S, policy_fresh, 
 
 EXECUTOR_INTERVAL_S = 5
 AUDIT_SHIP_INTERVAL_S = 30
-
-# The one broker read the brake's whole existence depends on, named here
-# because it MUST be classified read-only somewhere: the downstream's own
-# readOnlyHint, or the owner's `read_only_tools` glob. Otherwise
-# classify_write's `unknown_is_write` calls it a write, and check_accounts
-# denies a write that names no account whenever account tiers exist. That
-# denial is silent from the brake's side: no price, no breach, no fire, and
-# every display still saying guarded. See _quotes below, and the famine signal
-# in brake.tick, which is what makes the silence audible.
-QUOTE_TOOL = "get_quotes"
 
 
 def freshness_error() -> str:
@@ -240,10 +231,23 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
 async def _quotes(hub, state: EdgeState, symbols: list[str]) -> dict:
     """Full normalized quotes for the supervised symbols, per connector.
 
-    Meant to be a read, and only the guardrail config makes it one: see
-    QUOTE_TOOL. A connector that will not answer contributes nothing: no quote
-    means no tick for that symbol, which means no fire, which is the safe
-    direction, but it is NOT a quiet direction. brake.tick counts the silence.
+    The one broker read the brake's whole existence depends on. It is meant to
+    be a read, and only the guardrail config makes it one: whatever tool a
+    connector's `get_quote` map names MUST still be classified read-only,
+    either by the downstream's own readOnlyHint or by the owner's
+    `read_only_tools` glob. Otherwise classify_write's `unknown_is_write` calls
+    it a write, and check_accounts then denies a write that names no account
+    whenever account tiers exist. That denial is SILENT from the brake's side:
+    no price, no breach, no fire, and every display still saying guarded. The
+    map moved the tool NAME out of this module; it did not move that
+    requirement, which now has to hold once per connector rather than once in
+    total.
+
+    A connector that will not answer contributes nothing: no quote means no
+    tick for that symbol, which means no fire, which is the safe direction but
+    NOT a quiet one. brake.tick counts the silence and raises a famine signal,
+    which is the only thing that tells the denial above apart from a brake that
+    is simply watching a quiet price.
 
     Returns {symbol: full quote}, ts and book included, never a bare price:
     see the comment on Brake.tick for why that distinction matters.
@@ -255,9 +259,14 @@ async def _quotes(hub, state: EdgeState, symbols: list[str]) -> dict:
     out: dict = {}
     for connector_id, syms in wanted.items():
         try:
-            got = await hub.call(connector_id, QUOTE_TOOL,
-                                 {"symbols": sorted(syms)})
-        except Exception as e:  # noqa: BLE001
+            cap = hub.spec(connector_id).capability("get_quote")
+            tool, args = resolve("get_quote", cap, {"symbols": sorted(syms)})
+            got = await hub.call(connector_id, tool, args)
+        except Exception as e:  # noqa: BLE001 (one connector, never the sweep)
+            # CapabilityError lands here too: a connector that never declared
+            # get_quote is skipped by name rather than dialed on a guessed tool
+            # name, and rather than taking every other connector's quotes down
+            # with it.
             logging.getLogger("nakagai.edge").warning(
                 "no quotes from %s this tick: %s", connector_id, e)
             continue
@@ -266,15 +275,12 @@ async def _quotes(hub, state: EdgeState, symbols: list[str]) -> dict:
         # this so usable()'s freshness check has a real receipt time to
         # measure against, not the tick's own later clock read.
         received_at = time.time()
-        payload = (got or {}).get("data")
-        if isinstance(payload, dict) and "data" in payload:
-            payload = payload["data"]
-        rows = payload.get("quotes") if isinstance(payload, dict) else payload
-        for row in rows if isinstance(rows, list) else []:
+        for row in extract("get_quote", cap, (got or {}).get("data")):
             quote = normalize_quote(row, received_at)
-            symbol = str((row or {}).get("symbol", "")).upper()
-            if quote and symbol:
-                out[symbol] = quote
+            if quote:
+                # `symbol` is a required field of the capability, so every row
+                # extract kept carries one, already upper-cased.
+                out[row["symbol"]] = quote
     return out
 
 
