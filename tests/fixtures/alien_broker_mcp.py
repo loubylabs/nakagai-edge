@@ -49,5 +49,18 @@ def submit(acct: str, ticker: str, action: str, qty: float,
     return {"order_ref": "AL-ORD-1", "state": "accepted"}
 
 
+@mcp.tool()
+def orders(acct: str, state: str = "") -> dict:
+    """Working orders."""
+    return {"working": [{"ref": "AL-ORD-1", "tkr": "aapl", "action": "BUY_TO_OPEN",
+                         "qty": "25", "state": "working"}]}
+
+
+@mcp.tool()
+def scrub(acct: str, ref: str) -> dict:
+    """Cancel an order."""
+    return {"ref": ref, "state": "cancelled"}
+
+
 if __name__ == "__main__":
     mcp.run()

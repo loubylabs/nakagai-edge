@@ -14,9 +14,10 @@ ALIEN_CONNECTOR = {
     "enabled": True,
     "guardrails": {
         "allow_writes": True,
-        "read_only_tools": ["accounts_list", "balances", "holdings", "ticker"],
+        "read_only_tools": ["accounts_list", "balances", "holdings", "ticker",
+                            "orders"],
         "accounts": {"allow": ["AL-1"], "arg_names": ["acct"]},
-        "approvals": {"require_for": ["submit"]},
+        "approvals": {"require_for": ["submit", "scrub"]},
     },
     "capabilities": {
         "list_accounts": {
@@ -47,6 +48,17 @@ ALIEN_CONNECTOR = {
             "values": {"side": {"buy": ["BUY_TO_OPEN", "BUY_TO_COVER"],
                                 "sell": ["SELL_TO_CLOSE", "SELL_SHORT"]}},
             "market_args": {"kind": "MARKET"}},
+        "list_orders": {
+            "tool": "orders",
+            "args": {"account": "acct", "status": "state"},
+            "items": ["working"],
+            "fields": {"order_id": ["ref"], "symbol": ["tkr"], "side": ["action"],
+                       "quantity": ["qty"], "status": ["state"]},
+            "values": {"side": {"buy": ["BUY_TO_OPEN", "BUY_TO_COVER"],
+                                "sell": ["SELL_TO_CLOSE", "SELL_SHORT"]}}},
+        "cancel_order": {
+            "tool": "scrub",
+            "args": {"order_id": "ref", "account": "acct"}},
     },
 }
 
@@ -97,5 +109,16 @@ ROBINHOOD_CONNECTOR = {
             "values": {"side": {"buy": ["buy", "buy_to_open", "buy_to_cover"],
                                 "sell": ["sell", "sell_to_open", "sell_short"]}},
             "market_args": {"type": "market", "time_in_force": "gfd"}},
+        "list_orders": {
+            "tool": "get_orders",
+            "args": {"account": "account_number", "status": "status"},
+            "items": ["data.orders"],
+            "fields": {"order_id": ["id"], "symbol": ["symbol"], "side": ["side"],
+                       "quantity": ["quantity"], "status": ["state"]},
+            "values": {"side": {"buy": ["buy", "buy_to_open", "buy_to_cover"],
+                                "sell": ["sell", "sell_to_open", "sell_short"]}}},
+        "cancel_order": {
+            "tool": "cancel_order",
+            "args": {"order_id": "order_id", "account": "account_number"}},
     },
 }
