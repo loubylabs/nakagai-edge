@@ -7,6 +7,7 @@ import time
 
 import httpx
 
+from nakagai_edge.capability import CapabilityError
 from nakagai_edge.edge.audit import EdgeAudit
 from nakagai_edge.edge.client import EdgeClientError, PlatformClient
 from nakagai_edge.edge.remote import drop_intent, intents
@@ -86,24 +87,28 @@ def supervise(hub, state: EdgeState, approval_id: str, intent: dict,
         if not approval_id:
             return                       # nothing to key the ledger on
         spec = hub.spec(intent["connector_id"])
-        entry = read_entry(spec.guardrails.order_shape, intent.get("args") or {})
+        try:
+            cap = spec.capability("place_order")
+        except CapabilityError:
+            return                       # nothing declared, nothing to supervise
+        entry = read_entry(cap, intent.get("args") or {})
         if entry is None:
-            return                       # no stop, or no declared shape
+            return                       # no stop, or an incomplete map
         warrant = record_doc.get("exit_warrant")
         account = ""
         for name in spec.guardrails.accounts.arg_names:
             if intent["args"].get(name):
                 account = str(intent["args"][name])
                 break
-        shape = spec.guardrails.order_shape
-        buys = [v.lower() for v in shape.buy_values]
-        sells = [v.lower() for v in shape.sell_values]
+        aliases = cap.values.get("side") or {}
+        buys = [v.lower() for v in aliases.get("buy") or []]
+        sells = [v.lower() for v in aliases.get("sell") or []]
         direction = ("long" if entry["side"] in buys
                      else "short" if entry["side"] in sells else "")
         # Anything on this list leaves a position we can SEE but must never act
         # on: the direction decides how reconcile reads the broker's sign, the
         # account is what the warrant is scoped to and the only thing the
-        # broker can be asked about, and with no market_order_args declared
+        # broker can be asked about, and with no market_args declared
         # there is no exit order to build at all (spec section 9). Recording
         # those unguarded keeps them visible; recording a guess would put a
         # wrong R multiple on the owner's screen beside a `guarded: True` that
@@ -113,7 +118,7 @@ def supervise(hub, state: EdgeState, approval_id: str, intent: dict,
         blocked = "; ".join(why for why, ok in (
             ("unclassifiable order side", direction),
             ("no account on the order", account),
-            ("connector declares no market_order_args", shape.market_order_args),
+            ("connector declares no market_args", cap.market_args),
         ) if not ok)
         rec = {
             "position_id": approval_id,

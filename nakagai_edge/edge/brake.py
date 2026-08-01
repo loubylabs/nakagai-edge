@@ -21,6 +21,7 @@ import logging
 import math
 import time
 
+from nakagai_edge.capability import CapabilityError
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.supervision import claim, load, mark
 from nakagai_edge.edge.sync import cached_bundle, public_key
@@ -478,8 +479,18 @@ class Brake:
                 f"The brake could not exit {rec['symbol']}: {why_not}. That "
                 f"position is unguarded.", now)
         qty = min(float(held), ceiling)
-        args = exit_order_args(spec.guardrails.order_shape,
-                               rec.get("entry_args") or {}, qty)
+        try:
+            cap = spec.capability("place_order")
+        except CapabilityError as e:
+            # A connector that no longer declares place_order cannot be asked
+            # to guess one, and an uncaught raise here is a brake that does not
+            # fire at all: the position would sit `armed` with its stop already
+            # touched and nothing said to the owner. Refuse by name instead.
+            return await self._refuse(
+                rec, str(e),
+                f"The brake could not exit {rec['symbol']}: {e}. That position "
+                f"is unguarded.", now)
+        args = exit_order_args(cap, rec.get("entry_args") or {}, qty)
         if args is None:
             why_not = "this connector cannot express a market exit"
             return await self._refuse(
@@ -493,13 +504,17 @@ class Brake:
         # warrant covers the bytes actually being sent; checking against
         # rec["symbol"] or warrant["side"] instead would let a bug in
         # exit_order_args sail straight through verification untouched.
-        shape = spec.guardrails.order_shape
+        #
+        # Indexing cap.args directly is safe here: exit_order_args returned a
+        # payload, which it only does once all five order fields are declared.
+        # The account stays a LIST of candidates, because arg_names genuinely
+        # is one and check_accounts hunts the same way.
         sent = {
             "connector_id": rec["connector_id"],
             "tool": warrant.get("tool"),
-            "symbol": _sent_value(args, shape.symbol_keys),
-            "side": _sent_value(args, shape.side_keys),
-            "qty": _sent_qty(args, shape.quantity_keys),
+            "symbol": _sent_value(args, [cap.args["symbol"]]),
+            "side": _sent_value(args, [cap.args["side"]]),
+            "qty": _sent_qty(args, [cap.args["quantity"]]),
             "account": _sent_value(args, spec.guardrails.accounts.arg_names),
         }
 

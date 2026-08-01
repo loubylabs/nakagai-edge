@@ -14,7 +14,8 @@ import pytest
 
 pytest.importorskip("cryptography")
 
-from nakagai_edge.config import ConnectorSpec, GuardrailsConfig, OrderShape
+from nakagai_edge.capability import Capability
+from nakagai_edge.config import ConnectorSpec
 from nakagai_edge.edge import brake as brake_module
 from nakagai_edge.edge.audit import EdgeAudit
 from nakagai_edge.edge.brake import Brake
@@ -29,13 +30,15 @@ pytestmark = pytest.mark.anyio
 
 PRIV, PUB = generate_keypair()
 
-SHAPE = OrderShape(
-    symbol_keys=["symbol"], side_keys=["side"], quantity_keys=["quantity"],
-    price_keys=["limit_price"], stop_keys=["stop_price"],
-    stock_tools=["place_equity_order"],
-    market_order_args={"order_type": "market"})
+PLACE_ORDER = Capability(
+    tool="place_equity_order",
+    args={"symbol": "symbol", "side": "side", "quantity": "quantity",
+          "price": "limit_price", "stop": "stop_price"},
+    values={"side": {"buy": ["buy", "buy_to_open", "buy_to_cover"],
+                     "sell": ["sell", "sell_to_open", "sell_short"]}},
+    market_args={"order_type": "market"})
 
-ENTRY_ARGS = {"account_number": "463605220", "symbol": "AAPL", "side": "buy",
+ENTRY_ARGS ={"account_number": "463605220", "symbol": "AAPL", "side": "buy",
               "quantity": 100, "limit_price": 47.55, "stop_price": 46.20}
 
 
@@ -51,7 +54,7 @@ class FakeHub:
         self.fail = fail
         self._spec = ConnectorSpec(
             id="demo", kind="mcp-http", role="broker",
-            guardrails=GuardrailsConfig(order_shape=SHAPE))
+            capabilities={"place_order": PLACE_ORDER})
 
     def spec(self, connector_id):
         return self._spec
@@ -92,10 +95,8 @@ class NoQtyKeyHub(FakeHub):
         return {"is_error": False, "data": {"order_id": "42"}}
 
 
-NO_MARKET_SHAPE = OrderShape(
-    symbol_keys=["symbol"], side_keys=["side"], quantity_keys=["quantity"],
-    price_keys=["limit_price"], stop_keys=["stop_price"],
-    stock_tools=["place_equity_order"])  # no market_order_args declared
+# No market_args declared, so this connector cannot express an exit at all.
+NO_MARKET_CAP = PLACE_ORDER.model_copy(update={"market_args": {}})
 
 
 class NoMarketExitHub(FakeHub):
@@ -105,7 +106,20 @@ class NoMarketExitHub(FakeHub):
         super().__init__(held=held, fail=fail)
         self._spec = ConnectorSpec(
             id="demo", kind="mcp-http", role="broker",
-            guardrails=GuardrailsConfig(order_shape=NO_MARKET_SHAPE))
+            capabilities={"place_order": NO_MARKET_CAP})
+
+
+class NoPlaceOrderHub(FakeHub):
+    """A connector whose map lost `place_order` between entry and the stop.
+
+    A registry the owner edited, or a bundle that arrived with the entry
+    dropped. `spec.capability` raises here, and an uncaught raise inside
+    fire() is a brake that does not fire and says nothing.
+    """
+
+    def __init__(self, held=100.0, fail=None):
+        super().__init__(held=held, fail=fail)
+        self._spec = ConnectorSpec(id="demo", kind="mcp-http", role="broker")
 
 
 class OtherSymbolsHub(FakeHub):
@@ -308,7 +322,7 @@ async def test_a_forged_symbol_in_the_sent_payload_is_caught(tmp_path, monkeypat
     state, client, brake = _brake(tmp_path, hub)
     record(state, _rec())
 
-    def wrong_symbol(shape, entry_args, qty):
+    def wrong_symbol(cap, entry_args, qty):
         return {"account_number": "463605220", "symbol": "MSFT",
                 "side": "sell", "quantity": float(qty), "order_type": "market"}
 
@@ -404,6 +418,22 @@ async def test_fire_refuses_a_negative_infinite_warrant_ceiling(tmp_path):
     assert "not a usable number" in reason
     assert [c[0] for c in hub.calls] == ["get_equity_positions"]
     assert load(state)["ap_1"]["state"] == "armed"
+
+
+async def test_a_connector_that_declares_no_place_order_refuses_by_name(tmp_path):
+    # The map is read at firing time, so it can be gone by then. An uncaught
+    # CapabilityError here would leave the position `armed` with its stop
+    # already touched, no order placed and nothing said: the one failure of
+    # the brake nobody would see. It has to come out as a named refusal.
+    hub = NoPlaceOrderHub()
+    state, client, brake = _brake(tmp_path, hub)
+    record(state, _rec())
+    reason = await brake.fire(load(state)["ap_1"])
+    assert "place_order" in reason
+    assert [c[0] for c in hub.calls] == ["get_equity_positions"]
+    assert load(state)["ap_1"]["state"] == "armed"
+    assert client.messages, "the owner must hear the position is unguarded"
+    assert "denial" in [e["kind"] for e in brake.audit.pending()]
 
 
 async def test_the_owner_hears_when_the_connector_cannot_express_an_exit(tmp_path):

@@ -10,11 +10,16 @@ guarantee, and these bounds are the entire thing that replaces it.
 
 Pure: no I/O, no state, no clock of its own. Same posture as guardrails.py and
 the platform's envelope.py, so the safety story is testable without a network.
+
+Where an order's fields LIVE is not knowledge this module has: it comes from
+the connector's own `place_order` capability, which names one broker key per
+canonical field and declares how that broker spells "market order".
 """
 
 import math
 import time
 
+from nakagai_edge.capability import Capability
 from nakagai_edge.signing import verify_artifact
 
 WARRANT_KIND = "exit_warrant"
@@ -125,26 +130,43 @@ def authorizes(public_key: str, warrant: dict, exit_order: dict, *,
 # position records as unguarded.
 
 
-def _at(args: dict, keys: list[str]) -> str:
-    """The first of `keys` present in `args` with a scalar value, or ""."""
-    for key in keys:
-        if key in args:
-            value = args[key]
-            if value is not None and not isinstance(value, (dict, list)):
-                return key
-    return ""
+ORDER_FIELDS = ("symbol", "side", "quantity", "price", "stop")
 
 
-def read_entry(shape, args: dict) -> dict | None:
+def configured(cap: Capability) -> bool:
+    """Can this connector's order payload be read at all?
+
+    All five identity-and-size fields must be declared. `market_args` is
+    deliberately not here: a map without it is perfectly READABLE, it just
+    cannot express an exit, and the caller says so in the owner's words.
+    Folding it in would surface a missing declaration as "the order could not
+    be read", which is a lie.
+    """
+    return all(field in cap.args for field in ORDER_FIELDS)
+
+
+def _present(args: dict, key: str) -> bool:
+    """Is `key` in `args` with a scalar value?
+
+    A dict or a list under the key is the nested case the section comment
+    above declines, and a None is a broker field that was never filled in.
+    Neither is something an exit may be built from.
+    """
+    if key not in args:
+        return False
+    value = args[key]
+    return value is not None and not isinstance(value, (dict, list))
+
+
+def read_entry(cap: Capability, args: dict) -> dict | None:
     """The five fields the ledger needs, or None if this entry cannot be
     supervised. A missing stop is disqualifying here (unlike the envelope,
     which reports it and lets policy decide): with no stop there is no level,
     and with no level there is nothing to watch."""
-    if not shape.configured or not isinstance(args, dict):
+    if not configured(cap) or not isinstance(args, dict):
         return None
-    keys = {name: _at(args, getattr(shape, f"{name}_keys"))
-            for name in ("symbol", "side", "quantity", "price", "stop")}
-    if not all(keys.values()):
+    keys = {field: cap.args[field] for field in ORDER_FIELDS}
+    if not all(_present(args, key) for key in keys.values()):
         return None
     try:
         return {"symbol": str(args[keys["symbol"]]).upper(),
@@ -156,30 +178,38 @@ def read_entry(shape, args: dict) -> dict | None:
         return None
 
 
-def closing_side(shape, entry_side: str) -> str:
+def closing_side(cap: Capability, entry_side: str) -> str:
     """The side that reduces a position opened on `entry_side`, or "" when the
-    connector never declared one."""
+    connector never declared one.
+
+    The FIRST alias a connector lists is the spelling the exit gets, which is
+    the same rule capability._outbound() follows: a broker is told to close in
+    its own words, not in Nakagai's.
+    """
+    aliases = cap.values.get("side") or {}
+    buys = [v.lower() for v in aliases.get("buy") or []]
+    sells = [v.lower() for v in aliases.get("sell") or []]
     entry = str(entry_side).lower()
-    if entry in [v.lower() for v in shape.buy_values]:
-        return shape.sell_values[0] if shape.sell_values else ""
-    if entry in [v.lower() for v in shape.sell_values]:
-        return shape.buy_values[0] if shape.buy_values else ""
+    if entry in buys:
+        return (aliases.get("sell") or [""])[0]
+    if entry in sells:
+        return (aliases.get("buy") or [""])[0]
     return ""
 
 
-def exit_order_args(shape, entry_args: dict, qty: float) -> dict | None:
+def exit_order_args(cap: Capability, entry_args: dict, qty: float) -> dict | None:
     """The market exit for a position opened by `entry_args`, or None.
 
     Derived from the payload the broker already accepted rather than built from
     scratch, so account ids and any broker-required extras carry over without
     this module needing to know they exist.
     """
-    if not shape.market_order_args:
+    if not cap.market_args:
         return None
-    entry = read_entry(shape, entry_args)
+    entry = read_entry(cap, entry_args)
     if entry is None:
         return None
-    side = closing_side(shape, entry["side"])
+    side = closing_side(cap, entry["side"])
     if not side:
         return None
     # A market declaration may not touch the fields that identify or size the
@@ -188,21 +218,19 @@ def exit_order_args(shape, entry_args: dict, qty: float) -> dict | None:
     # a guess about an order bound for a real brokerage, so refuse. Price and
     # stop keys are deliberately excluded from this set: they are already
     # stripped below, so a collision there is expected and harmless.
-    aliases = (set(shape.symbol_keys) | set(shape.side_keys)
-               | set(shape.quantity_keys))
-    if aliases & set(shape.market_order_args):
+    identity = {cap.args[field] for field in ("symbol", "side", "quantity")}
+    if identity & set(cap.market_args):
         return None
-    symbol_key = _at(entry_args, shape.symbol_keys)
-    side_key = _at(entry_args, shape.side_keys)
-    qty_key = _at(entry_args, shape.quantity_keys)
-    # Strip EVERY symbol, side, and quantity alias, not just the one `_at`
-    # picked: an unused alias sitting in the entry payload would otherwise
-    # ride along beside the canonical one and leave the broker two answers.
-    # `aliases` is now safe to reuse for `drop` because every field it names
-    # gets written back below, unlike round 2's version of this set.
-    drop = set(shape.price_keys) | set(shape.stop_keys) | aliases
+    symbol_key, side_key = cap.args["symbol"], cap.args["side"]
+    qty_key = cap.args["quantity"]
+    # Price and stop leave the payload entirely: a market exit that still
+    # carried the entry's limit would be a limit order at the wrong level. The
+    # three identity keys are dropped and then written back below, so the
+    # closing side and the exit quantity REPLACE the entry's rather than
+    # `market_args` landing beside a stale pair of them.
+    drop = identity | {cap.args["price"], cap.args["stop"]}
     args = {k: v for k, v in entry_args.items() if k not in drop}
-    args.update(shape.market_order_args)
+    args.update(cap.market_args)
     # The RAW value, not entry["symbol"]: read_entry uppercases for
     # comparison, but the exit reuses the payload the broker already
     # accepted, so a lowercase ticker on the way in stays lowercase here.

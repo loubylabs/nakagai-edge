@@ -32,7 +32,7 @@ def _rec(**over):
 def _blocked_rec(**over):
     # A record the edge established at entry it can never act on. Its direction
     # and account are both fine, so nothing but `blocked` can catch it.
-    why = "connector declares no market_order_args"
+    why = "connector declares no market_args"
     return _rec(blocked=why, anomaly=why, **over)
 
 
@@ -326,7 +326,7 @@ def test_is_guarded_false_for_a_blocked_record_however_it_got_armed():
     # three times this branch re-armed a record it had already disqualified.
     # Everything else here is in order: warranted, armed, live warrant, both
     # switches on. Only `blocked` knows the connector can never build an exit.
-    rec = _rec(blocked="connector declares no market_order_args")
+    rec = _rec(blocked="connector declares no market_args")
     assert is_guarded(rec, brake_armed=True, disarmed=frozenset(),
                       now=BEFORE_EXPIRY) is False
 
@@ -349,7 +349,7 @@ def test_reconcile_clears_the_anomaly_but_never_the_blocked_field(tmp_path):
     row = load(state)["ap_1"]
     assert row["confirmed_qty"] == 80.0
     assert "anomaly" not in row
-    assert row["blocked"] == "connector declares no market_order_args"
+    assert row["blocked"] == "connector declares no market_args"
 
 
 @pytest.mark.parametrize("terminal_state", TERMINAL)

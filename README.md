@@ -130,9 +130,9 @@ nakagai-edge brake on                  # re-arm
 The brake does not promise the level. A gap opens a position under its stop and
 the exit goes off at the market, below it. That is what a stop is.
 
-A connector must declare an `order_shape` with `market_order_args` before its
-positions can be supervised. Without it, positions are recorded as unguarded
-and reported that way rather than silently ignored.
+A connector must declare a `place_order` capability with `market_args` before
+its positions can be supervised. Without it, positions are recorded as
+unguarded and reported that way rather than silently ignored.
 
 ## Failure modes
 

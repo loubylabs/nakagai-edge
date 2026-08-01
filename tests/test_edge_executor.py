@@ -344,10 +344,17 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
 
     order = {"symbol": "NVDA", "side": "buy", "quantity": 10,
              "limit_price": 118.40, "stop_price": 116.10}
-    order_shape = {"symbol_keys": ["symbol"], "side_keys": ["side"],
-                   "quantity_keys": ["quantity"], "price_keys": ["limit_price"],
-                   "stop_keys": ["stop_price"],
-                   "stock_tools": ["place_equity_order"]}
+    # The connector's own words for placing an order. `tool` is also the
+    # positive gate: exactly one declared share-order tool, so an option order
+    # cannot ride in on a `place_*` glob and be sized without its multiplier.
+    place_order = {
+        "tool": "place_equity_order",
+        "args": {"symbol": "symbol", "side": "side", "quantity": "quantity",
+                 "price": "limit_price", "stop": "stop_price",
+                 "account": "account_number"},
+        "values": {"side": {"buy": ["buy", "buy_to_open", "buy_to_cover"],
+                            "sell": ["sell", "sell_to_open", "sell_short"]}},
+        "market_args": {"order_type": "market"}}
 
     # ---- platform: autopilot armed, a seeded signal, the signing key ----
     plat = tmp_path / "platform"
@@ -402,8 +409,8 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
         "id": "broker", "kind": "mcp-http", "role": "broker",
         "url": "https://example.test/mcp", "enabled": True,
         "guardrails": {"allow_writes": True, "read_only_tools": ["get_*"],
-                       "approvals": {"require_for": ["place_*"], "ttl_s": 900},
-                       "order_shape": order_shape}}]}))
+                       "approvals": {"require_for": ["place_*"], "ttl_s": 900}},
+        "capabilities": {"place_order": place_order}}]}))
     # Seeded through the SAME Postgres `mandate_db` the running platform uses,
     # not a file store: the mandate now requires DATABASE_URL to grant
     # anything, so create_app's hub.database is set here too, and

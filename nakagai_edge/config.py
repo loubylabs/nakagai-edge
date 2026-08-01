@@ -93,57 +93,6 @@ class ApprovalConfig(BaseModel):
     ttl_s: int = 900
 
 
-class OrderShape(BaseModel):
-    """How to read symbol / side / quantity / price / stop out of THIS broker's
-    order payload, and WHICH of its tools places a plain share order. Nakagai does
-    not own the shape, the downstream MCP server does, so the owner names the
-    keys, exactly as `AccountFilter.arg_names` does for account ids.
-
-    Unconfigured (any required key list empty) means this connector can never be
-    auto-executed against: the envelope cannot bound what it cannot read. Fail
-    closed, same posture as `unknown_is_write`.
-
-    `stock_tools` is why autopilot auto-executes SHARE orders and nothing else. A
-    broker's approval gate is a glob (`place_*`), which catches `place_equity_order`
-    and `place_option_order` alike, but `Order.notional` is `quantity x price`,
-    and for an option that is `contracts x premium`, missing the x100 contract
-    multiplier. Four contracts at $2.50 would compute as $10 of notional against a
-    $2,000 per-order cap, when the real exposure is $1,000. The envelope's central
-    dollar fence would be wrong by two orders of magnitude.
-
-    So the owner DECLARES which tools place shares, and autopilot auto-executes only
-    those. A positive gate, not a blacklist: a broker that adds futures or crypto
-    tomorrow is refused by default rather than waved through with a notional nobody
-    checked. An undeclared `stock_tools` means no auto-execution at all, and the
-    refused order still reaches a human tap, as every refusal here does.
-    """
-    symbol_keys: list[str] = Field(default_factory=list)
-    side_keys: list[str] = Field(default_factory=list)
-    quantity_keys: list[str] = Field(default_factory=list)
-    price_keys: list[str] = Field(default_factory=list)
-    stop_keys: list[str] = Field(default_factory=list)
-    stock_tools: list[str] = Field(default_factory=list)   # e.g. ["place_equity_order"]
-    buy_values: list[str] = Field(
-        default_factory=lambda: ["buy", "buy_to_open", "buy_to_cover"])
-    sell_values: list[str] = Field(
-        default_factory=lambda: ["sell", "sell_to_open", "sell_short"])
-
-    # How this connector expresses "market order". Merged into a derived exit
-    # after every price and stop key is stripped. Undeclared means the brake
-    # cannot build an exit here, and the position records as unguarded: the
-    # same posture as an undeclared order_shape, for the same reason.
-    market_order_args: dict = Field(default_factory=dict)
-
-    @property
-    def configured(self) -> bool:
-        # `stock_tools` is deliberately NOT here. An order_shape without it is
-        # perfectly READABLE, it just is not auto-executable, and check_envelope
-        # says so in the owner's words. Folding it in would surface a missing
-        # declaration as "the order could not be read", which is a lie.
-        return all([self.symbol_keys, self.side_keys, self.quantity_keys,
-                    self.price_keys, self.stop_keys])
-
-
 class GuardrailsConfig(BaseModel):
     tools: ToolFilter = Field(default_factory=ToolFilter)
     allow_writes: bool = False
@@ -153,7 +102,6 @@ class GuardrailsConfig(BaseModel):
     unknown_is_write: bool = True   # fail closed: unclassifiable tool == write
     accounts: AccountFilter = Field(default_factory=AccountFilter)
     approvals: ApprovalConfig = Field(default_factory=ApprovalConfig)
-    order_shape: OrderShape = Field(default_factory=OrderShape)
 
 
 class ConnectorSpec(BaseModel):
@@ -231,9 +179,9 @@ class ConnectorSpec(BaseModel):
     def capability(self, name: str) -> Capability:
         """This connector's map for `name`, or refuse.
 
-        Fail closed, same posture as `order_shape.configured` before it: a
-        connector that never declared how to do something cannot be asked to
-        guess, and the agent is told which connector is missing which entry.
+        Fail closed: a connector that never declared how to do something cannot
+        be asked to guess, and the agent is told which connector is missing
+        which entry.
         """
         cap = self.capabilities.get(name)
         if cap is None:
