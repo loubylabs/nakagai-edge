@@ -223,11 +223,17 @@ def exit_order_args(cap: Capability, entry_args: dict, qty: float) -> dict | Non
         return None
     symbol_key, side_key = cap.args["symbol"], cap.args["side"]
     qty_key = cap.args["quantity"]
-    # Price and stop leave the payload entirely: a market exit that still
-    # carried the entry's limit would be a limit order at the wrong level. The
-    # three identity keys are dropped and then written back below, so the
-    # closing side and the exit quantity REPLACE the entry's rather than
-    # `market_args` landing beside a stale pair of them.
+    # Price and stop must leave the payload: a market exit still carrying the
+    # entry's limit would be a limit order at the wrong level, and the stop is
+    # the thing being acted on, not something to attach again.
+    #
+    # The three identity keys are redundant here, on two counts: the collision
+    # check above already refused any `market_args` naming one, and all three
+    # are rewritten unconditionally below. They stay so the strip set is
+    # complete on its own terms. It means "nothing from the entry survives but
+    # the extras this module knows nothing about", and reading it should not
+    # require holding two distant invariants in mind to see that a stale side
+    # cannot ride along beside the flipped one.
     drop = identity | {cap.args["price"], cap.args["stop"]}
     args = {k: v for k, v in entry_args.items() if k not in drop}
     args.update(cap.market_args)

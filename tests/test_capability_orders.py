@@ -28,6 +28,26 @@ def test_read_entry_refuses_an_entry_with_no_stop():
                            if k != "stop_price"}) is None
 
 
+def test_read_entry_refuses_a_null_under_a_declared_key():
+    # Declared and present is not the same as filled in. A None here would
+    # read as the string "NONE" and build an exit for an instrument no broker
+    # has. Later layers do catch that as a symbol mismatch, but this is the
+    # first one, and the first one is what keeps a malformed entry from ever
+    # becoming an order.
+    assert read_entry(RH, {**RH_ENTRY, "symbol": None}) is None
+
+
+def test_read_entry_refuses_a_container_under_a_declared_key():
+    # The nested case, one level down under a key that IS declared. Both of
+    # these are on string fields on purpose: a container under quantity or
+    # price is caught a second time when float() raises, but str() never
+    # raises, so a dict under `symbol` would stringify into a fake instrument
+    # and a list under `side` into a side no broker has. This guard is the
+    # only thing standing there.
+    assert read_entry(RH, {**RH_ENTRY, "symbol": {"ticker": "aapl"}}) is None
+    assert read_entry(RH, {**RH_ENTRY, "side": ["buy"]}) is None
+
+
 def test_closing_side_inverts_through_each_connectors_own_words():
     assert closing_side(ALIEN, "buy_to_open") == "SELL_TO_CLOSE"
     assert closing_side(RH, "buy") == "sell"

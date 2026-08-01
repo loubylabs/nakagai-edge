@@ -38,7 +38,7 @@ PLACE_ORDER = Capability(
                      "sell": ["sell", "sell_to_open", "sell_short"]}},
     market_args={"order_type": "market"})
 
-ENTRY_ARGS ={"account_number": "463605220", "symbol": "AAPL", "side": "buy",
+ENTRY_ARGS = {"account_number": "463605220", "symbol": "AAPL", "side": "buy",
               "quantity": 100, "limit_price": 47.55, "stop_price": 46.20}
 
 
