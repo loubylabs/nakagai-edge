@@ -1,7 +1,8 @@
 import pytest
 
-from nakagai_edge.capability import CapabilityError
+from nakagai_edge.capability import CAPABILITIES, CapabilityError
 from nakagai_edge.config import ConnectorSpec, load_specs
+from tests.fixtures.alien_registry import ALIEN_CONNECTOR, ROBINHOOD_CONNECTOR
 
 BASE = {"id": "demo", "kind": "mcp-http", "role": "broker",
         "url": "https://example.test/mcp/", "enabled": True}
@@ -20,6 +21,66 @@ def test_a_connector_parses_its_capability_map():
 def test_an_unknown_capability_name_is_rejected_at_parse_time():
     with pytest.raises(ValueError, match="get_horoscope"):
         ConnectorSpec(**BASE, capabilities={"get_horoscope": {"tool": "x"}})
+
+
+def test_a_position_map_with_no_symbol_path_is_rejected_at_parse_time():
+    # The release path this closes: read_partial skips the required check on
+    # purpose, so without a `symbol` path the sweep produces rows nothing can
+    # name, and a position that cannot be named is missing from both
+    # held_quantities and unreadable(), which reconcile reads as closed. The
+    # record is RELEASED, its stop stops being watched, and the portfolio
+    # document still displays the row. Nothing downstream catches it, so
+    # parse time is the only place it can be caught.
+    with pytest.raises(ValueError, match="demo.*list_positions.*symbol"):
+        ConnectorSpec(**BASE, capabilities={
+            "list_positions": {"tool": "holdings",
+                               "items": ["holdings"],
+                               "fields": {"quantity": ["qty"]}}})
+
+
+def test_a_position_map_with_no_quantity_path_is_rejected_at_parse_time():
+    with pytest.raises(ValueError, match="demo.*list_positions.*quantity"):
+        ConnectorSpec(**BASE, capabilities={
+            "list_positions": {"tool": "holdings",
+                               "items": ["holdings"],
+                               "fields": {"symbol": ["ticker"]}}})
+
+
+def test_a_map_declaring_no_fields_at_all_is_rejected():
+    # The likeliest shape of the mistake: `fields` forgotten entirely, which
+    # today reads as a capability that is present and mapped.
+    with pytest.raises(ValueError, match="demo.*get_balance.*equity"):
+        ConnectorSpec(**BASE, capabilities={"get_balance": {"tool": "balances"}})
+
+
+def test_a_map_declaring_every_required_field_parses():
+    spec = ConnectorSpec(**BASE, capabilities={
+        "list_positions": {"tool": "holdings", "items": ["holdings"],
+                           "fields": {"symbol": ["ticker"], "quantity": ["qty"]}}})
+    assert spec.capability("list_positions").fields["symbol"] == ["ticker"]
+
+
+def test_the_write_capabilities_require_nothing_and_parse_with_no_fields():
+    # place_order and cancel_order are written, not read: their vocabulary
+    # entries have empty `required` tuples, so a map for either carries no
+    # `fields` at all and must not be caught by the check above.
+    assert CAPABILITIES["place_order"].required == ()
+    assert CAPABILITIES["cancel_order"].required == ()
+    spec = ConnectorSpec(**BASE, capabilities={
+        "place_order": {"tool": "submit", "args": {"symbol": "ticker"},
+                        "market_args": {"kind": "MARKET"}},
+        "cancel_order": {"tool": "scrub", "args": {"order_id": "ref"}}})
+    assert spec.capability("place_order").fields == {}
+
+
+def test_both_shipped_fixture_connectors_map_every_field_they_need():
+    # These two are what every migrated path is tested against. If either had
+    # a hole, the validator would be describing a rule the fixtures break.
+    specs = load_specs({"connectors": [ALIEN_CONNECTOR, ROBINHOOD_CONNECTOR]})
+    assert sorted(specs) == ["alien-broker", "robinhood-trading"]
+    for spec in specs.values():
+        for name, cap in spec.capabilities.items():
+            assert set(CAPABILITIES[name].required) <= set(cap.fields)
 
 
 def test_an_unmapped_capability_refuses_and_names_the_connector():

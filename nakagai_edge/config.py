@@ -142,6 +142,43 @@ class ConnectorSpec(BaseModel):
                 f"(known: {', '.join(sorted(CAPABILITIES))})")
         return v
 
+    @field_validator("capabilities")
+    @classmethod
+    def _required_fields_are_mapped(cls, v: dict, info) -> dict:
+        """Every declared capability must say where its required fields live.
+
+        Declared after `_names_are_in_the_vocabulary` so it runs after it, and
+        every name reaching here is therefore known.
+
+        Nothing downstream catches this, which is why it has to be caught at
+        parse time. `read_partial` deliberately skips the required check, so a
+        map with no `symbol` path does not fail loudly: the sweep keeps
+        producing position rows that simply have no symbol on them, under a
+        connector that looks perfectly configured.
+
+        A position that cannot be named is absent from `held_quantities` AND
+        absent from `unreadable()`, because both key off the symbol. That is
+        the one combination `reconcile` reads as "the account answered and this
+        position is not in it", so the record is RELEASED, which is TERMINAL:
+        the brake stops watching a live position, while the portfolio document
+        still shows the row under the broker's own key and every display looks
+        normal. One omitted line of connector config does that to every
+        position on the connector, silently.
+
+        `place_order` and `cancel_order` require nothing (they are written, not
+        read), so a map for either parses with no `fields` at all.
+        """
+        broken = []
+        for name in sorted(v):
+            missing = sorted(set(CAPABILITIES[name].required) - set(v[name].fields))
+            if missing:
+                broken.append(f"{name} declares no path for {', '.join(missing)}")
+        if broken:
+            cid = (info.data or {}).get("id", "?")
+            raise ValueError(
+                f"connector {cid!r} cannot read what it maps: {'; '.join(broken)}")
+        return v
+
     @model_validator(mode="after")
     def _default_the_account_key(self):
         # The map says where the account goes; check_accounts hunts for it in
