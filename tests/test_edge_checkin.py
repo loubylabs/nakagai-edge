@@ -164,14 +164,20 @@ async def test_edge_agent_can_arm_autopilot_after_checking_in_with_equity(
     from nakagai_platform.mandate_store import MandateStore
 
     owner = TestClient(platform_app)
-    owner_headers = {"Authorization": "Bearer api-secret"}
+    # An identity, because arming is a per-account act and the platform now
+    # refuses one that carries none. This used to send a bearer token and
+    # nothing else, which landed on the house "default" workspace: convenient
+    # for a harness, and exactly the anonymous write the platform closed.
+    # The equity report is unaffected either way, since latest_equity_report()
+    # is scoped to the root rather than to a workspace.
+    owner_email = "edge-owner@example.com"
+    owner_headers = {"Authorization": "Bearer api-secret", "X-User": owner_email}
 
-    # Seed the mandate the same way /api/mandate/arm itself resolves it: no
-    # X-Workspace/X-User on these owner_headers, so the route lands on the
-    # house "default" workspace. resolve_workspace() with the same blank
-    # headers is what keeps this store pointed at that identical row.
+    # Seed the mandate the way /api/mandate/arm itself resolves it: the same
+    # email through the same resolver, so this store and the route land on one
+    # workspace row.
     db = Database.from_env()
-    ctx = resolve_workspace(db, "", "")
+    ctx = resolve_workspace(db, "", owner_email)
     store = MandateStore(platform_root, db, ctx)
     doc = store.load()
     doc["preset"] = "autopilot"
