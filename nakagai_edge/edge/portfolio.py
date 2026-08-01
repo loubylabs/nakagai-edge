@@ -18,7 +18,7 @@ from pathlib import Path
 
 import yaml
 
-from nakagai_edge.capability import extract, first, read_partial, resolve
+from nakagai_edge.capability import first, read_partial, resolve
 
 PORTFOLIO_INTERVAL_S = 300      # the timer loop's cadence
 REFRESH_MIN_INTERVAL_S = 15     # a poke inside this window is not a sweep
@@ -72,10 +72,7 @@ async def connector_snapshot(hub, spec) -> dict:
     """
     entry: dict = {"id": spec.id, "error": "", "accounts": []}
     try:
-        cap = spec.capability("list_accounts")
-        tool, args = resolve("list_accounts", cap, {})
-        payload = (await hub.call(spec.id, tool, args)).get("data")
-        listed = extract("list_accounts", cap, payload)
+        listed = await _listed(hub, spec)
     except Exception as e:  # noqa: BLE001 (per-connector degradation, by design)
         # CapabilityError arrives here too. A connector that never declared
         # list_accounts says so in its own entry and contributes no accounts,
@@ -88,6 +85,17 @@ async def connector_snapshot(hub, spec) -> dict:
                "nickname": account.get("nickname") or "",
                "type": account.get("type") or "",
                "tier": tier, "error": "", "portfolio": {}, "positions": []}
+        if not num:
+            # Listed by the broker, but with nothing readable to name it by.
+            # The row is kept and not dialed: there is no identifier to ask
+            # about, and inventing one would ask about somebody else's account.
+            # Saying so here beats sending the broker a blank account and
+            # relaying whatever it makes of that.
+            row["error"] = ("this connector listed an account with no readable "
+                            "identifier, so its balances and positions cannot "
+                            "be fetched")
+            entry["accounts"].append(row)
+            continue
         try:
             row["portfolio"] = await _figures(hub, spec, num)
             row["positions"] = await _positions(hub, spec, num)
@@ -95,6 +103,27 @@ async def connector_snapshot(hub, spec) -> dict:
             row["error"] = f"{type(e).__name__}: {e}"
         entry["accounts"].append(row)
     return entry
+
+
+async def _listed(hub, spec) -> list[dict]:
+    """The broker's accounts, normalized one row at a time.
+
+    `read_partial`, not `extract`, for exactly the reason `_positions` uses it.
+    `account` is a required field, so `extract` would DROP a row whose
+    identifier will not read, and a dropped account does not come back as a
+    visible hole: it takes its balances and every position underneath it out of
+    the document, and no display says anything happened. Keeping the row with
+    no `account` makes the same fault loud instead, which is the rule
+    supervision.unreadable() applies to positions.
+    """
+    cap = spec.capability("list_accounts")
+    tool, args = resolve("list_accounts", cap, {})
+    payload = (await hub.call(spec.id, tool, args)).get("data")
+    rows = first(payload, cap.items) if cap.items else payload
+    if not isinstance(rows, list):
+        return []
+    return [read_partial("list_accounts", cap, row)
+            for row in rows if isinstance(row, dict)]
 
 
 async def _figures(hub, spec, account: str) -> dict:
@@ -110,6 +139,13 @@ async def _figures(hub, spec, account: str) -> dict:
     own, and the map now says where that sits instead of this module knowing
     the word "data". A broker that wraps nothing declares no items, and the
     whole payload is the figures.
+
+    A payload missing the node the map names yields no figures at all, where
+    the old hardcoded peel passed the outer payload through instead. Stricter
+    on purpose: that payload is not the shape the map describes, and handing
+    the web the rest of the envelope would put a `guide` string where the
+    money goes. Blank tiles read as broken; wrong ones do not. The account row
+    itself still reports, so nothing disappears over it.
     """
     cap = spec.capability("get_balance")
     tool, args = resolve("get_balance", cap, {"account": account})

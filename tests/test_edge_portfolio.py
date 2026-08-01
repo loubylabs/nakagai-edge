@@ -80,9 +80,12 @@ class FakeHub:
                 "is_error": False, "data": {"data": out, "guide": "ignore me"}}
 
 
-class AlienHub:
-    """The same contract for a broker with no envelope of its own: one canned
-    response per tool, handed back as hub.call's `data` and nothing more."""
+class FlatHub:
+    """The same contract, keyed by tool alone: one canned response per tool,
+    handed back as hub.call's `data` and nothing more. What a test puts in is
+    exactly what the map has to read, which is what makes it useful both for
+    the alien broker (no envelope at all) and for pinning what happens when a
+    Robinhood-shaped payload is missing the node its map names."""
 
     def __init__(self, responses):
         self.responses, self.calls = responses, []
@@ -165,7 +168,7 @@ def _alien_hub(**over):
         "holdings": {"holdings": [{"ticker": "aapl", "qty": "25",
                                    "cost": "187.20"}]}}
     responses.update(over)
-    return AlienHub(responses)
+    return FlatHub(responses)
 
 
 async def test_snapshot_dials_the_alien_brokers_own_tool_names():
@@ -195,7 +198,7 @@ async def test_snapshot_keeps_broker_figures_verbatim():
 async def test_a_connector_missing_a_capability_reports_the_error():
     spec = SPECS["alien-broker"].model_copy(deep=True)
     del spec.capabilities["list_accounts"]
-    entry = await connector_snapshot(AlienHub({}), spec)
+    entry = await connector_snapshot(FlatHub({}), spec)
     assert "list_accounts" in entry["error"]
     assert entry["accounts"] == []
 
@@ -227,6 +230,70 @@ async def test_an_unreadable_row_does_not_shift_its_neighbours_quantity():
     rows = entry["accounts"][0]["positions"]
     assert [(r["symbol"], r.get("quantity")) for r in rows] == [
         ("SPY", None), ("AAPL", 25.0), ("MSFT", 7.0)]
+
+
+def _untiered_alien():
+    """The alien spec with its account lists cleared, so tiered_accounts takes
+    the no-restriction path and reports whatever the broker listed. That is the
+    only path on which an account the broker lists reaches the document by
+    itself, so it is the path an unreadable one can vanish from."""
+    spec = SPECS["alien-broker"].model_copy(deep=True)
+    spec.guardrails.accounts.allow = []
+    spec.guardrails.accounts.read = []
+    return spec
+
+
+async def test_an_account_whose_identifier_will_not_read_stays_visible():
+    """`account` is a required field, so `extract` would drop this row and the
+    account would simply be gone, taking its balances and every position under
+    it with it, with nothing on any display saying so. Same rule as an
+    unreadable position: present-but-unparseable is not absent, and the owner
+    has to be able to see the difference."""
+    hub = _alien_hub(accounts_list={"accounts": [
+        {"label": "Ghost"},                     # no `acct` at all
+        {"acct": "AL-1", "label": "Main"}]})
+    entry = await connector_snapshot(hub, _untiered_alien())
+    ghost, main = entry["accounts"]
+    assert ghost["account_number"] == ""        # nothing invented
+    assert ghost["nickname"] == "Ghost"         # what did read, survives
+    assert ghost["error"]                       # and the owner is told
+    assert ghost["portfolio"] == {} and ghost["positions"] == []
+    assert main["account_number"] == "AL-1" and main["error"] == ""
+    # The ghost is never dialed. There is nothing to ask about, and a made-up
+    # identifier would be asking about somebody else's account.
+    assert [c[1] for c in hub.calls] == ["accounts_list", "balances", "holdings"]
+
+
+async def test_the_tiered_path_is_unaffected_by_an_unreadable_account():
+    """With account lists configured the guardrails enumerate the accounts and
+    the broker's list only enriches them, so an account the owner never listed
+    is out of scope whether or not its identifier reads. It must not appear,
+    and it must not displace the configured one."""
+    hub = _alien_hub(accounts_list={"accounts": [
+        {"label": "Ghost"},
+        {"acct": "AL-1", "label": "Main"}]})
+    entry = await connector_snapshot(hub, SPECS["alien-broker"])   # allows AL-1
+    assert [a["account_number"] for a in entry["accounts"]] == ["AL-1"]
+    assert entry["accounts"][0]["nickname"] == "Main"
+    assert entry["accounts"][0]["error"] == ""
+
+
+async def test_a_balance_payload_missing_the_mapped_root_is_no_figures():
+    """The map says Robinhood's figures live under `data`. A payload without
+    that node is not the shape the map describes, so the account reports no
+    figures rather than handing the web whatever else the envelope held. Blank
+    money tiles read as broken; a `guide` string sitting where the figures
+    belong reads as figures. The account itself still reports."""
+    hub = FlatHub({
+        "get_accounts": {"data": {"accounts": [{"account_number": "463605220"}]}},
+        "get_portfolio": {"guide": "the figures are elsewhere today"},
+        "get_equity_positions": {"data": {"positions": []}}})
+    spec = _spec(guardrails={"tools": {"allow": ["get_*"]},
+                             "read_only_tools": ["get_*"]})
+    row = (await connector_snapshot(hub, spec))["accounts"][0]
+    assert row["account_number"] == "463605220"
+    assert row["portfolio"] == {}
+    assert row["error"] == ""
 
 
 # ---- the guarded marker ---------------------------------------------------
