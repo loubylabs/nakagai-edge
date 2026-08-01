@@ -12,9 +12,10 @@ OAuth tokens live under `secrets/` (gitignored) or in Postgres.
 import re
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from nakagai_edge._env import read_env_ref
+from nakagai_edge.capability import CAPABILITIES, Capability, CapabilityError
 from nakagai_edge.slug import safe_slug
 
 # Verb prefixes that mark a downstream tool as state-changing when the server
@@ -172,12 +173,39 @@ class ConnectorSpec(BaseModel):
     idle_ttl_s: float = 600.0
     auth: AuthConfig = Field(default_factory=AuthConfig)
     guardrails: GuardrailsConfig = Field(default_factory=GuardrailsConfig)
+    capabilities: dict[str, Capability] = Field(default_factory=dict)
 
     @field_validator("id")
     @classmethod
     def _id_is_a_slug(cls, v: str) -> str:
         # Doubles as path safety: the id names a token file under secrets/.
         return safe_slug(v, label="connector id")
+
+    @field_validator("capabilities")
+    @classmethod
+    def _names_are_in_the_vocabulary(cls, v: dict) -> dict:
+        # A typo must not become a silently absent capability: an unmapped
+        # capability already refuses at call time, and a misspelled one would
+        # look identical while the correct spelling sat right there in the file.
+        unknown = sorted(set(v) - set(CAPABILITIES))
+        if unknown:
+            raise ValueError(
+                f"unknown capabilities: {', '.join(unknown)} "
+                f"(known: {', '.join(sorted(CAPABILITIES))})")
+        return v
+
+    @model_validator(mode="after")
+    def _default_the_account_key(self):
+        # The map says where the account goes; check_accounts hunts for it in
+        # arbitrary args on the raw call_connector path. Different jobs, and
+        # they must not disagree about the key name, so the map inherits it.
+        names = self.guardrails.accounts.arg_names
+        if not names:
+            return self
+        for name, cap in self.capabilities.items():
+            if "account" in CAPABILITIES[name].args and "account" not in cap.args:
+                cap.args["account"] = names[0]
+        return self
 
     @property
     def is_mcp(self) -> bool:
@@ -186,6 +214,24 @@ class ConnectorSpec(BaseModel):
     @property
     def transport(self) -> str | None:
         return KIND_TO_TRANSPORT.get(self.kind)
+
+    @property
+    def capability_names(self) -> list[str]:
+        return sorted(self.capabilities)
+
+    def capability(self, name: str) -> Capability:
+        """This connector's map for `name`, or refuse.
+
+        Fail closed, same posture as `order_shape.configured` before it: a
+        connector that never declared how to do something cannot be asked to
+        guess, and the agent is told which connector is missing which entry.
+        """
+        cap = self.capabilities.get(name)
+        if cap is None:
+            raise CapabilityError(
+                f"connector {self.id!r} declares no {name!r} capability "
+                f"(declares: {', '.join(self.capability_names) or 'none'})")
+        return cap
 
     def check_connectable(self) -> None:
         """Raise ValueError unless this spec has what its transport needs."""
