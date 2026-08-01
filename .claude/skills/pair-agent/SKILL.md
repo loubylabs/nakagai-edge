@@ -104,9 +104,14 @@ Once connected, in order:
      is a request to look, not to act, and the mandate still decides what you
      may do about what you find.
 
-   Every other kind, a `signal`, an `approval_decided`, a `mandate_changed`,
-   is context you absorb silently; hundreds of signals a session means
-   replying to each would bury the owner's conversation in their own pane.
+   Every other kind, a `signal`, a `market_event`, an `approval_decided`, a
+   `mandate_changed`, is context you absorb silently; hundreds of signals and
+   events a session means replying to each would bury the owner's conversation
+   in their own pane. A `market_event` is one recorded observation about one
+   symbol on one bar: `detector` names what fired (`sharp_move`, a volume
+   surge, a new range extreme, an opening gap) and `magnitude` carries its
+   numbers. It gives no direction and no entry, stop or target, so it
+   authorizes nothing; it is background for what you already watch.
    Chat is never mandate-gated, so keep answering even when halted; say that
    you are halted. Delivery is at-least-once and `send_message` has no
    idempotency key, so track which `seq` values you have already answered.
