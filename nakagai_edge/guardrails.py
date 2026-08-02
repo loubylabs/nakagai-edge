@@ -58,8 +58,8 @@ def iter_arg_values(args: Any, depth: int = 0):
     """Yield (key, value) pairs from the top level and one level down.
 
     Downstream tools nest account ids one level at a time (`{"order":
-    {"account_number": ...}}`); deeper than that we stop rather than pretend to
-    have inspected the whole tree.
+    {"account": ...}}`, whatever that broker spells the key); deeper than that
+    we stop rather than pretend to have inspected the whole tree.
 
     Public: `check_accounts` walks this to find account ids in the call args.
     """
