@@ -209,6 +209,7 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
                          {"reason": "policy stale", "capability": capability})
             return {**STALE_POLICY, "capability": capability,
                     "connector": connector_id, "tool": ""}
+        cid = connector_id
         try:
             cid = _pick_connector(capability, connector_id)
             spec = hub.spec(cid)
@@ -224,6 +225,18 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
                     wanted["account"] = inferred
             tool, broker_args = resolve(capability, cap, wanted)
         except (CapabilityError, ConnectorError, ValueError) as e:
+            # Journalled HERE for the same reason the stale-policy refusal
+            # above is: these land before `_guarded`, which is where every
+            # other denial is recorded. An unmapped capability, an ambiguous
+            # connector and a missing required argument are all refusals an
+            # owner has to be able to find afterwards, and without this they
+            # would be the only ones leaving no trace at all: the audit trail
+            # would show an agent that looks idle while it is in fact being
+            # turned away. `cid` is the connector actually chosen when the
+            # refusal came after that point, and the caller's own (possibly
+            # empty) argument when it came before.
+            audit.record("denial", cid, "",
+                         {"reason": str(e), "capability": capability})
             return {"is_error": True, "error": str(e), "capability": capability}
         out = await _guarded(cid, tool, broker_args, signal_id=signal_id,
                              capability=capability)
@@ -457,6 +470,15 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         `stop` sets the stop, both in the account's currency; only the fields
         you name are sent, and the edge never adds an order type of its own, so
         a broker that needs one will say so in its own error.
+
+        AN ORDER WITH NO `stop` GETS NO BRAKE. The stop is the level the edge
+        watches, so an order placed without one is executed and then supervised
+        by nothing: no ledger record, no exit warrant, and nothing anywhere
+        that will close the position if the price runs against you. It is also
+        absent from `get_open_risk` entirely, so it does not appear in your own
+        open risk or in portfolio heat, and the Portfolio page shows it
+        unguarded. Pass a stop unless you mean to hold that position with no
+        automatic exit at all.
 
         `connector_id` may be omitted when exactly one enabled broker declares
         this capability. `account` may be omitted only when the owner allows

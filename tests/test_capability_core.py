@@ -48,6 +48,17 @@ def test_coerce_float_refuses_a_non_finite_value():
         assert coerce("quantity", bad, cap) is None
 
 
+def test_coerce_refuses_a_boolean_rather_than_counting_it_as_one():
+    # `true` is not a quantity, a price or a stop. Python makes bool a subclass
+    # of int, so without an explicit check float(True) is 1.0: a position sized
+    # one share, or a stop at $1.00, invented out of a field that said nothing
+    # numeric. Verbatim fields refuse it for the same reason.
+    cap = Capability(tool="t")
+    for field in ("quantity", "price", "stop", "symbol", "equity"):
+        assert coerce(field, True, cap) is None
+        assert coerce(field, False, cap) is None
+
+
 def test_coerce_side_resolves_through_the_connector_alias_map():
     cap = Capability(tool="t", values={"side": {
         "buy": ["buy", "buy_to_open"], "sell": ["sell", "sell_short"]}})

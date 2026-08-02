@@ -404,6 +404,39 @@ async def test_a_capability_the_connector_never_declared_names_both(tmp_path):
     assert hub.calls == [], "an unmapped capability must not be dialed on a guess"
 
 
+@pytest.mark.parametrize("specs,tool,args,connector", [
+    # Unmapped: refused by `spec.capability`, after the connector was chosen.
+    (_without(ALIEN_CONNECTOR, "list_positions"), "list_positions",
+     {"connector_id": ALIEN, "account": "AL-1"}, ALIEN),
+    # Ambiguous: refused by `_pick_connector`, before one was chosen, so the
+    # event names no broker rather than one nothing was sent to.
+    (None, "get_balance", {}, ""),
+    # A mandatory argument left empty: refused by `required`.
+    (_specs(ALIEN_CONNECTOR), "cancel_order", {"order_id": ""}, ALIEN),
+])
+async def test_every_pre_guard_refusal_is_journalled(tmp_path, specs, tool,
+                                                     args, connector):
+    """An owner reading the audit trail sees every refusal, not a subset.
+
+    These three land before `_guarded`, which is where every other denial is
+    recorded, so each has to be journalled where it happens. Without that, an
+    agent being turned away over and over is indistinguishable from an idle
+    one, and the misconfiguration doing the turning away leaves no trace of
+    itself anywhere the owner looks.
+    """
+    state = _state(tmp_path)
+    hub = MapHub(specs=specs) if specs is not None else MapHub()
+    doc = await _call(_server(state, hub), tool, **args)
+
+    assert doc["is_error"] is True
+    events = EdgeAudit(state).pending()
+    assert [e["kind"] for e in events] == ["denial"]
+    assert events[0]["connector_id"] == connector
+    assert events[0]["detail"]["capability"] == tool
+    # The reason is the sentence the agent was given, not a category.
+    assert events[0]["detail"]["reason"] == doc["error"]
+
+
 # ---- account inference ----------------------------------------------------
 #
 # Inference FILLS the argument; `check_accounts` then evaluates it exactly as

@@ -20,7 +20,7 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
-SCALARS = (str, int, float, bool)
+SCALARS = (str, int, float)
 
 # How a canonical field is read. Declared by the vocabulary, never by a
 # connector: a map may say WHERE a value lives, never what it means.
@@ -145,7 +145,15 @@ def coerce(field: str, value: Any, cap: Capability) -> Any | None:
             if wanted in [a.lower() for a in aliases.get(canonical) or []]:
                 return canonical
         return None
-    if not isinstance(value, SCALARS):
+    if isinstance(value, bool) or not isinstance(value, SCALARS):
+        # `bool` is deliberately not a scalar here, and the check has to be
+        # explicit because bool subclasses int in Python: isinstance(True, int)
+        # is True, so `true` would otherwise reach float() and coerce to 1.0. A
+        # broker answering `true` for a quantity or a stop has said nothing
+        # numeric at all, and inventing one share, or a stop at $1.00, out of
+        # that is the exact "unreadable becomes a number" failure this whole
+        # module refuses. No canonical field is a boolean, so nothing legible
+        # is lost.
         return None
     if kind is UPPER_STR:
         return str(value).strip().upper() or None
