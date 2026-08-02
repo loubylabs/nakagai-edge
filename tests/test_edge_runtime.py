@@ -1,6 +1,9 @@
 """Edge runtime surface: freshness gate, tool passthrough, hub wiring."""
 
+import asyncio
+import contextlib
 import json
+import logging
 import time
 
 import httpx
@@ -8,12 +11,15 @@ import pytest
 
 pytest.importorskip("mcp")
 
+from nakagai_edge.capability import Capability
+from nakagai_edge.config import ConnectorSpec, load_specs
 from nakagai_edge.edge.audit import EdgeAudit
 from nakagai_edge.edge.brake import Brake
 from nakagai_edge.edge.client import PlatformClient
 from nakagai_edge.edge.runtime import build_hub, create_edge_mcp, freshness_error
 from nakagai_edge.edge.state import EdgeState
-from nakagai_edge.edge.sync import apply_bundle
+from nakagai_edge.edge.sync import BUNDLE_SCHEMA, apply_bundle, sync_once
+from tests.fixtures.alien_registry import ALIEN_CONNECTOR, ROBINHOOD_CONNECTOR
 
 pytestmark = pytest.mark.anyio
 
@@ -26,7 +32,7 @@ def anyio_backend():
 def _state(tmp_path):
     s = EdgeState(tmp_path)
     s.save_agent("https://api.test", "ag1", "nk_agent_t")
-    apply_bundle(s, {"bundle_version": "v1",
+    apply_bundle(s, {"bundle_version": "v1", "schema_version": BUNDLE_SCHEMA,
                      "connectors": {"connectors": []},
                      "signing_public_key": "k"}, "v1")
     return s
@@ -84,7 +90,32 @@ async def test_status_tool_works_even_stale(tmp_path, monkeypatch):
     monkeypatch.setattr(time, "time", lambda: real() + 1000)
     result = await mcp.call_tool("get_connector_status", {})
     text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
-    assert "connectors" in json.loads(text)
+    doc = json.loads(text)
+    assert "connectors" in doc
+    assert doc["schema_error"] == ""
+
+
+async def test_status_tool_carries_the_schema_error(tmp_path):
+    """The one tool that answers on stale policy, so it is the one place an
+    agent can learn WHY the rest is refusing. `policy_fresh: false` alone reads
+    as a network problem; a refused bundle needs the owner, not a retry."""
+    state = _state(tmp_path)
+    client = PlatformClient(
+        "https://api.test", "t",
+        transport=httpx.MockTransport(lambda r: httpx.Response(
+            200, json={"bundle_version": "v2", "connectors": {"connectors": []}},
+            headers={"etag": "v2"})))
+    assert sync_once(state, client) is False
+
+    hub = build_hub(state, client)
+    audit = EdgeAudit(state)
+    mcp = create_edge_mcp(state, hub, client, audit, _Reporter(),
+                          Brake(state, hub, client, audit))
+    result = await mcp.call_tool("get_connector_status", {})
+    text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+    doc = json.loads(text)
+    assert "upgrade the platform" in doc["schema_error"].lower()
+    assert str(BUNDLE_SCHEMA) in doc["schema_error"]
 
 
 def test_build_hub_exports_agent_token_env(tmp_path, monkeypatch):
@@ -183,6 +214,13 @@ async def test_write_tool_edge_client_error_returns_is_error_json(tmp_path):
     assert "revoked" in doc["error"]
 
 
+DEMO_SPEC = ConnectorSpec(
+    id="demo", kind="mcp-http", role="broker",
+    capabilities={"get_quote": Capability(
+        tool="get_quotes", args={"symbols": "symbols"}, items=["quotes"],
+        fields={"symbol": ["symbol"], "price": ["price"]})})
+
+
 def _supervised_position(**over) -> dict:
     # expires_at is an epoch float, the way warrant.build_warrant_payload
     # writes it, because `guarded` reads it now: an ISO string is not a clock
@@ -206,6 +244,9 @@ async def test_get_open_risk_reports_positions_with_live_prices(tmp_path):
     record(state, _supervised_position())
 
     class QuoteHub:
+        def spec(self, connector_id):
+            return DEMO_SPEC
+
         async def call(self, connector_id, tool, args, **kw):
             assert tool == "get_quotes"
             return {"data": {"quotes": [{"symbol": "AAPL", "price": 92.0}]}}
@@ -230,26 +271,143 @@ async def test_get_open_risk_reports_positions_with_live_prices(tmp_path):
     assert out["portfolio_heat"] == row["open_risk"]
 
 
-async def test_the_quote_read_goes_through_the_named_constant(tmp_path, monkeypatch):
-    """The one tool name the brake's whole existence depends on lives in a
-    single named place, because it has to be classified read-only in the
-    guardrail config or the read is denied and the brake goes blind in
-    silence."""
-    import nakagai_edge.edge.runtime as runtime
+# ---- the quote feed goes through each connector's own map -----------------
+#
+# The read the brake's whole existence depends on. Whatever tool a connector's
+# `get_quote` entry names must still be classified read-only, or the edge's own
+# guardrails deny it and the brake goes blind in silence; brake.tick's famine
+# signal is what makes that audible.
+
+QUOTE_SPECS = load_specs({"connectors": [ALIEN_CONNECTOR, ROBINHOOD_CONNECTOR]})
+
+QUOTE_PAYLOADS = {
+    # The alien broker wraps nothing and spells every field its own way.
+    "ticker": {"ticks": [{"tkr": "aapl", "last": "92.00"}]},
+    # Robinhood nests its own {"data": ..., "guide": ...} envelope, which the
+    # map roots at rather than anything in runtime.py peeling it.
+    "get_quotes": {
+        "data": {"quotes": [{"symbol": "MSFT",
+                             "last_trade_price": "310.50"}]},
+        "guide": "ignore me"},
+}
+
+
+class MapQuoteHub:
+    """Answers through the real connector maps, keyed by the tool asked for."""
+
+    def __init__(self, payloads=None, fail=frozenset()):
+        self.calls = []
+        self.payloads = QUOTE_PAYLOADS if payloads is None else payloads
+        self.fail = fail
+
+    def spec(self, connector_id):
+        return QUOTE_SPECS[connector_id]
+
+    async def call(self, connector_id, tool, args, **kw):
+        self.calls.append((connector_id, tool, dict(args)))
+        if connector_id in self.fail:
+            raise RuntimeError(f"{connector_id} is not answering")
+        return {"data": self.payloads[tool]}
+
+
+def _two_brokers(tmp_path):
+    """One supervised position on each connector, distinct symbols."""
     from nakagai_edge.edge.supervision import record
     state = _state(tmp_path)
-    record(state, _supervised_position())
-    monkeypatch.setattr(runtime, "QUOTE_TOOL", "get_market_quotes")
+    record(state, _supervised_position(connector_id="alien-broker",
+                                       symbol="AAPL", account="AL-1"))
+    record(state, _supervised_position(position_id="ap_2",
+                                       connector_id="robinhood-trading",
+                                       symbol="MSFT", account="463605220"))
+    return state
 
-    asked = []
 
-    class QuoteHub:
-        async def call(self, connector_id, tool, args, **kw):
-            asked.append(tool)
-            return {"data": {"quotes": []}}
+async def test_quotes_dial_each_connectors_own_quote_tool(tmp_path):
+    """`ticker` with `tickers` for the alien broker, `get_quotes` with
+    `symbols` for Robinhood, and the same canonical quote shape out of both.
 
-    await runtime._quotes(QuoteHub(), state, ["AAPL"])
-    assert asked == ["get_market_quotes"]
+    The tool name and the argument key both come from the map, and both are
+    asserted: a broker handed the right tool under the wrong argument key
+    answers about nothing at all, and the brake then goes quiet in exactly the
+    way a working brake looks from outside.
+    """
+    import nakagai_edge.edge.runtime as runtime
+    state = _two_brokers(tmp_path)
+    hub = MapQuoteHub()
+
+    quotes = await runtime._quotes(hub, state, ["AAPL", "MSFT"])
+
+    by_tool = {tool: args for _, tool, args in hub.calls}
+    assert by_tool == {"ticker": {"tickers": ["AAPL"]},
+                       "get_quotes": {"symbols": ["MSFT"]}}
+    assert set(quotes) == {"AAPL", "MSFT"}
+    assert quotes["AAPL"]["price"] == 92.00
+    assert quotes["MSFT"]["price"] == 310.50
+    for quote in quotes.values():
+        # The full normalized shape, not a bare price: usable() needs the
+        # receipt time and the book to judge freshness and spread.
+        assert set(quote) == {"price", "bid", "ask", "ts"}
+        assert quote["ts"] > 0
+
+
+async def test_a_connector_that_will_not_answer_costs_only_its_own_symbols(
+        tmp_path):
+    """No quote means no tick for that symbol, which means no fire. That is
+    the safe direction but not a quiet one: the missing symbol is what
+    brake.tick counts toward its famine signal. The other connector's
+    positions must still be priced."""
+    import nakagai_edge.edge.runtime as runtime
+    state = _two_brokers(tmp_path)
+    hub = MapQuoteHub(fail={"alien-broker"})
+
+    quotes = await runtime._quotes(hub, state, ["AAPL", "MSFT"])
+
+    assert set(quotes) == {"MSFT"}, "the sweep survives one dead connector"
+
+
+async def test_a_connector_declaring_no_get_quote_is_skipped_with_a_reason(
+        tmp_path, caplog):
+    """A connector with no `get_quote` entry cannot be asked to guess one. It
+    is skipped by name in the log, not dialed on a hopeful tool name, and it
+    does not take the other connectors' quotes down with it."""
+    import nakagai_edge.edge.runtime as runtime
+    state = _two_brokers(tmp_path)
+    hub = MapQuoteHub()
+    hub.spec = lambda cid: (
+        ConnectorSpec(id=cid, kind="mcp-http", role="broker")
+        if cid == "alien-broker" else QUOTE_SPECS[cid])
+
+    with caplog.at_level(logging.WARNING, logger="nakagai.edge"):
+        quotes = await runtime._quotes(hub, state, ["AAPL", "MSFT"])
+
+    assert set(quotes) == {"MSFT"}
+    assert [c[0] for c in hub.calls] == ["robinhood-trading"], (
+        "an unmapped connector must not be dialed on a guessed tool name")
+    assert "alien-broker" in caplog.text and "get_quote" in caplog.text
+
+
+async def test_a_quote_payload_the_map_cannot_read_is_famine_not_an_empty_book(
+        tmp_path, caplog):
+    """An answer this connector's map cannot read must reach the brake as
+    silence, not as a quote list that happens to be empty.
+
+    `extract` returns None rather than [] for a payload that holds no list
+    where the map says one lives. Iterating that would raise inside the sweep
+    and take the OTHER connector's quotes down with it; coercing it back to []
+    would be worse, because a broker whose shape changed under a stale map
+    would look exactly like a market with nothing to say and the famine signal
+    would never fire.
+    """
+    import nakagai_edge.edge.runtime as runtime
+    state = _two_brokers(tmp_path)
+    hub = MapQuoteHub(payloads={**QUOTE_PAYLOADS,
+                                "ticker": {"ticks": {"tkr": "aapl"}}})
+
+    with caplog.at_level(logging.WARNING, logger="nakagai.edge"):
+        quotes = await runtime._quotes(hub, state, ["AAPL", "MSFT"])
+
+    assert set(quotes) == {"MSFT"}, "one unreadable answer, one live connector"
+    assert "alien-broker" in caplog.text
 
 
 async def test_get_open_risk_keeps_terminal_records_out_of_the_heat(tmp_path):
@@ -384,3 +542,240 @@ async def test_get_open_risk_is_self_consistent_after_a_per_position_disarm(tmp_
     guarded_ids = {r["position_id"] for r in out["positions"] if r["guarded"]}
     assert not (guarded_ids & set(out["disarmed_positions"]))
     assert out["positions"][0]["guarded"] is False
+
+
+# ---- the tool schemas the platform cannot fetch for itself ----------------
+#
+# The platform never dials a broker, so a connector's tool list and JSON
+# schemas reach it only if this edge ships them. They ride the connector
+# report, not the agent-facing status tools: `list_connectors` is read by an
+# agent that pays tokens for every byte, and `list_connector_tools` already
+# serves the schemas per connector, on demand.
+
+SPEC = {"id": "demo", "kind": "mcp-http", "role": "broker",
+        "url": "https://example.test/mcp/", "enabled": True}
+
+LISTED_TOOL = {
+    "name": "get_account",
+    "title": "Get account",
+    "description": "Balances for one account",
+    "inputSchema": {"type": "object",
+                    "properties": {"account": {"type": "string"}}},
+    "outputSchema": {"type": "object"},
+    "annotations": {"readOnlyHint": True},
+    "_meta": {"noise": True},
+}
+
+
+def test_to_dict_carries_each_tools_name_description_and_schema():
+    from nakagai_edge.hub import Connection
+    row = Connection(spec=ConnectorSpec(**SPEC), status="connected",
+                     tools=[LISTED_TOOL]).to_dict(with_tools=True)
+    assert row["tool_count"] == 1
+    # Exactly three keys: outputSchema, annotations and _meta are the
+    # downstream's business, and shipping them would put bytes on the wire
+    # every cycle that nothing upstream reads.
+    assert row["tools"] == [{
+        "name": "get_account",
+        "description": "Balances for one account",
+        "inputSchema": {"type": "object",
+                        "properties": {"account": {"type": "string"}}}}]
+
+
+def test_to_dict_leaves_the_schemas_out_unless_they_are_asked_for():
+    from nakagai_edge.hub import Connection
+    row = Connection(spec=ConnectorSpec(**SPEC), status="connected",
+                     tools=[LISTED_TOOL]).to_dict()
+    assert "tools" not in row and row["tool_count"] == 1
+
+
+def test_to_dict_of_a_connector_that_never_connected_still_has_a_tool_list():
+    from nakagai_edge.hub import Connection
+    row = Connection(spec=ConnectorSpec(**SPEC)).to_dict(with_tools=True)
+    assert row["status"] == "disconnected"
+    assert row["tools"] == [] and row["tool_count"] == 0
+
+
+def test_a_tool_that_publishes_no_description_or_schema_still_reports_both_keys():
+    # A predictable payload: the platform reads three keys off every entry
+    # rather than three keys off some of them.
+    from nakagai_edge.hub import Connection
+    row = Connection(spec=ConnectorSpec(**SPEC), status="connected",
+                     tools=[{"name": "ping"}]).to_dict(with_tools=True)
+    assert row["tools"] == [{"name": "ping", "description": "", "inputSchema": {}}]
+
+
+LIVE_BUNDLE = {"bundle_version": "v1", "schema_version": BUNDLE_SCHEMA,
+               "connectors": {"connectors": [ROBINHOOD_CONNECTOR]},
+               "signing_public_key": "k"}
+
+
+def _live_connector(tmp_path, handler=None):
+    """A hub whose robinhood connector is CONNECTED and has published a schema.
+
+    Nothing is dialed: the Connection is placed by hand in exactly the state a
+    successful `_run_connection` leaves behind (status connected, `tools`
+    snapshotted from the downstream's list_tools). Without a live one, every
+    assertion about the schemas is vacuous: an unconnected connector carries an
+    empty tool list, so `inputSchema` is absent from every payload whatever the
+    flags say.
+
+    The bundle is synced through `sync_once` rather than `apply_bundle` because
+    that is what stamps `fetched_at`, and without a fresh stamp `list_connectors`
+    answers the stale-policy refusal instead of a connector list, which is
+    another way for these assertions to pass while proving nothing.
+    """
+    from nakagai_edge.hub import Connection
+
+    def _bundle_only(req):
+        if req.url.path == "/api/agent/bundle":
+            return httpx.Response(200, json=LIVE_BUNDLE, headers={"etag": "v1"})
+        return httpx.Response(404, json={"detail": "?"})
+
+    state = EdgeState(tmp_path)
+    state.save_agent("https://api.test", "ag1", "nk_agent_t")
+    client = PlatformClient("https://api.test", "t",
+                            transport=httpx.MockTransport(handler or _bundle_only))
+    assert sync_once(state, client) is True
+    hub = build_hub(state, client)
+    hub._conns["robinhood-trading"] = Connection(
+        spec=hub.spec("robinhood-trading"), status="connected",
+        tools=[LISTED_TOOL])
+    return state, client, hub
+
+
+async def test_a_live_connectors_schemas_reach_the_platform_and_not_the_agent(
+        tmp_path):
+    """Both halves of the split, asserted off one live connector.
+
+    The platform can NEVER read a broker's schemas for itself, so the syncer's
+    call has to carry them. `list_connectors` answers "which broker can be
+    asked what" to an agent that pays tokens for every byte, and
+    `list_connector_tools` already serves the schemas per connector on demand,
+    so the same call must not carry them there.
+    """
+    state, client, hub = _live_connector(tmp_path)
+    audit = EdgeAudit(state)
+    mcp = create_edge_mcp(state, hub, client, audit, _Reporter(),
+                          Brake(state, hub, client, audit))
+
+    reported = hub.status(with_tools=True)["connectors"]
+    row = next(c for c in reported if c["id"] == "robinhood-trading")
+    assert row["status"] == "connected"
+    assert row["tools"] == [{"name": "get_account",
+                             "description": "Balances for one account",
+                             "inputSchema": LISTED_TOOL["inputSchema"]}]
+
+    for tool in ("list_connectors", "get_connector_status"):
+        result = await mcp.call_tool(tool, {})
+        text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+        # The connector itself must be in the answer, or this proves nothing:
+        # a stale-policy refusal carries no schemas either.
+        assert "robinhood-trading" in text, f"{tool} never answered"
+        assert "inputSchema" not in text, f"{tool} shipped downstream schemas"
+        assert "get_account" not in text, f"{tool} shipped downstream tool names"
+
+
+async def test_the_syncer_ships_a_live_connectors_schemas_upstream(
+        tmp_path, monkeypatch):
+    """The one path that carries a broker's schemas off this machine.
+
+    Everything else in this file proves the hub CAN produce them. This proves
+    the loop actually asks: the platform has no other source, so a syncer that
+    stopped passing `with_tools` would leave the capability-map derivation with
+    nothing to read, and nothing anywhere would go red.
+    """
+    import nakagai_edge.edge.runtime as runtime
+    monkeypatch.setattr(runtime, "SYNC_INTERVAL_S", 0.01)
+    seen = []
+
+    def handler(req):
+        if req.url.path == "/api/agent/connectors":
+            seen.append(json.loads(req.content)["connectors"])
+            return httpx.Response(200, json={"ok": True, "connectors": 1})
+        if req.url.path == "/api/agent/bundle":
+            return httpx.Response(200, json=LIVE_BUNDLE, headers={"etag": "v1"})
+        return httpx.Response(404, json={"detail": "?"})
+
+    state, client, hub = _live_connector(tmp_path, handler)
+    audit = EdgeAudit(state)
+    tasks = await runtime._loops(state, hub, client, audit, _Reporter(),
+                                 Brake(state, hub, client, audit))
+    for _ in range(200):
+        if seen:
+            break
+        await asyncio.sleep(0.01)
+    for t in tasks:
+        t.cancel()
+    for t in tasks:
+        with contextlib.suppress(asyncio.CancelledError):
+            await t
+
+    assert seen, "the syncer never reported connector status"
+    row = next(c for c in seen[0] if c["id"] == "robinhood-trading")
+    assert row["tools"] == [{"name": "get_account",
+                             "description": "Balances for one account",
+                             "inputSchema": LISTED_TOOL["inputSchema"]}]
+    await hub.aclose()
+
+
+def test_status_carries_the_flag_to_every_row_it_builds(tmp_path):
+    """`with_tools` is a property of the call, not of one branch inside it: a
+    registered connector with no live Connection object gets the same treatment
+    as one that has it. The client decides what to SAY about a connector that
+    is not connected; the hub reports uniformly."""
+    _, _, hub = _live_connector(tmp_path)
+    hub._conns.clear()      # registered, never dialed: the placeholder branch
+    rows = hub.status(with_tools=True)["connectors"]
+    assert [r["status"] for r in rows] == ["disconnected"]
+    assert rows[0]["tools"] == []
+
+
+async def test_the_syncer_survives_a_report_that_raises(tmp_path, monkeypatch, caplog):
+    """The connector report is best-effort and the syncer runs forever: one
+    uncaught exception out of it would kill every later sync too, not just
+    this cycle's report. The schema guard runs inside that call, so it must
+    not become a new way for the loop to die."""
+    import nakagai_edge.edge.runtime as runtime
+    monkeypatch.setattr(runtime, "SYNC_INTERVAL_S", 0.01)
+    state = _state(tmp_path)
+    calls = {"bundle": 0, "report": 0}
+
+    def handler(req):
+        if req.url.path == "/api/agent/bundle":
+            calls["bundle"] += 1
+            return httpx.Response(200, json={"bundle_version": "v1",
+                                             "schema_version": BUNDLE_SCHEMA,
+                                             "connectors": {"connectors": []},
+                                             "signing_public_key": "k"},
+                                  headers={"etag": "v1"})
+        return httpx.Response(404, json={"detail": "?"})
+
+    client = PlatformClient("https://api.test", "t",
+                            transport=httpx.MockTransport(handler))
+
+    def boom(connectors):
+        calls["report"] += 1
+        raise RuntimeError("the schema guard blew up")
+
+    client.report_connectors = boom
+    hub = build_hub(state, client)
+    audit = EdgeAudit(state)
+
+    caplog.set_level(logging.WARNING, logger="nakagai.edge")
+    tasks = await runtime._loops(state, hub, client, audit, _Reporter(),
+                                 Brake(state, hub, client, audit))
+    for _ in range(200):
+        if calls["report"] >= 2:
+            break
+        await asyncio.sleep(0.01)
+    for t in tasks:
+        t.cancel()
+    for t in tasks:
+        with contextlib.suppress(asyncio.CancelledError):
+            await t
+
+    assert calls["report"] >= 2, "the loop died on the first raising report"
+    assert calls["bundle"] >= 2, "sync_once stopped running too, not just the report"
+    assert any("connector" in r.message.lower() for r in caplog.records)
+    await hub.aclose()

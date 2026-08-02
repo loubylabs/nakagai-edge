@@ -58,20 +58,33 @@ def test_confirmation_needs_two_consecutive_breaches_by_default():
     assert confirmed(2) is True
 
 
-def test_a_quote_payload_is_normalized_from_common_broker_shapes():
+def test_a_mapped_quote_row_is_stamped_and_carries_its_book():
+    # The row arrives through the connector's map, so the fields are already
+    # canonical and already floats. All this adds is the receipt time.
     assert normalize_quote(
-        {"last_trade_price": "46.10", "bid_price": "46.09",
-         "ask_price": "46.11"}, NOW)["price"] == 46.10
+        {"symbol": "AAPL", "price": 46.10, "bid": 46.09, "ask": 46.11},
+        NOW) == {"price": 46.10, "bid": 46.09, "ask": 46.11, "ts": NOW}
+
+
+def test_a_row_still_wearing_the_brokers_own_key_names_normalizes_to_nothing():
+    # Locating the price is the map's job now, and it is the only place an
+    # owner can fix it. A second guess at the spelling here would be a second
+    # answer to the same question, and the two would drift.
+    assert normalize_quote({"last_trade_price": 46.10}, NOW) is None
 
 
 def test_an_unreadable_quote_payload_normalizes_to_nothing():
     assert normalize_quote({"nope": 1}, NOW) is None
     assert normalize_quote(None, NOW) is None
+    # coerce() drops anything it cannot turn into a finite float, so a string
+    # here means the map never read it. Parsing it anyway would resurrect the
+    # very value the capability layer refused.
+    assert normalize_quote({"price": "46.10"}, NOW) is None
 
 
 def test_a_quote_straight_out_of_normalize_quote_with_stale_received_at_is_refused():
     normalized = normalize_quote(
-        {"price": "46.10", "bid": "46.09", "ask": "46.11"}, NOW - 120.0)
+        {"price": 46.10, "bid": 46.09, "ask": 46.11}, NOW - 120.0)
     assert "stale" in usable(normalized, 46.50, NOW)
 
 

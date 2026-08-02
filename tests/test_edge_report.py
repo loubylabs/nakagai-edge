@@ -1,9 +1,11 @@
 """Each sync cycle, the edge tells the platform what it can reach.
 
 The edge holds the broker credential; the platform never does. What crosses
-the wire is `hub.status()`'s connector list: id/name/kind/role/status/
-tool_count/last_error/allow_writes/auth_mode. auth_mode is a label
-(none/bearer/headers/oauth), never the token or header value itself.
+the wire is `hub.status(with_tools=True)`'s connector list: id/name/kind/role/
+status/tool_count/last_error/allow_writes/auth_mode, plus each downstream
+tool's name/description/inputSchema on the cycles where those changed.
+auth_mode is a label (none/bearer/headers/oauth), never the token or header
+value itself.
 """
 
 import asyncio
@@ -23,7 +25,7 @@ from nakagai_edge.edge.brake import Brake
 from nakagai_edge.edge.client import PlatformClient
 from nakagai_edge.edge.runtime import _loops, build_hub
 from nakagai_edge.edge.state import EdgeState
-from nakagai_edge.edge.sync import apply_bundle
+from nakagai_edge.edge.sync import BUNDLE_SCHEMA, apply_bundle
 import nakagai_edge.edge.runtime as runtime
 
 pytestmark = pytest.mark.anyio
@@ -60,7 +62,7 @@ def test_report_connectors_posts_the_status_list():
 # every sync, same 60s wake, no second interval) actually lives.
 
 CONNECTORS_BUNDLE = {
-    "bundle_version": "v1",
+    "bundle_version": "v1", "schema_version": BUNDLE_SCHEMA,
     "connectors": {"connectors": [
         {"id": "robinhood-trading", "name": "Robinhood", "kind": "mcp-http",
          "role": "broker", "url": "https://demo.test/mcp", "enabled": True},
@@ -118,7 +120,16 @@ async def test_syncer_reports_hub_status_connectors_each_cycle(tmp_path, monkeyp
     await _run_briefly_then_cancel(tasks, lambda: len(seen) >= 1)
 
     assert seen, "the syncer never reported connector status"
-    assert seen[0] == {"connectors": hub.status()["connectors"]}
+    # What the syncer hands the client, minus the one transformation the client
+    # makes on the way out: this connector never connected (nothing here dials
+    # a real broker), and report_connectors says nothing at all about the tools
+    # of a connector this edge is not in touch with, rather than reporting an
+    # empty list the platform could read as "the broker lost its tools".
+    expected = hub.status(with_tools=True)["connectors"]
+    for row in expected:
+        assert row["status"] != "connected"
+        assert row.pop("tools") == []
+    assert seen[0] == {"connectors": expected}
     assert seen[0]["connectors"][0]["id"] == "robinhood-trading"
 
     # Pin the wire contract: the edge's Connection.to_dict() and the
@@ -127,13 +138,27 @@ async def test_syncer_reports_hub_status_connectors_each_cycle(tmp_path, monkeyp
     # field and leave ConnectorReport.tool_count at its default of 0. The edge
     # sends server_info as an extra key (deliberately dropped by extra="ignore"),
     # so we allow it as an exception to the field-set check.
+    #
+    # `capabilities` is the second such exception: the edge reports what each
+    # connector can be asked to do in the shared vocabulary, and the platform
+    # drops it until ConnectorReport carries a field for it. Delete it from
+    # this set (not from to_dict) once the platform reads it.
+    #
+    # `tools` and `tools_unchanged` are the third and fourth, and they are a
+    # pair: for a CONNECTED connector the edge ships each downstream tool's
+    # name, description and inputSchema, which is the only way those schemas
+    # can ever reach a platform that never dials a broker, and says
+    # `tools_unchanged: true` instead on the cycles where they are what it last
+    # accepted. Neither key appears on the row below, whose connector never
+    # connected. Delete both once ConnectorReport models them.
+    extras = {"server_info", "capabilities", "tools", "tools_unchanged"}
     connector_on_wire = seen[0]["connectors"][0]
     expected_keys = set(ConnectorReport.model_fields)
     wire_keys = set(connector_on_wire)
     assert expected_keys <= wire_keys, (
         f"missing required fields: {expected_keys - wire_keys}")
-    assert wire_keys <= expected_keys | {"server_info"}, (
-        f"unexpected fields on wire: {wire_keys - expected_keys - {'server_info'}}")
+    assert wire_keys <= expected_keys | extras, (
+        f"unexpected fields on wire: {wire_keys - expected_keys - extras}")
 
     # No credential can ride along: only the label-shaped fields hub.status()
     # produces are on the wire, never a token, header, or auth value.

@@ -97,6 +97,138 @@ Notes that matter:
 The platform never holds a broker credential at any point in this chain. It
 authorizes; the edge acts.
 
+## The capability layer
+
+A broker connector is a downstream MCP server with its own name for everything:
+its own tool for placing an order, its own key for an account, its own field
+for a position's quantity. When those names live in the edge, a second broker
+is not a config change, and the failure is not a loud one. The brake stops
+seeing positions while every display goes on reporting them as guarded.
+
+So the edge knows seven things a broker can be asked to do, and nothing about
+how any particular broker spells them: `list_accounts`, `get_balance`,
+`list_positions`, `get_quote`, `list_orders`, `place_order`, `cancel_order`.
+
+Code owns the meaning and the type of every canonical field. `quantity` is a
+number, `symbol` is upper-cased, `side` is `buy` or `sell`. A connector's map
+owns location only: which downstream tool, which argument keys, which response
+paths. That split is the safety property. A wrong map produces a visibly wrong
+number or an extraction failure; it can never make `quantity` mean notional.
+
+**The vocabulary is closed on purpose.** These seven cover shares. Options,
+futures and crypto each need their own notional math and their own envelope
+reasoning before they can be let in. Four option contracts at $2.50 compute as
+$10 of notional against a $2,000 per-order cap, when the real exposure is
+$1,000: an option's notional is contracts times premium times the 100
+multiplier. A broker that adds futures tomorrow is refused by default rather
+than waved through under a notional nobody checked.
+
+**Adding a broker is data, not code.** A connector declares its map in the
+registry, so a new brokerage is a registry entry rather than a release of this
+package:
+
+```yaml
+- id: alien-broker
+  kind: mcp-http
+  role: broker
+  capabilities:
+    list_positions:
+      tool: holdings
+      args: {account: acct}
+      items: [holdings]
+      fields:
+        symbol: [ticker]
+        quantity: [qty]
+        avg_price: [cost]
+    place_order:
+      tool: submit
+      args:
+        symbol: ticker
+        side: action
+        quantity: qty
+        price: limit
+        stop: trigger
+        account: acct
+      values:
+        side:
+          buy: [BUY]
+          sell: [SELL]
+      market_args: {kind: MARKET}
+```
+
+**A `place_order` map has to name all five order keys**: symbol, side,
+quantity, price and stop. The edge reads an executed entry back through them to
+build the ledger record the brake watches, so a map missing one places real
+orders that are then supervised by nothing, absent from `get_open_risk` while
+the Portfolio page still lists them. A connector declaring an incomplete
+`place_order` is refused when the registry is parsed, by name and by which keys
+are missing, rather than found later by a position that had no stop watching
+it. A connector that places no orders at all simply declares no `place_order`.
+
+**The order inside `values.side` is load-bearing.** The list is every spelling
+this connector recognizes when it reads a side back off an order, and the first
+entry is the single spelling the edge sends when it places one or builds a
+stop's exit. So list them all, and put first the one that is correct whether the
+order opens or closes. A broker with separate verbs mapped as
+`buy: [BUY_TO_OPEN, BUY_TO_COVER]` sends `BUY_TO_OPEN` for every buy, including
+the one meant to cover a short.
+
+The agent gets seven named tools it learns once and uses against any broker.
+`connector_id` is optional only while exactly one enabled broker declares the
+capability. Enable a second and the edge stops filling it in: the call comes
+back naming both candidates and the agent has to say which brokerage it meant.
+Letting registry order decide which broker received an order is not something
+an agent can review or an owner can predict, so this is the one place the layer
+gets louder rather than quieter as brokers are added.
+
+`call_connector` remains the raw escape hatch: a broker tool outside the
+vocabulary is still reachable by its own name, through the same guardrails, the
+same approval queue, and the same audit record.
+
+**Three read-only classifications, each of which fails silently.** An
+unclassified tool counts as a write (`unknown_is_write`, fail closed), and
+`check_accounts` denies a write that names no account whenever account tiers
+exist. That pair is right for an agent and wrong for the edge acting on its own
+behalf, so any tool the edge dials for itself has to be classified read-only,
+either by the downstream server's own `readOnlyHint` or by the owner's
+`read_only_tools` glob:
+
+- **A connector's `get_quote` tool.** Otherwise the brake goes blind: no price,
+  no breach, no fire, and every display still saying guarded.
+- **A connector's `list_accounts` tool.** Otherwise account inference enqueues
+  an approval instead of answering the question it was asked.
+- **Anything else the edge dials on its own behalf**, for the same reason. The
+  map moved the tool names out of the edge; it did not move this requirement,
+  which now has to hold once per connector rather than once in total.
+
+**The bundle schema gate.** The edge refuses a policy bundle whose
+`schema_version` it does not understand. `ConnectorSpec` reaches the platform
+through PyPI and pydantic ignores unknown fields, so an edge running ahead of
+the platform would parse the older bundle cleanly and simply not find what the
+newer shape carries. Losing the capability map that builds a stop's exit order
+records every supervised position as unguarded while every display still calls
+it guarded. Refusing beats half-understanding. A refused bundle leaves the
+previous registry untouched and does not stamp freshness, so the cached policy
+goes on aging and everything is refused once the TTL lapses. `edge sync`
+reports the refusal on the spot and
+`edge status` carries a `schema_error` until a sync succeeds; the fix is to
+upgrade whichever side is behind, or pin an older `nakagai-edge`.
+
+**Two things a registry entry must get right.** Both are the connector author's
+job and both fail silently:
+
+- **Every broker connector must declare `place_order.values.side`.** There is
+  no default buy/sell vocabulary any more. There used to be a
+  Robinhood-flavored one, and it would have quietly mistranslated the next
+  broker's spelling. Without it an entry's side cannot be classified and the
+  position is recorded `blocked` with the anomaly "unclassifiable order side":
+  visible, unguarded, and never acted on.
+- **A connector whose responses are enveloped must root its scalar capabilities
+  with `items:`.** Robinhood wraps everything in `{"data": ..., "guide": ...}`,
+  so its `get_balance` needs `items: [data]` and unprefixed field paths beneath
+  it. Without that the raw figures ship with the envelope still on and the
+  Portfolio page renders blank.
+
 ## The brake
 
 Every out-of-sample number in Nakagai's evidence store was measured on a
@@ -130,9 +262,16 @@ nakagai-edge brake on                  # re-arm
 The brake does not promise the level. A gap opens a position under its stop and
 the exit goes off at the market, below it. That is what a stop is.
 
-A connector must declare an `order_shape` with `market_order_args` before its
-positions can be supervised. Without it, positions are recorded as unguarded
-and reported that way rather than silently ignored.
+A connector must declare a `place_order` capability with `market_args` before
+its positions can be supervised, and the two halves of that fail differently.
+A connector that declares `place_order` but no `market_args` still gets a
+ledger record: there is no exit order to build, so the position is recorded
+unguarded, listed that way by `get_open_risk`, and shown that way on the
+Portfolio page. A connector that declares no `place_order` at all leaves no
+ledger record to make, so its positions are absent from `get_open_risk`
+entirely; the Portfolio page still shows them unguarded, because a position
+with no record cannot be marked guarded. The Portfolio page is the surface that
+sees both, so it is the one to check before assuming a stop is being watched.
 
 ## Failure modes
 

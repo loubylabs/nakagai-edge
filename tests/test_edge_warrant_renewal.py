@@ -94,13 +94,13 @@ def test_an_unclassifiable_position_is_absent_from_the_renewal_request(tmp_path)
 # Three times now, a rule enforced at the entry path has been quietly undone
 # downstream. `blocked` is written once at entry and never cleared, so the
 # renewal path cannot re-arm a record the edge established it can never act
-# on. These use the market_order_args case on purpose: its direction and
+# on. These use the market_args case on purpose: its direction and
 # account are both perfectly good, so only `blocked` can catch it.
 
 
 def _blocked_rec(**over):
-    return _rec(blocked="connector declares no market_order_args",
-                anomaly="connector declares no market_order_args",
+    return _rec(blocked="connector declares no market_args",
+                anomaly="connector declares no market_args",
                 warrant=None, state="unguarded", **over)
 
 

@@ -60,22 +60,40 @@ def _sync_step(state) -> int:
     Raises EdgeClientError when the pull itself failed.
 
     sync_once swallows every error and returns False, and it returns False on a
-    304 as well, so its return value cannot tell us which happened. Two disk
-    facts can. A missing registry means this edge has never synced at all. And
+    304 as well, so its return value cannot tell us which happened. Three disk
+    facts can. A missing registry means this edge has never synced at all.
     fetched_at, which sync_once advances only when the platform answered (a 200
     or a 304), means the pull reached the platform: on an edge that synced
     before, the registry is on disk either way, so this stamp is the only thing
-    separating a fresh answer from a dead platform.
+    separating a fresh answer from a dead platform. And schema_error_at means
+    the platform answered with a bundle we would not take.
+
+    All three are read either side of the call, never as absolute state, so
+    what gets reported is what this sync did rather than whatever the edge was
+    already carrying.
     """
     import yaml as _yaml
 
     from nakagai_edge.edge.client import EdgeClientError
-    from nakagai_edge.edge.sync import fetched_at, sync_once
+    from nakagai_edge.edge.sync import (fetched_at, schema_error, schema_error_at,
+                                        sync_once)
     client = _edge_client(state)
     if client is None:
         raise EdgeClientError("edge is not paired")
     before = fetched_at(state)
+    before_refusal = schema_error_at(state)
     sync_once(state, client)
+    # A refused bundle is the more specific fault, and it has to be named
+    # first: it leaves fetched_at exactly where a dead platform would, so the
+    # generic message below would send the owner checking a URL that is fine.
+    #
+    # Only a refusal from THIS call, though. The reason stays on record until a
+    # sync succeeds, and repeating it through a later outage tells an owner who
+    # has just upgraded the platform that their upgrade did not take, which is
+    # the same wrong-fault-naming arriving from the other side. The timestamp
+    # advances on every refusal, so a genuine repeat still reports honestly.
+    if schema_error_at(state) > before_refusal:
+        raise EdgeClientError(f"sync failed: {schema_error(state)}")
     path = state.root / "config" / "connectors.yaml"
     if not path.exists():
         raise EdgeClientError(
@@ -202,7 +220,9 @@ def _cmd_setup(args) -> int:
         try:
             count = _sync_step(state)
         except EdgeClientError as e:
-            print(f"  x  sync failed: {e}")
+            # Every _sync_step message already opens with "sync failed:", so
+            # prefixing one here reads "sync failed: sync failed: ...".
+            print(f"  x  {e}")
             return 1
         print(f"  v  synced     {count} connectors")
     else:
@@ -250,14 +270,28 @@ def _cmd_status(args) -> int:
     import json as _json
 
     from nakagai_edge.edge.state import EdgeState, default_root
-    from nakagai_edge.edge.sync import meta, policy_fresh
+    from nakagai_edge.edge.sync import meta, policy_fresh, schema_error
     state = EdgeState(default_root())
     agent = state.agent()
-    print(_json.dumps({"paired": agent is not None,
-                       "agent_id": (agent or {}).get("agent_id", ""),
-                       "platform_url": (agent or {}).get("platform_url", ""),
-                       "policy_fresh": policy_fresh(state),
-                       "meta": meta(state), "root": str(state.root)}, indent=2))
+    out = {"paired": agent is not None,
+           "agent_id": (agent or {}).get("agent_id", ""),
+           "platform_url": (agent or {}).get("platform_url", ""),
+           "policy_fresh": policy_fresh(state),
+           "meta": meta(state), "root": str(state.root)}
+    # Promoted beside policy_fresh, and only when there is one. A refused
+    # bundle otherwise shows up here as nothing but `policy_fresh: false`,
+    # which reads as an unreachable platform and sends the owner debugging a
+    # network that is fine. The message carries its own fix.
+    #
+    # It does print twice, since `meta` above is a verbatim dump of
+    # cache/meta.json and that file is where the reason lives. The copy earns
+    # its place: `meta` stays the file exactly as it is on disk, which is what
+    # makes it worth pasting into a bug report, and popping a key out of it
+    # here would make it a curated view that quietly lies about the file and
+    # traps whoever adds the next meta key. Two lines of noise beats that.
+    if (refused := schema_error(state)):
+        out["schema_error"] = refused
+    print(_json.dumps(out, indent=2))
     return 0
 
 

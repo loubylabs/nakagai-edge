@@ -21,6 +21,7 @@ import logging
 import math
 import time
 
+from nakagai_edge.capability import CapabilityError, first, read_partial, resolve
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.supervision import claim, load, mark
 from nakagai_edge.edge.sync import cached_bundle, public_key
@@ -36,38 +37,41 @@ BRAKE_INTERVAL_S = 15.0
 QUOTE_FAMINE_TICKS = 8        # two minutes of blindness at that cadence
 NOTIFY_BACKOFF_S = 3600.0     # one owner message per position per reason
 
-_PRICE_KEYS = ("price", "last_trade_price", "last_price", "mark_price", "last")
-_BID_KEYS = ("bid", "bid_price")
-_ASK_KEYS = ("ask", "ask_price")
+
+def _f(value) -> float | None:
+    """One already-mapped numeric field as a float, or None if it is not one.
+
+    A boundary check, not a parser. `capability.coerce` has already turned
+    every readable figure into a finite float and DROPPED whatever it could
+    not, so a string arriving here means the map never read it; parsing it
+    anyway would resurrect the exact value the capability layer refused.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value)
 
 
-def _num(payload: dict, keys) -> float | None:
-    for key in keys:
-        value = payload.get(key)
-        if value in (None, ""):
-            continue
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            continue
-    return None
+def normalize_quote(row, received_at: float) -> dict | None:
+    """A mapped quote row as {price, bid, ask, ts}, or None.
 
+    The row has already been through the connector's `get_quote` map, so
+    `price`, `bid` and `ask` are canonical names carrying canonical floats. No
+    key hunting here: a second guess at where a broker keeps its price would be
+    a second answer to a question the map already owns, and the two would
+    drift. The map is also the only one of the two an owner can fix.
 
-def normalize_quote(payload, received_at: float) -> dict | None:
-    """A broker's quote payload as {price, bid, ask, ts}, or None.
-
-    `received_at` is required, and it is the moment WE got this payload rather
+    `received_at` is required, and it is the moment WE got this row rather
     than any timestamp the broker supplied: brokers rarely stamp a quote, and a
     default here would hand `usable()` a value that silently disables its own
     freshness check.
     """
-    if not isinstance(payload, dict):
+    if not isinstance(row, dict):
         return None
-    price = _num(payload, _PRICE_KEYS)
+    price = _f(row.get("price"))
     if price is None:
         return None
-    return {"price": price, "bid": _num(payload, _BID_KEYS),
-            "ask": _num(payload, _ASK_KEYS), "ts": float(received_at)}
+    return {"price": price, "bid": _f(row.get("bid")),
+            "ask": _f(row.get("ask")), "ts": float(received_at)}
 
 
 def usable(quote: dict, prior_price, now: float, *,
@@ -181,8 +185,6 @@ def clear_local_disarm(state: EdgeState) -> None:
 
 # ---- firing -------------------------------------------------------------
 
-_POSITION_QTY_KEYS = ("quantity", "qty", "shares")
-
 
 def _sent_value(args: dict, keys: list[str]):
     """The first of `keys` present in `args` with a scalar value, or None.
@@ -295,14 +297,14 @@ class Brake:
     async def _note_blind_tick(self, rec: dict, why: str) -> None:
         """Count a tick that produced no usable observation, and say so once.
 
-        A quote read the edge's own guardrails deny (get_quotes classified as a
-        write, then refused for naming no account) looks exactly like a working
-        brake from outside: no price, no breach, no fire, and a display that
-        still says guarded. The elapsed silence is the only thing that tells
-        them apart, so the silence itself has to reach the owner. Reported on
-        the tick that crosses the threshold and not again until a usable quote
-        resets the count: a repeat every 15 seconds is how an owner learns to
-        ignore the channel.
+        A quote read the edge's own guardrails deny (the connector's quote tool
+        classified as a write, then refused for naming no account) looks
+        exactly like a working brake from outside: no price, no breach, no
+        fire, and a display that still says guarded. The elapsed silence is the
+        only thing that tells them apart, so the silence itself has to reach
+        the owner. Reported on the tick that crosses the threshold and not
+        again until a usable quote resets the count: a repeat every 15 seconds
+        is how an owner learns to ignore the channel.
         """
         pid = rec["position_id"]
         self._dry[pid] = dry = self._dry.get(pid, 0) + 1
@@ -312,9 +314,9 @@ class Brake:
         detail = {"position_id": pid, "symbol": rec["symbol"],
                   "ticks": dry, "reason": why}
         self.audit.record("error", rec["connector_id"], "brake", detail)
-        # The connector's quote tool is named in runtime.QUOTE_TOOL, which this
-        # module cannot import (runtime imports this one), so the message says
-        # what to look at rather than quoting the name.
+        # The tool to look at is whatever this connector's own `get_quote` map
+        # names, which differs per broker, so the message says what to check
+        # rather than quoting a name that would be wrong for half of them.
         await self._notify(
             f"The brake has had no usable price for {rec['symbol']} in "
             f"{blind_s}s ({dry} passes): {why}. Nothing is watching that stop "
@@ -331,38 +333,51 @@ class Brake:
         the caller treats that as "do not fire blind", not as a release. 0.0
         is returned only when a genuinely readable position list simply does
         not contain the symbol.
+
+        Which tool to dial and which key the account goes under both come from
+        the connector's `list_positions` map, so a connector that never
+        declared one comes back None here rather than a guess: the raise from
+        `spec.capability` lands in the same catch as an unreachable broker,
+        because both are the same "no answer to read".
+
+        Deliberately NOT `extract`, which would collapse the one distinction
+        this whole function exists for. `extract` DROPS a row whose quantity
+        will not read, and a list missing its row is indistinguishable from a
+        list that never held one: it arrives as 0.0 held, and fire() marks such
+        a record `released`, which is TERMINAL. `extract` no longer confuses an
+        unreadable PAYLOAD with an empty one (it returns None, not [], when the
+        map finds no list where it says one lives), but a dropped row is a hole
+        inside a list it read successfully, and nothing downstream can see it.
+        The peel and the per-row read are done by hand so that "unreadable" can
+        stay distinct from "not held".
         """
         try:
-            out = await self.hub.call(rec["connector_id"], "get_equity_positions",
-                                      {"account_number": rec["account"]})
+            spec = self.hub.spec(rec["connector_id"])
+            cap = spec.capability("list_positions")
+            tool, args = resolve("list_positions", cap,
+                                 {"account": rec["account"]})
+            out = await self.hub.call(rec["connector_id"], tool, args)
         except Exception as e:  # noqa: BLE001
             log.warning("brake could not re-read %s before firing: %s",
                         rec["symbol"], e)
             return None
         payload = (out or {}).get("data")
-        if isinstance(payload, dict) and "data" in payload:
-            payload = payload["data"]
-        if isinstance(payload, dict):
-            payload = payload.get("positions") or payload.get("results") or []
-        if not isinstance(payload, list):
-            # No position list to search at all: an unreadable answer, not
-            # evidence the symbol is gone.
+        rows = first(payload, cap.items) if cap.items else payload
+        if not isinstance(rows, list):
+            # No position list where the map says one lives: an unreadable
+            # answer, not evidence the symbol is gone.
             return None
-        for row in payload:
-            if not isinstance(row, dict):
+        for row in rows:
+            mapped = read_partial("list_positions", cap, row)
+            if mapped.get("symbol") != rec["symbol"]:
                 continue
-            if str(row.get("symbol", "")).upper() != rec["symbol"]:
-                continue
-            for key in _POSITION_QTY_KEYS:
-                if row.get(key) not in (None, ""):
-                    try:
-                        return float(row[key])
-                    except (TypeError, ValueError):
-                        return None
-            # The row that names our symbol carries no key we recognize: we
-            # found the position but cannot read its size, which is "I don't
-            # know", not "it's gone".
-            return None
+            held = mapped.get("quantity")
+            if held is None:
+                # The row that names our symbol carries no size the map could
+                # read: we found the position but cannot size it, which is "I
+                # don't know", not "it's gone".
+                return None
+            return float(held)
         return 0.0
 
     async def _notify(self, text: str) -> None:
@@ -478,8 +493,18 @@ class Brake:
                 f"The brake could not exit {rec['symbol']}: {why_not}. That "
                 f"position is unguarded.", now)
         qty = min(float(held), ceiling)
-        args = exit_order_args(spec.guardrails.order_shape,
-                               rec.get("entry_args") or {}, qty)
+        try:
+            cap = spec.capability("place_order")
+        except CapabilityError as e:
+            # A connector that no longer declares place_order cannot be asked
+            # to guess one, and an uncaught raise here is a brake that does not
+            # fire at all: the position would sit `armed` with its stop already
+            # touched and nothing said to the owner. Refuse by name instead.
+            return await self._refuse(
+                rec, str(e),
+                f"The brake could not exit {rec['symbol']}: {e}. That position "
+                f"is unguarded.", now)
+        args = exit_order_args(cap, rec.get("entry_args") or {}, qty)
         if args is None:
             why_not = "this connector cannot express a market exit"
             return await self._refuse(
@@ -493,13 +518,17 @@ class Brake:
         # warrant covers the bytes actually being sent; checking against
         # rec["symbol"] or warrant["side"] instead would let a bug in
         # exit_order_args sail straight through verification untouched.
-        shape = spec.guardrails.order_shape
+        #
+        # Indexing cap.args directly is safe here: exit_order_args returned a
+        # payload, which it only does once all five order fields are declared.
+        # The account stays a LIST of candidates, because arg_names genuinely
+        # is one and check_accounts hunts the same way.
         sent = {
             "connector_id": rec["connector_id"],
             "tool": warrant.get("tool"),
-            "symbol": _sent_value(args, shape.symbol_keys),
-            "side": _sent_value(args, shape.side_keys),
-            "qty": _sent_qty(args, shape.quantity_keys),
+            "symbol": _sent_value(args, [cap.args["symbol"]]),
+            "side": _sent_value(args, [cap.args["side"]]),
+            "qty": _sent_qty(args, [cap.args["quantity"]]),
             "account": _sent_value(args, spec.guardrails.accounts.arg_names),
         }
 

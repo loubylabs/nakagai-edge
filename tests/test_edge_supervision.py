@@ -5,8 +5,8 @@ import pytest
 
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.supervision import (
-    TERMINAL, claim, held_quantities, is_guarded, ledger_fault, load, mark,
-    open_risk, recover_interrupted, reconcile, record, unreadable,
+    TERMINAL, answered, claim, held_quantities, is_guarded, ledger_fault, load,
+    mark, open_risk, recover_interrupted, reconcile, record, unreadable,
 )
 
 # A real warrant carries an epoch float (see warrant.build_warrant_payload),
@@ -32,14 +32,17 @@ def _rec(**over):
 def _blocked_rec(**over):
     # A record the edge established at entry it can never act on. Its direction
     # and account are both fine, so nothing but `blocked` can catch it.
-    why = "connector declares no market_order_args"
+    why = "connector declares no market_args"
     return _rec(blocked=why, anomaly=why, **over)
 
 
 def _portfolio(qty, *, error="", symbol="AAPL"):
+    # A position row as portfolio._positions now builds it: the broker's own
+    # fields with a normalized `symbol` (uppercased) and `quantity` (float)
+    # written over them. The readers here read those two and nothing else.
     return {"connectors": [{"id": "demo", "error": error, "accounts": [
         {"account_number": "463605220", "error": "", "portfolio": {},
-         "positions": [{"symbol": symbol, "quantity": str(qty)}]}]}]}
+         "positions": [{"symbol": symbol, "quantity": float(qty)}]}]}]}
 
 
 def _portfolio_row(row):
@@ -326,7 +329,7 @@ def test_is_guarded_false_for_a_blocked_record_however_it_got_armed():
     # three times this branch re-armed a record it had already disqualified.
     # Everything else here is in order: warranted, armed, live warrant, both
     # switches on. Only `blocked` knows the connector can never build an exit.
-    rec = _rec(blocked="connector declares no market_order_args")
+    rec = _rec(blocked="connector declares no market_args")
     assert is_guarded(rec, brake_armed=True, disarmed=frozenset(),
                       now=BEFORE_EXPIRY) is False
 
@@ -349,7 +352,7 @@ def test_reconcile_clears_the_anomaly_but_never_the_blocked_field(tmp_path):
     row = load(state)["ap_1"]
     assert row["confirmed_qty"] == 80.0
     assert "anomaly" not in row
-    assert row["blocked"] == "connector declares no market_order_args"
+    assert row["blocked"] == "connector declares no market_args"
 
 
 @pytest.mark.parametrize("terminal_state", TERMINAL)
@@ -371,7 +374,8 @@ def test_is_guarded_false_for_a_terminal_record_that_still_holds_its_warrant(
 
 
 def test_an_unrecognized_quantity_key_does_not_release_the_position(tmp_path):
-    # "amount_held" is not one of the candidate quantity keys. A skipped row
+    # A row the sweep could not normalize: it kept its symbol and arrived with
+    # no `quantity` at all, whatever the broker called the field. A skipped row
     # is not good enough here: absent-from-held plus answered-account reads
     # as released unless reconcile is told this row was unreadable, not zero.
     state = EdgeState(tmp_path)
@@ -420,6 +424,102 @@ def test_a_genuinely_flat_position_still_releases(tmp_path):
     row = load(state)["ap_1"]
     assert row["state"] == "released"
     assert row["confirmed_qty"] == 0.0
+
+
+def _alien(row, *, account="AL-1", error=""):
+    """One position row under a connector that spells everything its own way.
+
+    Whatever it calls its fields, the sweep has already written the canonical
+    `symbol` and `quantity` over them, so these readers never see the broker's
+    spelling. The raw keys are left in the fixture precisely to prove that.
+    """
+    return {"connectors": [{"id": "alien-broker", "error": "", "accounts": [
+        {"account_number": account, "error": error, "positions": [row]}]}]}
+
+
+def test_held_reads_normalized_rows():
+    doc = _alien({"ticker": "aapl", "symbol": "AAPL", "quantity": 25.0})
+    assert held_quantities(doc) == {("alien-broker", "AL-1", "AAPL"): 25.0}
+
+
+def test_unreadable_sees_a_row_with_a_symbol_but_no_usable_quantity():
+    # What _positions produces for {"ticker": "aapl", "qty": "many"}: the
+    # symbol coerced, the quantity dropped, the raw keys still there.
+    doc = _alien({"ticker": "aapl", "qty": "many", "symbol": "AAPL"})
+    assert unreadable(doc) == {("alien-broker", "AL-1", "AAPL")}
+
+
+def test_an_unreadable_row_is_not_counted_as_held():
+    doc = _alien({"ticker": "aapl", "qty": "many", "symbol": "AAPL"})
+    assert held_quantities(doc) == {}
+
+
+def test_unreadable_is_empty_when_every_row_normalized():
+    doc = _alien({"ticker": "aapl", "symbol": "AAPL", "quantity": 25.0})
+    assert unreadable(doc) == set()
+
+
+def test_a_quantity_left_as_the_brokers_own_string_is_unreadable():
+    # The sharp edge of reading the normalized field instead of guessing. A
+    # `quantity` that is still a string is one the sweep did NOT normalize: it
+    # is raw broker debris that happens to sit under the canonical name, and
+    # the field the map actually pointed at is the one that failed to read.
+    # Parsing it here would report a number no capability map ever chose.
+    doc = _alien({"symbol": "AAPL", "quantity": "100"})
+    assert held_quantities(doc) == {}
+    assert unreadable(doc) == {("alien-broker", "AL-1", "AAPL")}
+
+
+@pytest.mark.parametrize("qty", [float("nan"), float("inf"), float("-inf")])
+def test_a_non_finite_quantity_is_unreadable_not_a_position(qty):
+    # capability.coerce refuses these, so a normalized row can never carry one;
+    # arriving here it is raw debris again. It matters more than the string
+    # case because every NaN comparison is False: held as a real quantity it
+    # would flow into confirmed_qty and quietly disable the brake's own clamp.
+    doc = _alien({"symbol": "AAPL", "quantity": qty})
+    assert held_quantities(doc) == {}
+    assert unreadable(doc) == {("alien-broker", "AL-1", "AAPL")}
+
+
+def test_a_row_whose_symbol_never_read_is_keyed_by_nothing():
+    # read_partial drops an unreadable symbol too, and such a row cannot be
+    # named. It must not become a ("demo", "AL-1", "") key: that triple belongs
+    # to no record, and in held_quantities it would be a quantity attributed to
+    # no position at all.
+    doc = _alien({"ticker": {"nested": "nonsense"}, "quantity": 25.0})
+    assert held_quantities(doc) == {}
+    assert unreadable(doc) == set()
+
+
+def test_an_account_with_no_readable_identifier_proves_nothing():
+    # The shape connector_snapshot now produces: the account stays visible
+    # instead of vanishing, with an empty number and an error saying why.
+    doc = _alien({"symbol": "AAPL", "quantity": 25.0}, account="",
+                 error="this connector listed an account with no readable "
+                       "identifier")
+    assert answered(doc) == set()
+    assert held_quantities(doc) == {}
+    assert unreadable(doc) == set()
+
+
+def test_an_unnamed_account_proves_nothing_even_without_an_error():
+    # The same account with the error stripped, which is the only way to reach
+    # the identifier check itself. A record whose own account is "" would
+    # otherwise pair with this one in `answered`, read as confirmed-absent, and
+    # be released, and released is TERMINAL.
+    doc = _alien({"symbol": "AAPL", "quantity": 25.0}, account="")
+    assert answered(doc) == set()
+    assert held_quantities(doc) == {}
+    assert unreadable(doc) == set()
+
+
+def test_an_account_that_answered_is_reported_even_holding_nothing():
+    # The other half of the rule above: absence from a SUCCESSFUL snapshot is
+    # the only thing that proves a position is gone, so a healthy account with
+    # an empty position list still has to say it answered.
+    doc = {"connectors": [{"id": "alien-broker", "error": "", "accounts": [
+        {"account_number": "AL-1", "error": "", "positions": []}]}]}
+    assert answered(doc) == {("alien-broker", "AL-1")}
 
 
 def test_a_resolved_anomaly_is_cleared_not_left_stale(tmp_path):

@@ -12,9 +12,11 @@ OAuth tokens live under `secrets/` (gitignored) or in Postgres.
 import re
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from nakagai_edge._env import read_env_ref
+from nakagai_edge.capability import (CAPABILITIES, ORDER_FIELDS, Capability,
+                                     CapabilityError)
 from nakagai_edge.slug import safe_slug
 
 # Verb prefixes that mark a downstream tool as state-changing when the server
@@ -92,57 +94,6 @@ class ApprovalConfig(BaseModel):
     ttl_s: int = 900
 
 
-class OrderShape(BaseModel):
-    """How to read symbol / side / quantity / price / stop out of THIS broker's
-    order payload, and WHICH of its tools places a plain share order. Nakagai does
-    not own the shape, the downstream MCP server does, so the owner names the
-    keys, exactly as `AccountFilter.arg_names` does for account ids.
-
-    Unconfigured (any required key list empty) means this connector can never be
-    auto-executed against: the envelope cannot bound what it cannot read. Fail
-    closed, same posture as `unknown_is_write`.
-
-    `stock_tools` is why autopilot auto-executes SHARE orders and nothing else. A
-    broker's approval gate is a glob (`place_*`), which catches `place_equity_order`
-    and `place_option_order` alike, but `Order.notional` is `quantity x price`,
-    and for an option that is `contracts x premium`, missing the x100 contract
-    multiplier. Four contracts at $2.50 would compute as $10 of notional against a
-    $2,000 per-order cap, when the real exposure is $1,000. The envelope's central
-    dollar fence would be wrong by two orders of magnitude.
-
-    So the owner DECLARES which tools place shares, and autopilot auto-executes only
-    those. A positive gate, not a blacklist: a broker that adds futures or crypto
-    tomorrow is refused by default rather than waved through with a notional nobody
-    checked. An undeclared `stock_tools` means no auto-execution at all, and the
-    refused order still reaches a human tap, as every refusal here does.
-    """
-    symbol_keys: list[str] = Field(default_factory=list)
-    side_keys: list[str] = Field(default_factory=list)
-    quantity_keys: list[str] = Field(default_factory=list)
-    price_keys: list[str] = Field(default_factory=list)
-    stop_keys: list[str] = Field(default_factory=list)
-    stock_tools: list[str] = Field(default_factory=list)   # e.g. ["place_equity_order"]
-    buy_values: list[str] = Field(
-        default_factory=lambda: ["buy", "buy_to_open", "buy_to_cover"])
-    sell_values: list[str] = Field(
-        default_factory=lambda: ["sell", "sell_to_open", "sell_short"])
-
-    # How this connector expresses "market order". Merged into a derived exit
-    # after every price and stop key is stripped. Undeclared means the brake
-    # cannot build an exit here, and the position records as unguarded: the
-    # same posture as an undeclared order_shape, for the same reason.
-    market_order_args: dict = Field(default_factory=dict)
-
-    @property
-    def configured(self) -> bool:
-        # `stock_tools` is deliberately NOT here. An order_shape without it is
-        # perfectly READABLE, it just is not auto-executable, and check_envelope
-        # says so in the owner's words. Folding it in would surface a missing
-        # declaration as "the order could not be read", which is a lie.
-        return all([self.symbol_keys, self.side_keys, self.quantity_keys,
-                    self.price_keys, self.stop_keys])
-
-
 class GuardrailsConfig(BaseModel):
     tools: ToolFilter = Field(default_factory=ToolFilter)
     allow_writes: bool = False
@@ -152,7 +103,6 @@ class GuardrailsConfig(BaseModel):
     unknown_is_write: bool = True   # fail closed: unclassifiable tool == write
     accounts: AccountFilter = Field(default_factory=AccountFilter)
     approvals: ApprovalConfig = Field(default_factory=ApprovalConfig)
-    order_shape: OrderShape = Field(default_factory=OrderShape)
 
 
 class ConnectorSpec(BaseModel):
@@ -172,12 +122,122 @@ class ConnectorSpec(BaseModel):
     idle_ttl_s: float = 600.0
     auth: AuthConfig = Field(default_factory=AuthConfig)
     guardrails: GuardrailsConfig = Field(default_factory=GuardrailsConfig)
+    capabilities: dict[str, Capability] = Field(default_factory=dict)
 
     @field_validator("id")
     @classmethod
     def _id_is_a_slug(cls, v: str) -> str:
         # Doubles as path safety: the id names a token file under secrets/.
         return safe_slug(v, label="connector id")
+
+    @field_validator("capabilities")
+    @classmethod
+    def _names_are_in_the_vocabulary(cls, v: dict) -> dict:
+        # A typo must not become a silently absent capability: an unmapped
+        # capability already refuses at call time, and a misspelled one would
+        # look identical while the correct spelling sat right there in the file.
+        unknown = sorted(set(v) - set(CAPABILITIES))
+        if unknown:
+            raise ValueError(
+                f"unknown capabilities: {', '.join(unknown)} "
+                f"(known: {', '.join(sorted(CAPABILITIES))})")
+        return v
+
+    @field_validator("capabilities")
+    @classmethod
+    def _required_fields_are_mapped(cls, v: dict, info) -> dict:
+        """Every declared capability must say where its required fields live.
+
+        Declared after `_names_are_in_the_vocabulary` so it runs after it, and
+        every name reaching here is therefore known.
+
+        Nothing downstream catches this, which is why it has to be caught at
+        parse time. `read_partial` deliberately skips the required check, so a
+        map with no `symbol` path does not fail loudly: the sweep keeps
+        producing position rows that simply have no symbol on them, under a
+        connector that looks perfectly configured.
+
+        A position that cannot be named is absent from `held_quantities` AND
+        absent from `unreadable()`, because both key off the symbol. That is
+        the one combination `reconcile` reads as "the account answered and this
+        position is not in it", so the record is RELEASED, which is TERMINAL:
+        the brake stops watching a live position, while the portfolio document
+        still shows the row under the broker's own key and every display looks
+        normal. One omitted line of connector config does that to every
+        position on the connector, silently.
+
+        `place_order` and `cancel_order` require nothing (they are written, not
+        read), so a map for either parses with no `fields` at all.
+        """
+        broken = []
+        for name in sorted(v):
+            missing = sorted(set(CAPABILITIES[name].required) - set(v[name].fields))
+            if missing:
+                broken.append(f"{name} declares no path for {', '.join(missing)}")
+        if broken:
+            cid = (info.data or {}).get("id", "?")
+            raise ValueError(
+                f"connector {cid!r} cannot read what it maps: {'; '.join(broken)}")
+        return v
+
+    @field_validator("capabilities")
+    @classmethod
+    def _order_args_are_mapped(cls, v: dict, info) -> dict:
+        """A declared `place_order` must say where all five order fields go.
+
+        The twin of `_required_fields_are_mapped`, on the ARGUMENT side. That
+        one closed this hole for the fields a capability READS; this one closes
+        it for the keys `place_order` WRITES, and the consequence here is worse.
+
+        `warrant.configured()` needs every one of ORDER_FIELDS before an entry
+        can be read at all, and nothing downstream complains when they are not
+        there. A map declaring three of the five parses, places real orders,
+        and then `read_entry` returns None for every one of them, so
+        `executor.supervise` returns early: no ledger record, no `blocked`
+        reason, no anomaly, and no audit line. The position is absent from
+        `get_open_risk` entirely, while the Portfolio page still lists it and
+        the brake is not watching it. Nothing anywhere says why, which is what
+        makes parse time the only place to catch it.
+
+        Scoped to `place_order` alone. The five are what an order IS, so a
+        connector serving quotes or positions and no orders declares no
+        `place_order` and parses untouched.
+        """
+        cap = v.get("place_order")
+        if cap is None:
+            return v
+        missing = [field for field in ORDER_FIELDS if field not in cap.args]
+        if missing:
+            cid = (info.data or {}).get("id", "?")
+            raise ValueError(
+                f"connector {cid!r} declares place_order but maps no argument "
+                f"key for {', '.join(missing)}; all of "
+                f"{', '.join(ORDER_FIELDS)} must be mapped or the edge cannot "
+                f"read back the orders it places, and every position opened "
+                f"through this connector goes unsupervised and unreported")
+        return v
+
+    @model_validator(mode="after")
+    def _default_the_account_key(self):
+        # The map says where the account goes; check_accounts hunts for it in
+        # arbitrary args on the raw call_connector path. Different jobs, and
+        # they must not disagree about the key name, so the map inherits it.
+        #
+        # Copy rather than mutate: a caller may pass an already-constructed
+        # Capability instance and reuse that same object across two specs, and
+        # pydantic keeps the identical reference rather than copying it. An
+        # in-place write to cap.args would then leak the FIRST spec's account
+        # key into the SECOND spec's map, since both specs would be looking at
+        # the same dict. Building a new Capability keeps each spec's map its
+        # own.
+        names = self.guardrails.accounts.arg_names
+        if not names:
+            return self
+        for name, cap in self.capabilities.items():
+            if "account" in CAPABILITIES[name].args and "account" not in cap.args:
+                self.capabilities[name] = cap.model_copy(
+                    update={"args": {**cap.args, "account": names[0]}})
+        return self
 
     @property
     def is_mcp(self) -> bool:
@@ -186,6 +246,24 @@ class ConnectorSpec(BaseModel):
     @property
     def transport(self) -> str | None:
         return KIND_TO_TRANSPORT.get(self.kind)
+
+    @property
+    def capability_names(self) -> list[str]:
+        return sorted(self.capabilities)
+
+    def capability(self, name: str) -> Capability:
+        """This connector's map for `name`, or refuse.
+
+        Fail closed: a connector that never declared how to do something cannot
+        be asked to guess, and the agent is told which connector is missing
+        which entry.
+        """
+        cap = self.capabilities.get(name)
+        if cap is None:
+            raise CapabilityError(
+                f"connector {self.id!r} declares no {name!r} capability "
+                f"(declares: {', '.join(self.capability_names) or 'none'})")
+        return cap
 
     def check_connectable(self) -> None:
         """Raise ValueError unless this spec has what its transport needs."""

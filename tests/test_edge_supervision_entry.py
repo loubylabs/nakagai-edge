@@ -7,31 +7,34 @@ import pytest
 
 pytest.importorskip("cryptography")
 
-from nakagai_edge.config import ConnectorSpec, GuardrailsConfig, OrderShape
+from nakagai_edge.capability import Capability
+from nakagai_edge.config import ConnectorSpec
 from nakagai_edge.edge.executor import supervise
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.supervision import load
 
-SHAPE = OrderShape(
-    symbol_keys=["symbol"], side_keys=["side"], quantity_keys=["quantity"],
-    price_keys=["limit_price"], stop_keys=["stop_price"],
-    stock_tools=["place_equity_order"],
-    market_order_args={"order_type": "market"})
+PLACE_ORDER = Capability(
+    tool="place_equity_order",
+    args={"symbol": "symbol", "side": "side", "quantity": "quantity",
+          "price": "limit_price", "stop": "stop_price"},
+    values={"side": {"buy": ["buy", "buy_to_open", "buy_to_cover"],
+                     "sell": ["sell", "sell_to_open", "sell_short"]}},
+    market_args={"order_type": "market"})
 
-NO_MARKET_SHAPE = OrderShape(
-    symbol_keys=["symbol"], side_keys=["side"], quantity_keys=["quantity"],
-    price_keys=["limit_price"], stop_keys=["stop_price"],
-    stock_tools=["place_equity_order"])   # no market_order_args declared
+# No market_args declared, so nothing here can build an exit.
+NO_MARKET_CAP = PLACE_ORDER.model_copy(update={"market_args": {}})
 
 ENTRY_ARGS = {"account_number": "463605220", "symbol": "AAPL", "side": "buy",
               "quantity": 100, "limit_price": 47.55, "stop_price": 46.20}
 
 
 class FakeHub:
-    def __init__(self, shape=SHAPE):
+    def __init__(self, cap=PLACE_ORDER):
+        # `cap=None` is a connector that declares no place_order at all, which
+        # is a different failure from declaring an unusable one.
         self._spec = ConnectorSpec(
             id="demo", kind="mcp-http", role="broker",
-            guardrails=GuardrailsConfig(order_shape=shape))
+            capabilities={"place_order": cap} if cap else {})
 
     def spec(self, connector_id):
         return self._spec
@@ -90,10 +93,30 @@ def test_an_entry_with_no_stop_is_not_supervised_at_all(tmp_path):
     assert load(state) == {}
 
 
-def test_a_connector_with_no_declared_shape_is_not_supervised(tmp_path):
+def test_a_connector_that_declares_no_place_order_is_not_supervised(tmp_path):
+    # Nothing declared means nothing to read the order through, and a ledger
+    # record keyed on guessed field names would be worse than no record.
     state = EdgeState(tmp_path)
-    supervise(FakeHub(OrderShape()), state, "ap_1", _intent(),
+    supervise(FakeHub(None), state, "ap_1", _intent(),
               _record({"grant_id": "wr_1"}), {})
+    assert load(state) == {}
+
+
+def test_a_place_order_map_missing_a_field_is_not_supervised(tmp_path):
+    # Declared, but not completely: with no stop key there is no level, so
+    # there is nothing for the brake to watch.
+    #
+    # The spec is built whole and then broken by hand because config.py now
+    # refuses this map at parse time, so no registry can produce one. The check
+    # inside supervise() stays anyway: a Capability constructed in code never
+    # went past that validator, and the alternative is a ledger record keyed on
+    # field names nobody declared.
+    state = EdgeState(tmp_path)
+    hub = FakeHub()
+    hub.spec("demo").capabilities["place_order"] = PLACE_ORDER.model_copy(
+        update={"args": {k: v for k, v in PLACE_ORDER.args.items()
+                         if k != "stop"}})
+    supervise(hub, state, "ap_1", _intent(), _record({"grant_id": "wr_1"}), {})
     assert load(state) == {}
 
 
@@ -176,20 +199,20 @@ def test_both_an_unclassifiable_side_and_a_missing_account_are_reported(tmp_path
     assert "no account on the order" in rec["anomaly"]
 
 
-def test_a_connector_with_no_market_order_args_records_unguarded(tmp_path):
-    # Spec section 9: no order_shape OR no market_order_args means this
+def test_a_connector_with_no_market_args_records_unguarded(tmp_path):
+    # Spec section 9: no place_order map OR no market_args means this
     # connector's positions cannot be supervised. The platform mints the
     # warrant from the entry order and cannot see an edge-side connector
     # field, so nothing but this check keeps the record out of `armed`, and
     # `armed` here would report guarded: true for a brake that can never
     # build an exit.
     state = EdgeState(tmp_path)
-    supervise(FakeHub(NO_MARKET_SHAPE), state, "ap_1", _intent(),
+    supervise(FakeHub(NO_MARKET_CAP), state, "ap_1", _intent(),
               _record({"grant_id": "wr_1"}), {})
     rec = load(state)["ap_1"]
     assert rec["state"] == "unguarded"
     assert rec["warrant"] is None
-    assert "market_order_args" in rec["anomaly"]
+    assert "market_args" in rec["anomaly"]
 
 
 def test_the_disqualification_is_persisted_on_the_record(tmp_path):
@@ -197,9 +220,9 @@ def test_the_disqualification_is_persisted_on_the_record(tmp_path):
     # the renewal path re-armed the record sixty seconds after entry. `blocked`
     # is the durable half, written once here and read by every downstream gate.
     state = EdgeState(tmp_path)
-    supervise(FakeHub(NO_MARKET_SHAPE), state, "ap_1", _intent(),
+    supervise(FakeHub(NO_MARKET_CAP), state, "ap_1", _intent(),
               _record({"grant_id": "wr_1"}), {})
-    assert load(state)["ap_1"]["blocked"] == "connector declares no market_order_args"
+    assert load(state)["ap_1"]["blocked"] == "connector declares no market_args"
 
 
 def test_a_healthy_position_records_an_empty_blocked_field(tmp_path):
