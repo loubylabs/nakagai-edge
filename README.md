@@ -145,12 +145,27 @@ package:
       args: {symbol: ticker, side: action, quantity: qty, account: acct}
       values:
         side:
-          buy: [BUY_TO_OPEN, BUY_TO_COVER]
-          sell: [SELL_TO_CLOSE, SELL_SHORT]
+          buy: [BUY]
+          sell: [SELL]
       market_args: {kind: MARKET}
 ```
 
+**The order inside `values.side` is load-bearing.** The list is every spelling
+this connector recognizes when it reads a side back off an order, and the first
+entry is the single spelling the edge sends when it places one or builds a
+stop's exit. So list them all, and put first the one that is correct whether the
+order opens or closes. A broker with separate verbs mapped as
+`buy: [BUY_TO_OPEN, BUY_TO_COVER]` sends `BUY_TO_OPEN` for every buy, including
+the one meant to cover a short.
+
 The agent gets seven named tools it learns once and uses against any broker.
+`connector_id` is optional only while exactly one enabled broker declares the
+capability. Enable a second and the edge stops filling it in: the call comes
+back naming both candidates and the agent has to say which brokerage it meant.
+Letting registry order decide which broker received an order is not something
+an agent can review or an owner can predict, so this is the one place the layer
+gets louder rather than quieter as brokers are added.
+
 `call_connector` remains the raw escape hatch: a broker tool outside the
 vocabulary is still reachable by its own name, through the same guardrails, the
 same approval queue, and the same audit record.
@@ -178,8 +193,9 @@ the platform would parse the older bundle cleanly and simply not find what the
 newer shape carries. Losing the capability map that builds a stop's exit order
 records every supervised position as unguarded while every display still calls
 it guarded. Refusing beats half-understanding. A refused bundle leaves the
-previous registry untouched and does not stamp freshness, so within the policy
-TTL everything fails closed. `edge sync` reports the refusal on the spot and
+previous registry untouched and does not stamp freshness, so the cached policy
+goes on aging and everything is refused once the TTL lapses. `edge sync`
+reports the refusal on the spot and
 `edge status` carries a `schema_error` until a sync succeeds; the fix is to
 upgrade whichever side is behind, or pin an older `nakagai-edge`.
 
@@ -188,7 +204,7 @@ job and both fail silently:
 
 - **Every broker connector must declare `place_order.values.side`.** There is
   no default buy/sell vocabulary any more. There used to be a
-  Robinhood-flavoured one, and it would have quietly mistranslated the next
+  Robinhood-flavored one, and it would have quietly mistranslated the next
   broker's spelling. Without it an entry's side cannot be classified and the
   position is recorded `blocked` with the anomaly "unclassifiable order side":
   visible, unguarded, and never acted on.
@@ -232,8 +248,15 @@ The brake does not promise the level. A gap opens a position under its stop and
 the exit goes off at the market, below it. That is what a stop is.
 
 A connector must declare a `place_order` capability with `market_args` before
-its positions can be supervised. Without it, positions are recorded as
-unguarded and reported that way rather than silently ignored.
+its positions can be supervised, and the two halves of that fail differently.
+A connector that declares `place_order` but no `market_args` still gets a
+ledger record: there is no exit order to build, so the position is recorded
+unguarded, listed that way by `get_open_risk`, and shown that way on the
+Portfolio page. A connector that declares no `place_order` at all leaves no
+ledger record to make, so its positions are absent from `get_open_risk`
+entirely; the Portfolio page still shows them unguarded, because a position
+with no record cannot be marked guarded. The Portfolio page is the surface that
+sees both, so it is the one to check before assuming a stop is being watched.
 
 ## Failure modes
 
