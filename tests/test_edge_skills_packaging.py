@@ -9,7 +9,8 @@ from pathlib import Path
 import pytest
 
 REPO = Path(__file__).resolve().parents[1]
-EXPECTED = {"connect-edge", "pair-agent", "verify-edge"}
+EXPECTED = {"connect-edge", "pair-agent", "verify-edge",
+            "daily-brief", "halt", "check-the-evidence"}
 
 
 @pytest.fixture(scope="module")
@@ -39,3 +40,12 @@ def test_shipped_skills_are_not_empty(wheel):
     for name in wheel.namelist():
         if name.startswith("nakagai_edge/skills/") and name.endswith("/SKILL.md"):
             assert len(wheel.read(name)) > 200, f"{name} is suspiciously small"
+
+
+def test_every_skill_has_name_and_description(wheel):
+    for name in wheel.namelist():
+        if name.startswith("nakagai_edge/skills/") and name.endswith("/SKILL.md"):
+            body = wheel.read(name).decode()
+            assert body.startswith("---\n"), f"{name} has no frontmatter"
+            head = body.split("---")[1]
+            assert "name:" in head and "description:" in head, f"{name} frontmatter is incomplete"
