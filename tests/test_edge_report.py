@@ -120,7 +120,16 @@ async def test_syncer_reports_hub_status_connectors_each_cycle(tmp_path, monkeyp
     await _run_briefly_then_cancel(tasks, lambda: len(seen) >= 1)
 
     assert seen, "the syncer never reported connector status"
-    assert seen[0] == {"connectors": hub.status(with_tools=True)["connectors"]}
+    # What the syncer hands the client, minus the one transformation the client
+    # makes on the way out: this connector never connected (nothing here dials
+    # a real broker), and report_connectors says nothing at all about the tools
+    # of a connector this edge is not in touch with, rather than reporting an
+    # empty list the platform could read as "the broker lost its tools".
+    expected = hub.status(with_tools=True)["connectors"]
+    for row in expected:
+        assert row["status"] != "connected"
+        assert row.pop("tools") == []
+    assert seen[0] == {"connectors": expected}
     assert seen[0]["connectors"][0]["id"] == "robinhood-trading"
 
     # Pin the wire contract: the edge's Connection.to_dict() and the
@@ -136,11 +145,12 @@ async def test_syncer_reports_hub_status_connectors_each_cycle(tmp_path, monkeyp
     # this set (not from to_dict) once the platform reads it.
     #
     # `tools` and `tools_unchanged` are the third and fourth, and they are a
-    # pair: the edge ships each downstream tool's name, description and
-    # inputSchema, which is the only way those schemas can ever reach a
-    # platform that never dials a broker, and says `tools_unchanged: true`
-    # instead on the cycles where those names and schemas are the ones it last
-    # accepted. Delete both from this set once ConnectorReport models them.
+    # pair: for a CONNECTED connector the edge ships each downstream tool's
+    # name, description and inputSchema, which is the only way those schemas
+    # can ever reach a platform that never dials a broker, and says
+    # `tools_unchanged: true` instead on the cycles where they are what it last
+    # accepted. Neither key appears on the row below, whose connector never
+    # connected. Delete both once ConnectorReport models them.
     extras = {"server_info", "capabilities", "tools", "tools_unchanged"}
     connector_on_wire = seen[0]["connectors"][0]
     expected_keys = set(ConnectorReport.model_fields)

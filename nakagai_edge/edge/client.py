@@ -25,16 +25,23 @@ class EdgeClientError(Exception):
 def _tool_digest(tools: list[dict]) -> str:
     """A stable fingerprint of one connector's tool list.
 
-    Name and inputSchema only, sorted by name, each schema serialized with
-    sorted keys. What the platform derives a capability map from is the tool a
-    broker offers and the arguments it takes; the order the downstream happened
-    to list them in, and the key order inside a schema, are not changes to
-    that. Without both sortings a server that re-serializes its schemas
-    differently between two calls would look changed every sixty seconds
-    forever, which is the exact resend this digest exists to prevent.
+    Covers exactly the three fields that get reported (name, description,
+    inputSchema), so nothing the platform reads can go stale behind an
+    unchanged digest. Including the description costs nothing on a quiet cycle,
+    since it rides in the same payload as the schema when anything at all
+    changes, and it only forces a resend when a broker actually reworded a
+    tool, which is a release, not a minute.
+
+    Sorted by name, and each schema serialized with sorted keys: the order a
+    downstream happened to list its tools in, and the key order inside a
+    schema, are not changes to what it can be asked to do. Without both
+    sortings a server that re-serializes its schemas differently between two
+    calls would look changed every sixty seconds forever, which is the exact
+    resend this digest exists to prevent.
     """
     projection = sorted(
         (str(tool.get("name") or ""),
+         str(tool.get("description") or ""),
          json.dumps(tool.get("inputSchema") or {}, sort_keys=True, default=str))
         for tool in tools)
     return hashlib.sha256(json.dumps(projection).encode()).hexdigest()
@@ -143,17 +150,32 @@ class PlatformClient:
         # report the platform took. Robinhood publishes thirty-odd tools with
         # full JSON schemas, this runs every sixty seconds, and the list changes
         # about never: sending it regardless would be a steady tax on someone's
-        # home connection for no new information. An unchanged entry says
-        # `tools_unchanged` rather than simply dropping the key, so the platform
-        # can tell "you already hold these" apart from "this connector has no
-        # tools", which are different facts about a connector.
-        payload, digests = [], {}
+        # home connection for no new information.
+        #
+        # Three distinguishable statements per connector, because they are three
+        # different facts: `tools: [...]` is "here is what it publishes",
+        # `tools_unchanged: true` is "you already hold that", and neither key at
+        # all is "this edge is not in touch with it, so it is not saying".
+        # `tools: []` therefore keeps its own meaning: a connected broker that
+        # publishes nothing.
+        payload, digests, reported = [], {}, set()
         for row in connectors:
             entry = dict(row)   # the caller still holds `row`; never edit it
+            connector_id = str(entry.get("id") or "")
+            reported.add(connector_id)
+            if entry.get("status") != "connected":
+                # A connector we cannot currently reach has nothing to say
+                # about its tools. Its Connection is replaced on the way down,
+                # so an empty `tools` here means "we did not look", not "this
+                # broker has none", and shipping it would invite the platform
+                # to read a flap as a broker that lost every tool. Saying
+                # nothing at all (no `tools`, no `tools_unchanged`) leaves both
+                # the platform's copy and our digest exactly as they were, so
+                # the reconnect costs no resend either.
+                entry.pop("tools", None)
             if entry.get("tools") is None:
                 payload.append(entry)
                 continue
-            connector_id = str(entry.get("id") or "")
             digest = _tool_digest(entry["tools"])
             digests[connector_id] = digest
             if self._reported_tools.get(connector_id) == digest:
@@ -166,7 +188,16 @@ class PlatformClient:
         # nothing, and remembering its digest would leave the platform without
         # schemas it never received until the tool list happened to change
         # again, which for a stable broker is never.
-        self._reported_tools.update(digests)
+        #
+        # Connectors this report did not mention are forgotten: one dropped
+        # from the bundle and later re-added is a new connector to the
+        # platform, and a remembered digest would answer `tools_unchanged`
+        # about schemas it no longer holds, with nothing short of an edge
+        # restart to correct it.
+        kept = {cid: digest for cid, digest in self._reported_tools.items()
+                if cid in reported}
+        kept.update(digests)
+        self._reported_tools = kept
         return out
 
     def report_portfolio(self, connectors: list[dict]) -> dict:

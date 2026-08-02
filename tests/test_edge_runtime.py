@@ -581,21 +581,130 @@ def test_a_tool_that_publishes_no_description_or_schema_still_reports_both_keys(
     assert row["tools"] == [{"name": "ping", "description": "", "inputSchema": {}}]
 
 
-async def test_the_status_tools_do_not_hand_the_agent_every_schema(tmp_path):
-    """`list_connectors` answers "which broker can be asked what", and an
-    agent pays tokens for every byte of it. Thirty JSON schemas belong in the
-    connector report, and in `list_connector_tools` when actually asked for."""
-    state = _state(tmp_path)
+LIVE_BUNDLE = {"bundle_version": "v1", "schema_version": BUNDLE_SCHEMA,
+               "connectors": {"connectors": [ROBINHOOD_CONNECTOR]},
+               "signing_public_key": "k"}
+
+
+def _live_connector(tmp_path, handler=None):
+    """A hub whose robinhood connector is CONNECTED and has published a schema.
+
+    Nothing is dialed: the Connection is placed by hand in exactly the state a
+    successful `_run_connection` leaves behind (status connected, `tools`
+    snapshotted from the downstream's list_tools). Without a live one, every
+    assertion about the schemas is vacuous: an unconnected connector carries an
+    empty tool list, so `inputSchema` is absent from every payload whatever the
+    flags say.
+
+    The bundle is synced through `sync_once` rather than `apply_bundle` because
+    that is what stamps `fetched_at`, and without a fresh stamp `list_connectors`
+    answers the stale-policy refusal instead of a connector list, which is
+    another way for these assertions to pass while proving nothing.
+    """
+    from nakagai_edge.hub import Connection
+
+    def _bundle_only(req):
+        if req.url.path == "/api/agent/bundle":
+            return httpx.Response(200, json=LIVE_BUNDLE, headers={"etag": "v1"})
+        return httpx.Response(404, json={"detail": "?"})
+
+    state = EdgeState(tmp_path)
+    state.save_agent("https://api.test", "ag1", "nk_agent_t")
     client = PlatformClient("https://api.test", "t",
-                            transport=httpx.MockTransport(lambda r: httpx.Response(500)))
+                            transport=httpx.MockTransport(handler or _bundle_only))
+    assert sync_once(state, client) is True
     hub = build_hub(state, client)
+    hub._conns["robinhood-trading"] = Connection(
+        spec=hub.spec("robinhood-trading"), status="connected",
+        tools=[LISTED_TOOL])
+    return state, client, hub
+
+
+async def test_a_live_connectors_schemas_reach_the_platform_and_not_the_agent(
+        tmp_path):
+    """Both halves of the split, asserted off one live connector.
+
+    The platform can NEVER read a broker's schemas for itself, so the syncer's
+    call has to carry them. `list_connectors` answers "which broker can be
+    asked what" to an agent that pays tokens for every byte, and
+    `list_connector_tools` already serves the schemas per connector on demand,
+    so the same call must not carry them there.
+    """
+    state, client, hub = _live_connector(tmp_path)
     audit = EdgeAudit(state)
     mcp = create_edge_mcp(state, hub, client, audit, _Reporter(),
                           Brake(state, hub, client, audit))
+
+    reported = hub.status(with_tools=True)["connectors"]
+    row = next(c for c in reported if c["id"] == "robinhood-trading")
+    assert row["status"] == "connected"
+    assert row["tools"] == [{"name": "get_account",
+                             "description": "Balances for one account",
+                             "inputSchema": LISTED_TOOL["inputSchema"]}]
+
     for tool in ("list_connectors", "get_connector_status"):
         result = await mcp.call_tool(tool, {})
         text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+        # The connector itself must be in the answer, or this proves nothing:
+        # a stale-policy refusal carries no schemas either.
+        assert "robinhood-trading" in text, f"{tool} never answered"
         assert "inputSchema" not in text, f"{tool} shipped downstream schemas"
+        assert "get_account" not in text, f"{tool} shipped downstream tool names"
+
+
+async def test_the_syncer_ships_a_live_connectors_schemas_upstream(
+        tmp_path, monkeypatch):
+    """The one path that carries a broker's schemas off this machine.
+
+    Everything else in this file proves the hub CAN produce them. This proves
+    the loop actually asks: the platform has no other source, so a syncer that
+    stopped passing `with_tools` would leave the capability-map derivation with
+    nothing to read, and nothing anywhere would go red.
+    """
+    import nakagai_edge.edge.runtime as runtime
+    monkeypatch.setattr(runtime, "SYNC_INTERVAL_S", 0.01)
+    seen = []
+
+    def handler(req):
+        if req.url.path == "/api/agent/connectors":
+            seen.append(json.loads(req.content)["connectors"])
+            return httpx.Response(200, json={"ok": True, "connectors": 1})
+        if req.url.path == "/api/agent/bundle":
+            return httpx.Response(200, json=LIVE_BUNDLE, headers={"etag": "v1"})
+        return httpx.Response(404, json={"detail": "?"})
+
+    state, client, hub = _live_connector(tmp_path, handler)
+    audit = EdgeAudit(state)
+    tasks = await runtime._loops(state, hub, client, audit, _Reporter(),
+                                 Brake(state, hub, client, audit))
+    for _ in range(200):
+        if seen:
+            break
+        await asyncio.sleep(0.01)
+    for t in tasks:
+        t.cancel()
+    for t in tasks:
+        with contextlib.suppress(asyncio.CancelledError):
+            await t
+
+    assert seen, "the syncer never reported connector status"
+    row = next(c for c in seen[0] if c["id"] == "robinhood-trading")
+    assert row["tools"] == [{"name": "get_account",
+                             "description": "Balances for one account",
+                             "inputSchema": LISTED_TOOL["inputSchema"]}]
+    await hub.aclose()
+
+
+def test_status_carries_the_flag_to_every_row_it_builds(tmp_path):
+    """`with_tools` is a property of the call, not of one branch inside it: a
+    registered connector with no live Connection object gets the same treatment
+    as one that has it. The client decides what to SAY about a connector that
+    is not connected; the hub reports uniformly."""
+    state, client, hub = _live_connector(tmp_path)
+    hub._conns.clear()      # registered, never dialed: the placeholder branch
+    rows = hub.status(with_tools=True)["connectors"]
+    assert [r["status"] for r in rows] == ["disconnected"]
+    assert rows[0]["tools"] == []
 
 
 async def test_the_syncer_survives_a_report_that_raises(tmp_path, monkeypatch, caplog):

@@ -110,9 +110,9 @@ GET_ACCOUNT = {
 }
 
 
-def _connector(tools, cid="robinhood-trading"):
+def _connector(tools, cid="robinhood-trading", status="connected"):
     """One row shaped like Connection.to_dict(with_tools=True) produces."""
-    return {"id": cid, "name": "Robinhood", "status": "connected",
+    return {"id": cid, "name": "Robinhood", "status": status,
             "tool_count": len(tools), "tools": tools}
 
 
@@ -211,15 +211,19 @@ def test_the_order_the_downstream_listed_its_tools_in_is_not_a_change():
     assert p.entry(1)["tools_unchanged"] is True
 
 
-def test_a_reworded_description_alone_does_not_trigger_a_resend():
-    # Deliberate: the digest covers name and inputSchema, which is what the
-    # platform's derivation reads. Prose is not worth thirty schemas a minute,
-    # and the next real schema change carries the new wording with it.
+def test_a_reworded_description_resends_the_tools():
+    # The digest covers every field the report carries, description included.
+    # The description is what the human approving a derived capability map
+    # reads, and it rides in the same payload as the schemas anyway, so
+    # excluding it would buy no bytes on a quiet cycle and would leave the
+    # platform showing wording the broker has retired.
     p = _Platform()
     c = p.client()
     c.report_connectors([_connector([GET_ACCOUNT])])
-    c.report_connectors([_connector([{**GET_ACCOUNT, "description": "Balances."}])])
-    assert p.entry(1)["tools_unchanged"] is True
+    reworded = {**GET_ACCOUNT, "description": "Balances. Cash included."}
+    c.report_connectors([_connector([reworded])])
+    assert p.entry(1)["tools"] == [reworded]
+    assert "tools_unchanged" not in p.entry(1)
 
 
 def test_a_failed_report_resends_the_schemas_next_cycle():
@@ -282,3 +286,59 @@ def test_the_callers_status_rows_are_never_mutated():
     c.report_connectors(rows)
     assert rows[0]["tools"] == [GET_ACCOUNT]
     assert "tools_unchanged" not in rows[0]
+
+
+def test_a_connector_that_is_not_connected_says_nothing_about_its_tools():
+    # Its Connection is replaced on the way down, so the tool list here is
+    # empty because nobody looked, not because the broker publishes nothing.
+    # Reporting that emptiness would invite the platform to read a flap as a
+    # broker that lost every tool it had.
+    p = _Platform()
+    c = p.client()
+    c.report_connectors([_connector([], status="error")])
+    assert "tools" not in p.entry(0)
+    assert "tools_unchanged" not in p.entry(0)
+    assert p.entry(0)["status"] == "error"
+
+
+def test_a_connection_flap_costs_neither_a_wipe_nor_a_resend():
+    p = _Platform()
+    c = p.client()
+    c.report_connectors([_connector([GET_ACCOUNT])])
+    c.report_connectors([_connector([], status="error")])
+    c.report_connectors([_connector([GET_ACCOUNT])])
+    # Cycle 1 said nothing, so the platform still holds what cycle 0 gave it
+    # and cycle 2 has nothing new to say. Both halves matter: a wipe in the
+    # middle would lose the schemas, and a forgotten digest would resend them.
+    assert "tools" not in p.entry(1)
+    assert "tools" not in p.entry(2)
+    assert p.entry(2)["tools_unchanged"] is True
+
+
+def test_a_connector_dropped_from_the_report_is_forgotten():
+    # Disabled in the registry, then re-added. To the platform that is a new
+    # connector row, so answering `tools_unchanged` would leave it holding no
+    # schemas at all with nothing short of an edge restart to correct it.
+    p = _Platform()
+    c = p.client()
+    c.report_connectors([_connector([GET_ACCOUNT])])
+    c.report_connectors([_connector([{"name": "get_clock", "description": "",
+                                      "inputSchema": {}}], cid="alpaca")])
+    c.report_connectors([_connector([GET_ACCOUNT])])
+    assert p.entry(2)["tools"] == [GET_ACCOUNT]
+    assert "tools_unchanged" not in p.entry(2)
+
+
+def test_a_report_that_failed_prunes_nothing_either():
+    # Same rule as the digest itself: a call that never landed changed nothing
+    # on the platform, so it may not change what we believe about it.
+    p = _Platform()
+    c = p.client()
+    c.report_connectors([_connector([GET_ACCOUNT])])
+    p.fail = True
+    with pytest.raises(EdgeClientError):
+        c.report_connectors([_connector([{"name": "get_clock", "description": "",
+                                          "inputSchema": {}}], cid="alpaca")])
+    p.fail = False
+    c.report_connectors([_connector([GET_ACCOUNT])])
+    assert p.entry(2)["tools_unchanged"] is True
