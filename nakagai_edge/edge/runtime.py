@@ -646,6 +646,35 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
             "portfolio_heat": round(heat, 2),
             "positions": rows}, default=str)
 
+    # Client-neutral skill delivery. A client with file-based skills installs
+    # them (see `nakagai-edge connect`); a client without still reads exactly
+    # the same content over the one URL it already has.
+    from nakagai_edge.edge import skills as _skills
+
+    @mcp.resource("nakagai://skills")
+    def _skill_index() -> str:
+        """Every skill this edge ships, with its one-line description."""
+        return json.dumps(
+            {n: _skills.skill_description(n) for n in _skills.list_skills()},
+            separators=(",", ":"))
+
+    @mcp.resource("nakagai://skills/{name}")
+    def _skill_body(name: str) -> str:
+        """One skill's full text."""
+        try:
+            return _skills.read_skill(name)
+        except KeyError:
+            return json.dumps({"is_error": True, "error": f"no skill {name!r}"})
+
+    for _name in _skills.list_skills():
+        def _make(skill_name: str):
+            def _prompt() -> str:
+                return _skills.read_skill(skill_name)
+            _prompt.__name__ = skill_name.replace("-", "_")
+            _prompt.__doc__ = _skills.skill_description(skill_name)
+            return _prompt
+        mcp.prompt(name=_name)(_make(_name))
+
     return mcp
 
 
