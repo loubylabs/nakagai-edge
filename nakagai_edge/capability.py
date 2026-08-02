@@ -253,6 +253,12 @@ def extract(name: str, cap: Capability, payload: Any) -> dict | list[dict] | Non
 
     A list capability drops rows it cannot read rather than folding them in as
     zero; a scalar capability returns None for the same reason. See coerce().
+
+    None means UNREADABLE for both kinds, and an empty list means the broker
+    answered with nothing. Those are different facts and the caller has to keep
+    them apart: "the account holds nothing" is what an agent reads before
+    buying, so an unreadable answer counted as flat is how one position becomes
+    two on a real account.
     """
     vocab = CAPABILITIES.get(name)
     if vocab is None:
@@ -261,6 +267,10 @@ def extract(name: str, cap: Capability, payload: Any) -> dict | list[dict] | Non
     if not vocab.is_list:
         return read_row(name, cap, node)
     if not isinstance(node, list):
-        return []
+        # Not an empty list: the map named a node that is not a list at all, so
+        # nothing here was read. Returning [] made "this connector's map does
+        # not fit what the broker sent" indistinguishable from "the broker
+        # holds nothing", under an answer that carried no error either.
+        return None
     read = (read_row(name, cap, row) for row in node)
     return [row for row in read if row is not None]

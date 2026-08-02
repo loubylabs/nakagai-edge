@@ -386,6 +386,30 @@ async def test_a_connector_declaring_no_get_quote_is_skipped_with_a_reason(
     assert "alien-broker" in caplog.text and "get_quote" in caplog.text
 
 
+async def test_a_quote_payload_the_map_cannot_read_is_famine_not_an_empty_book(
+        tmp_path, caplog):
+    """An answer this connector's map cannot read must reach the brake as
+    silence, not as a quote list that happens to be empty.
+
+    `extract` returns None rather than [] for a payload that holds no list
+    where the map says one lives. Iterating that would raise inside the sweep
+    and take the OTHER connector's quotes down with it; coercing it back to []
+    would be worse, because a broker whose shape changed under a stale map
+    would look exactly like a market with nothing to say and the famine signal
+    would never fire.
+    """
+    import nakagai_edge.edge.runtime as runtime
+    state = _two_brokers(tmp_path)
+    hub = MapQuoteHub(payloads={**QUOTE_PAYLOADS,
+                                "ticker": {"ticks": {"tkr": "aapl"}}})
+
+    with caplog.at_level(logging.WARNING, logger="nakagai.edge"):
+        quotes = await runtime._quotes(hub, state, ["AAPL", "MSFT"])
+
+    assert set(quotes) == {"MSFT"}, "one unreadable answer, one live connector"
+    assert "alien-broker" in caplog.text
+
+
 async def test_get_open_risk_keeps_terminal_records_out_of_the_heat(tmp_path):
     """portfolio_heat answers "what if every stop hit at once", so a position
     that already closed must not sit in it forever. reconcile() skips TERMINAL,

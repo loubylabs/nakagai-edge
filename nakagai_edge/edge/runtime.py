@@ -233,7 +233,21 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         found = {"capability": capability, "connector": cid, "tool": tool, **out}
         if out.get("is_error") or CAPABILITIES[capability].is_write:
             return found
-        return {**found, "data": extract(capability, cap, out.get("data"))}
+        data = extract(capability, cap, out.get("data"))
+        if data is None and CAPABILITIES[capability].is_list:
+            # An empty list is the answer "the broker holds nothing", so an
+            # unreadable answer must never arrive wearing it: an agent reading
+            # a failed list_positions as flat buys a position it already has.
+            # Raised to an error rather than handed over as a null, because a
+            # null is exactly what a caller coerces back to [] without meaning
+            # to. The scalar case needs none of this: None where a dict was
+            # promised is already unmistakable.
+            return {**found, "data": None, "is_error": True, "error":
+                    f"{cid} answered {capability}, but this connector's map "
+                    f"found no list where it says one lives, so the answer "
+                    f"could not be read. This is NOT a statement that there "
+                    f"is nothing; the map or the broker's shape has changed"}
+        return {**found, "data": data}
 
     @mcp.tool()
     async def call_connector(connector_id: str, tool: str, args_json: str = "{}") -> str:
@@ -357,7 +371,9 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         "market_value"}`, symbols upper-cased and quantities as numbers. A row
         the broker answered but this connector's map cannot read is DROPPED
         rather than reported as zero, so an empty list means "the broker says
-        nothing is held", never "something went wrong".
+        nothing is held", never "something went wrong". An answer that could
+        not be read AT ALL comes back as `is_error` instead, so a failure never
+        reaches you dressed as an empty account.
 
         `connector_id` and `account` follow the same rules as `get_balance`.
 
@@ -639,7 +655,18 @@ async def _quotes(hub, state: EdgeState, symbols: list[str]) -> dict:
         # this so usable()'s freshness check has a real receipt time to
         # measure against, not the tick's own later clock read.
         received_at = time.time()
-        for row in extract("get_quote", cap, (got or {}).get("data")):
+        rows = extract("get_quote", cap, (got or {}).get("data"))
+        if rows is None:
+            # The broker answered with something this map cannot read. Treated
+            # exactly like a connector that would not answer at all: no ticks
+            # from it, which brake.tick counts as famine and says out loud. An
+            # empty list here would be silence the brake cannot tell apart from
+            # a quiet price.
+            logging.getLogger("nakagai.edge").warning(
+                "%s answered get_quote with something its map cannot read; no "
+                "quotes from it this tick", connector_id)
+            continue
+        for row in rows:
             quote = normalize_quote(row, received_at)
             if quote:
                 # `symbol` is a required field of the capability, so every row

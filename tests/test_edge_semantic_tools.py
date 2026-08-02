@@ -240,6 +240,37 @@ async def test_list_positions_reads_both_brokers_into_one_shape(tmp_path, connec
                            ROBINHOOD: "get_equity_positions"}[connector]
 
 
+async def test_a_broker_holding_nothing_is_an_empty_list(tmp_path):
+    """The one shape that means "nothing held": a list, with nothing in it."""
+    hub = MapHub(payloads={"holdings": {"holdings": []}})
+    doc = await _call(_server(_state(tmp_path), hub), "list_positions",
+                      connector_id=ALIEN, account=ACCOUNTS[ALIEN])
+
+    assert doc["data"] == [] and not doc.get("is_error")
+
+
+async def test_an_unreadable_list_answer_is_an_error_not_an_empty_account(
+        tmp_path):
+    """A payload holding no list where the map says one lives is a FAILURE to
+    read, and the agent has to hear it as one.
+
+    This is the surface an agent consults before adding to a position. An
+    unreadable answer returned as `[]` reads as "the account is flat", which is
+    how a stale map or a changed broker shape turns one intended position into
+    two real ones. The brake is not the thing at risk here (its own position
+    re-read refuses to use `extract` for exactly this reason); the agent is.
+    """
+    hub = MapHub(payloads={"holdings": {"holdings": {"ticker": "aapl"}}})
+    doc = await _call(_server(_state(tmp_path), hub), "list_positions",
+                      connector_id=ALIEN, account=ACCOUNTS[ALIEN])
+
+    assert doc["is_error"] is True
+    assert doc["data"] is None
+    assert "NOT" in doc["error"] and ALIEN in doc["error"]
+    # Provenance survives the refusal: the call really was made.
+    assert (doc["capability"], doc["tool"]) == ("list_positions", "holdings")
+
+
 @pytest.mark.parametrize("connector", BOTH)
 async def test_get_quote_reads_both_brokers_into_one_shape(tmp_path, connector):
     hub = MapHub()

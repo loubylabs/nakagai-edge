@@ -87,13 +87,23 @@ def test_extract_drops_a_row_whose_required_field_is_unreadable():
     assert rows == [{"symbol": "MSFT", "quantity": 3.0}]
 
 
-def test_extract_returns_an_empty_list_when_no_items_path_matches():
-    assert extract("list_positions", POSITIONS, {"data": {}}) == []
+def test_extract_returns_none_when_no_items_path_matches():
+    # NOT []. The map named a node the payload does not have, so this answer
+    # was not read; "the broker holds nothing" is a different fact and it has
+    # its own value. An agent that cannot tell them apart reads a broken map as
+    # a flat account and buys what it already holds.
+    assert extract("list_positions", POSITIONS, {"data": {}}) is None
 
 
-def test_extract_returns_an_empty_list_when_the_items_root_is_not_a_list():
+def test_extract_returns_none_when_the_items_root_is_not_a_list():
     assert extract("list_positions", POSITIONS,
-                   {"data": {"positions": "none"}}) == []
+                   {"data": {"positions": "none"}}) is None
+
+
+def test_extract_returns_an_empty_list_only_for_a_genuinely_empty_one():
+    # The one shape that means "nothing held": the broker sent a list and it
+    # had nothing in it.
+    assert extract("list_positions", POSITIONS, {"data": {"positions": []}}) == []
 
 
 def test_read_row_enforces_required_fields():
