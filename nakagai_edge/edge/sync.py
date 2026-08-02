@@ -124,9 +124,13 @@ def _record_schema_error(state: EdgeState, reason: str) -> None:
     and get_connector_status can say what actually happened, since "stale"
     alone reads as a network problem and sends the owner hunting the wrong
     fault.
+
+    The timestamp goes with it, and advances on every refusal including a
+    repeat of the same one: see schema_error_at.
     """
     doc = meta(state)
     doc["schema_error"] = reason
+    doc["schema_error_at"] = time.time()
     state.meta_path.parent.mkdir(parents=True, exist_ok=True)
     state.meta_path.write_text(json.dumps(doc))
 
@@ -172,6 +176,23 @@ def fetched_at(state: EdgeState) -> float:
 def schema_error(state: EdgeState) -> str:
     """Why the last bundle was refused, or "" when the last one was readable."""
     return str(meta(state).get("schema_error", "") or "")
+
+
+def schema_error_at(state: EdgeState) -> float:
+    """When a bundle was last refused, or 0.0 if none ever was.
+
+    The same trick fetched_at plays, for the same reason: read it either side
+    of a sync and you can tell a refusal that just happened from one still on
+    record from an earlier call. A caller that cannot tell those apart reports
+    an outage as a schema mismatch, so an owner who has already upgraded the
+    platform reads the identical message again and concludes the upgrade did
+    not take. It advances on every refusal, a repeat of the same one included,
+    which a comparison of the reason itself could never do.
+    """
+    try:
+        return float(meta(state).get("schema_error_at", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def policy_fresh(state: EdgeState, ttl_s: int = POLICY_TTL_S) -> bool:
