@@ -96,6 +96,12 @@ def test_the_write_capabilities_require_nothing_and_parse_with_no_fields():
 # A place_order map is the only one whose ARGUMENT keys stay load-bearing after
 # the order is gone: warrant.read_entry reads the executed payload back through
 # them to build the ledger record the brake watches.
+#
+# Both tests below match on the COMPUTED clause, "no argument key for <list>;",
+# and not merely on a field name. The message also carries the constant tail
+# "all of symbol, side, quantity, price, stop must be mapped", which names all
+# five whatever the code worked out, so a looser pattern passes even when the
+# computed list is wrong or empty and pins nothing at all.
 
 
 def test_an_order_map_with_no_stop_key_is_rejected_at_parse_time():
@@ -104,14 +110,16 @@ def test_an_order_map_with_no_stop_key_is_rejected_at_parse_time():
     # early. No ledger record, no `blocked` reason, no anomaly and no audit
     # line: the position is missing from get_open_risk entirely while the
     # Portfolio page still shows it, and nothing anywhere says why.
-    with pytest.raises(ValueError, match="demo.*place_order.*stop"):
+    with pytest.raises(ValueError,
+                       match="demo.*place_order.*no argument key for stop;"):
         ConnectorSpec(**BASE, capabilities=_order_map("stop"))
 
 
 def test_an_order_map_missing_two_keys_names_both():
     # One hidden behind another costs a second edit and a second deploy to
     # find, with real orders placed in between.
-    with pytest.raises(ValueError, match="demo.*price, stop"):
+    with pytest.raises(ValueError,
+                       match="demo.*no argument key for price, stop;"):
         ConnectorSpec(**BASE, capabilities=_order_map("price", "stop"))
 
 

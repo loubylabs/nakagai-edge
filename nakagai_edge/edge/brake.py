@@ -340,13 +340,16 @@ class Brake:
         `spec.capability` lands in the same catch as an unreachable broker,
         because both are the same "no answer to read".
 
-        Deliberately NOT `extract`. That would collapse the one distinction
-        this whole function exists for, twice over: it returns `[]` for a
-        payload that is no list at all, and it DROPS a row whose quantity will
-        not read. Both would arrive here as an empty-or-symbol-less list, which
-        reads as 0.0 held, and fire() marks that record `released`, which is
-        TERMINAL. The peel and the per-row read are done by hand so that
-        "unreadable" can stay distinct from "not held".
+        Deliberately NOT `extract`, which would collapse the one distinction
+        this whole function exists for. `extract` DROPS a row whose quantity
+        will not read, and a list missing its row is indistinguishable from a
+        list that never held one: it arrives as 0.0 held, and fire() marks such
+        a record `released`, which is TERMINAL. `extract` no longer confuses an
+        unreadable PAYLOAD with an empty one (it returns None, not [], when the
+        map finds no list where it says one lives), but a dropped row is a hole
+        inside a list it read successfully, and nothing downstream can see it.
+        The peel and the per-row read are done by hand so that "unreadable" can
+        stay distinct from "not held".
         """
         try:
             spec = self.hub.spec(rec["connector_id"])

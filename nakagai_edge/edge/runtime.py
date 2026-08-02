@@ -171,14 +171,15 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
             tier = (list(accounts.allow) if CAPABILITIES[capability].is_write
                     else [*accounts.allow, *accounts.read])
             return tier[0] if len(tier) == 1 else ""
-        listed = await _capability_call("list_accounts", spec.id)
+        listed = await _capability_call("list_accounts", spec.id, internal=True)
         rows = listed.get("data") or []
         return str(rows[0].get("account") or "") if len(rows) == 1 else ""
 
     async def _capability_call(capability: str, connector_id: str = "",
                                args: dict | None = None, *,
                                required: tuple[str, ...] = (),
-                               signal_id: str = "") -> dict:
+                               signal_id: str = "",
+                               internal: bool = False) -> dict:
         """One semantic call: pick the connector, resolve, dial, read back.
 
         Every result carries its own provenance (`capability`, `connector`,
@@ -197,6 +198,19 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         VERBATIM: `place_order` and `cancel_order` declare no readable fields,
         so `extract` would return `{}` for them by construction and take the
         approval envelope (`approval_id` above all) with it.
+
+        `internal` marks a call this module makes on the agent's behalf inside
+        another one, rather than a call the agent made: `_infer_account`'s
+        `list_accounts` probe is the only one today. Such a call journals NO
+        refusal of its own. A connector with no `list_accounts` map is refusing
+        nothing the agent asked for, and the outer call goes on to succeed or
+        be denied on its own terms and to be journalled there. Recording the
+        probe would put "the agent was turned away" in the trail immediately
+        before a successful order, and a denial that did not happen is worse
+        than one that went unrecorded: the owner cannot tell it from a real
+        one. It suppresses the journal only, never the refusal itself, and only
+        for this one nested path; an agent calling `list_accounts` itself is
+        journalled like every other refusal.
         """
         from nakagai_edge.hub import ConnectorError
         if _gate() is not None:
@@ -205,8 +219,9 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
             # trade while the edge is cut off from the platform is exactly the
             # event an owner needs to find in the audit trail afterwards, and
             # without this line it would leave no trace at all.
-            audit.record("denial", connector_id, "",
-                         {"reason": "policy stale", "capability": capability})
+            if not internal:
+                audit.record("denial", connector_id, "",
+                             {"reason": "policy stale", "capability": capability})
             return {**STALE_POLICY, "capability": capability,
                     "connector": connector_id, "tool": ""}
         cid = connector_id
@@ -234,9 +249,13 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
             # would show an agent that looks idle while it is in fact being
             # turned away. `cid` is the connector actually chosen when the
             # refusal came after that point, and the caller's own (possibly
-            # empty) argument when it came before.
-            audit.record("denial", cid, "",
-                         {"reason": str(e), "capability": capability})
+            # empty) argument when it came before. `internal` calls are silent
+            # here for the reason the docstring gives: they refuse nothing the
+            # agent asked for, and the call they belong to is journalled on its
+            # own terms.
+            if not internal:
+                audit.record("denial", cid, "",
+                             {"reason": str(e), "capability": capability})
             return {"is_error": True, "error": str(e), "capability": capability}
         out = await _guarded(cid, tool, broker_args, signal_id=signal_id,
                              capability=capability)

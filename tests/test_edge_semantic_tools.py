@@ -408,6 +408,11 @@ async def test_a_capability_the_connector_never_declared_names_both(tmp_path):
     # Unmapped: refused by `spec.capability`, after the connector was chosen.
     (_without(ALIEN_CONNECTOR, "list_positions"), "list_positions",
      {"connector_id": ALIEN, "account": "AL-1"}, ALIEN),
+    # The same refusal on `list_accounts`, which the account-inference probe
+    # also runs into. An agent that asked for it ITSELF is being turned away
+    # and the trail has to say so; the probe below is not, and does not.
+    (_without(ALIEN_CONNECTOR, "list_accounts"), "list_accounts",
+     {"connector_id": ALIEN}, ALIEN),
     # Ambiguous: refused by `_pick_connector`, before one was chosen, so the
     # event names no broker rather than one nothing was sent to.
     (None, "get_balance", {}, ""),
@@ -435,6 +440,34 @@ async def test_every_pre_guard_refusal_is_journalled(tmp_path, specs, tool,
     assert events[0]["detail"]["capability"] == tool
     # The reason is the sentence the agent was given, not a category.
     assert events[0]["detail"]["reason"] == doc["error"]
+
+
+async def test_a_failed_inference_probe_journals_no_denial(tmp_path):
+    """A denial that did not happen is worse than one that went unrecorded.
+
+    `_infer_account` asks the connector for its accounts when the owner
+    configured no tiers. That probe is a step INSIDE the agent's call, not
+    something the agent asked for, so a connector with no `list_accounts` map
+    refuses nothing: the outer call carries on and is journalled on its own
+    terms. Left unsuppressed, a successful order would sit in the trail behind
+    a `denial` naming a capability the agent never called, and an owner reading
+    it cannot tell that from a real refusal.
+    """
+    caps = {k: v for k, v in ALIEN_CONNECTOR["capabilities"].items()
+            if k != "list_accounts"}
+    accounts = {**ALIEN_CONNECTOR["guardrails"]["accounts"],
+                "allow": [], "read": []}
+    # No tiers AND no list_accounts map: the only shape that reaches the probe
+    # and then fails inside it.
+    entry = {**ALIEN_CONNECTOR, "capabilities": caps,
+             "guardrails": {**ALIEN_CONNECTOR["guardrails"], "accounts": accounts}}
+    state = _state(tmp_path)
+    hub = MapHub(specs=_specs(entry))
+
+    doc = await _call(_server(state, hub), "get_balance")
+
+    assert not doc.get("is_error"), "the outer call is unaffected by the probe"
+    assert [e["kind"] for e in EdgeAudit(state).pending()] == ["call"]
 
 
 # ---- account inference ----------------------------------------------------

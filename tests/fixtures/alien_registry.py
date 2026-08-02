@@ -46,8 +46,9 @@ ALIEN_CONNECTOR = {
         # order, and the first is the single one the edge sends when it places
         # one or builds a stop's exit. Leading with BUY_TO_OPEN would send that
         # for every buy, including the one meant to cover a short, which is the
-        # trap README:153 warns about; a fixture every migrated path is tested
-        # against should model the practice rather than the trap.
+        # trap README's "The order inside `values.side` is load-bearing" rule
+        # warns about; a fixture every migrated path is tested against should
+        # model the practice rather than the trap.
         "place_order": {
             "tool": "submit",
             "args": {"symbol": "ticker", "side": "action", "quantity": "qty",
