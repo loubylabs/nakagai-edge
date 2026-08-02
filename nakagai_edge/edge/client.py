@@ -2,6 +2,9 @@
 enqueue is called from inside the hub's guardrail path (a sync method), and
 every other call sits in its own background thread/loop."""
 
+import hashlib
+import json
+
 import httpx
 
 
@@ -17,6 +20,24 @@ class EdgeClientError(Exception):
     def __init__(self, message: str, status: int | None = None) -> None:
         super().__init__(message)
         self.status = status
+
+
+def _tool_digest(tools: list[dict]) -> str:
+    """A stable fingerprint of one connector's tool list.
+
+    Name and inputSchema only, sorted by name, each schema serialized with
+    sorted keys. What the platform derives a capability map from is the tool a
+    broker offers and the arguments it takes; the order the downstream happened
+    to list them in, and the key order inside a schema, are not changes to
+    that. Without both sortings a server that re-serializes its schemas
+    differently between two calls would look changed every sixty seconds
+    forever, which is the exact resend this digest exists to prevent.
+    """
+    projection = sorted(
+        (str(tool.get("name") or ""),
+         json.dumps(tool.get("inputSchema") or {}, sort_keys=True, default=str))
+        for tool in tools)
+    return hashlib.sha256(json.dumps(projection).encode()).hexdigest()
 
 
 def _detail(resp: httpx.Response) -> str:
@@ -41,6 +62,11 @@ class PlatformClient:
         self._client = httpx.Client(
             base_url=platform_url.rstrip("/"), timeout=timeout, transport=transport,
             headers={"Authorization": f"Bearer {token}"})
+        # connector id -> digest of the tool list the platform has actually
+        # taken, so report_connectors can leave unchanged schemas at home. In
+        # memory on purpose: a restart re-sends once, which costs one payload
+        # and cannot disagree with the platform the way a cache file could.
+        self._reported_tools: dict[str, str] = {}
 
     def close(self) -> None:
         self._client.close()
@@ -112,8 +138,36 @@ class PlatformClient:
         # What this edge can currently reach, so the owner sees it in the web UI
         # without the platform ever holding the broker credential. Status is not
         # a secret; the token is, and the token stays here.
-        return self._check(self._client.post("/api/agent/connectors",
-                                             json={"connectors": connectors}))
+        #
+        # The tool schemas ride only when they have changed since the last
+        # report the platform took. Robinhood publishes thirty-odd tools with
+        # full JSON schemas, this runs every sixty seconds, and the list changes
+        # about never: sending it regardless would be a steady tax on someone's
+        # home connection for no new information. An unchanged entry says
+        # `tools_unchanged` rather than simply dropping the key, so the platform
+        # can tell "you already hold these" apart from "this connector has no
+        # tools", which are different facts about a connector.
+        payload, digests = [], {}
+        for row in connectors:
+            entry = dict(row)   # the caller still holds `row`; never edit it
+            if entry.get("tools") is None:
+                payload.append(entry)
+                continue
+            connector_id = str(entry.get("id") or "")
+            digest = _tool_digest(entry["tools"])
+            digests[connector_id] = digest
+            if self._reported_tools.get(connector_id) == digest:
+                del entry["tools"]
+                entry["tools_unchanged"] = True
+            payload.append(entry)
+        out = self._check(self._client.post("/api/agent/connectors",
+                                            json={"connectors": payload}))
+        # Only once the report has landed. A call that raised above delivered
+        # nothing, and remembering its digest would leave the platform without
+        # schemas it never received until the tool list happened to change
+        # again, which for a stable broker is never.
+        self._reported_tools.update(digests)
+        return out
 
     def report_portfolio(self, connectors: list[dict]) -> dict:
         # The edge's own figures for the owner's Portfolio page. Display state

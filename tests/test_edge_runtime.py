@@ -1,5 +1,7 @@
 """Edge runtime surface: freshness gate, tool passthrough, hub wiring."""
 
+import asyncio
+import contextlib
 import json
 import logging
 import time
@@ -516,3 +518,131 @@ async def test_get_open_risk_is_self_consistent_after_a_per_position_disarm(tmp_
     guarded_ids = {r["position_id"] for r in out["positions"] if r["guarded"]}
     assert not (guarded_ids & set(out["disarmed_positions"]))
     assert out["positions"][0]["guarded"] is False
+
+
+# ---- the tool schemas the platform cannot fetch for itself ----------------
+#
+# The platform never dials a broker, so a connector's tool list and JSON
+# schemas reach it only if this edge ships them. They ride the connector
+# report, not the agent-facing status tools: `list_connectors` is read by an
+# agent that pays tokens for every byte, and `list_connector_tools` already
+# serves the schemas per connector, on demand.
+
+SPEC = {"id": "demo", "kind": "mcp-http", "role": "broker",
+        "url": "https://example.test/mcp/", "enabled": True}
+
+LISTED_TOOL = {
+    "name": "get_account",
+    "title": "Get account",
+    "description": "Balances for one account",
+    "inputSchema": {"type": "object",
+                    "properties": {"account": {"type": "string"}}},
+    "outputSchema": {"type": "object"},
+    "annotations": {"readOnlyHint": True},
+    "_meta": {"noise": True},
+}
+
+
+def test_to_dict_carries_each_tools_name_description_and_schema():
+    from nakagai_edge.hub import Connection
+    row = Connection(spec=ConnectorSpec(**SPEC), status="connected",
+                     tools=[LISTED_TOOL]).to_dict(with_tools=True)
+    assert row["tool_count"] == 1
+    # Exactly three keys: outputSchema, annotations and _meta are the
+    # downstream's business, and shipping them would put bytes on the wire
+    # every cycle that nothing upstream reads.
+    assert row["tools"] == [{
+        "name": "get_account",
+        "description": "Balances for one account",
+        "inputSchema": {"type": "object",
+                        "properties": {"account": {"type": "string"}}}}]
+
+
+def test_to_dict_leaves_the_schemas_out_unless_they_are_asked_for():
+    from nakagai_edge.hub import Connection
+    row = Connection(spec=ConnectorSpec(**SPEC), status="connected",
+                     tools=[LISTED_TOOL]).to_dict()
+    assert "tools" not in row and row["tool_count"] == 1
+
+
+def test_to_dict_of_a_connector_that_never_connected_still_has_a_tool_list():
+    from nakagai_edge.hub import Connection
+    row = Connection(spec=ConnectorSpec(**SPEC)).to_dict(with_tools=True)
+    assert row["status"] == "disconnected"
+    assert row["tools"] == [] and row["tool_count"] == 0
+
+
+def test_a_tool_that_publishes_no_description_or_schema_still_reports_both_keys():
+    # A predictable payload: the platform reads three keys off every entry
+    # rather than three keys off some of them.
+    from nakagai_edge.hub import Connection
+    row = Connection(spec=ConnectorSpec(**SPEC), status="connected",
+                     tools=[{"name": "ping"}]).to_dict(with_tools=True)
+    assert row["tools"] == [{"name": "ping", "description": "", "inputSchema": {}}]
+
+
+async def test_the_status_tools_do_not_hand_the_agent_every_schema(tmp_path):
+    """`list_connectors` answers "which broker can be asked what", and an
+    agent pays tokens for every byte of it. Thirty JSON schemas belong in the
+    connector report, and in `list_connector_tools` when actually asked for."""
+    state = _state(tmp_path)
+    client = PlatformClient("https://api.test", "t",
+                            transport=httpx.MockTransport(lambda r: httpx.Response(500)))
+    hub = build_hub(state, client)
+    audit = EdgeAudit(state)
+    mcp = create_edge_mcp(state, hub, client, audit, _Reporter(),
+                          Brake(state, hub, client, audit))
+    for tool in ("list_connectors", "get_connector_status"):
+        result = await mcp.call_tool(tool, {})
+        text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+        assert "inputSchema" not in text, f"{tool} shipped downstream schemas"
+
+
+async def test_the_syncer_survives_a_report_that_raises(tmp_path, monkeypatch, caplog):
+    """The connector report is best-effort and the syncer runs forever: one
+    uncaught exception out of it would kill every later sync too, not just
+    this cycle's report. The schema guard runs inside that call, so it must
+    not become a new way for the loop to die."""
+    import nakagai_edge.edge.runtime as runtime
+    monkeypatch.setattr(runtime, "SYNC_INTERVAL_S", 0.01)
+    state = _state(tmp_path)
+    calls = {"bundle": 0, "report": 0}
+
+    def handler(req):
+        if req.url.path == "/api/agent/bundle":
+            calls["bundle"] += 1
+            return httpx.Response(200, json={"bundle_version": "v1",
+                                             "schema_version": BUNDLE_SCHEMA,
+                                             "connectors": {"connectors": []},
+                                             "signing_public_key": "k"},
+                                  headers={"etag": "v1"})
+        return httpx.Response(404, json={"detail": "?"})
+
+    client = PlatformClient("https://api.test", "t",
+                            transport=httpx.MockTransport(handler))
+
+    def boom(connectors):
+        calls["report"] += 1
+        raise RuntimeError("the schema guard blew up")
+
+    client.report_connectors = boom
+    hub = build_hub(state, client)
+    audit = EdgeAudit(state)
+
+    caplog.set_level(logging.WARNING, logger="nakagai.edge")
+    tasks = await runtime._loops(state, hub, client, audit, _Reporter(),
+                                 Brake(state, hub, client, audit))
+    for _ in range(200):
+        if calls["report"] >= 2:
+            break
+        await asyncio.sleep(0.01)
+    for t in tasks:
+        t.cancel()
+    for t in tasks:
+        with contextlib.suppress(asyncio.CancelledError):
+            await t
+
+    assert calls["report"] >= 2, "the loop died on the first raising report"
+    assert calls["bundle"] >= 2, "sync_once stopped running too, not just the report"
+    assert any("connector" in r.message.lower() for r in caplog.records)
+    await hub.aclose()

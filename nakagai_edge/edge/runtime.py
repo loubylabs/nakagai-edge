@@ -657,15 +657,24 @@ async def _loops(state: EdgeState, hub, client: PlatformClient, audit: EdgeAudit
             await asyncio.to_thread(sync_once, state, client)
             try:
                 # The platform cannot dial our connectors, so we tell it what we
-                # see. Best-effort: a platform that is down must not stop the
-                # edge from serving its agent. Caught broadly, like executor()
-                # below: EdgeClientError and httpx.HTTPError cover a rejected
-                # token or an unreachable platform, but this loop runs forever
-                # and a single uncaught exception (a non-JSON 200 body raising
+                # see. `with_tools` carries each downstream's own tool schemas,
+                # which the platform has no other way to read at all and which
+                # its capability-map derivation is built on; report_connectors
+                # holds them back on the cycles where nothing changed, so this
+                # stays cheap at a sixty-second cadence.
+                #
+                # Best-effort: a platform that is down must not stop the edge
+                # from serving its agent. Caught broadly, like executor() below:
+                # EdgeClientError and httpx.HTTPError cover a rejected token or
+                # an unreachable platform, but this loop runs forever and a
+                # single uncaught exception (a non-JSON 200 body raising
                 # ValueError inside _check, say) would kill it for good, taking
-                # every later sync down with it, not just this one report.
+                # every later sync down with it, not just this one report. A
+                # report that failed here is resent in full next cycle: the
+                # digest moves only after the platform has taken it.
                 await asyncio.to_thread(
-                    client.report_connectors, hub.status()["connectors"])
+                    client.report_connectors,
+                    hub.status(with_tools=True)["connectors"])
             except Exception as e:
                 logging.getLogger("nakagai.edge").warning(
                     "connector status not reported to the platform this "

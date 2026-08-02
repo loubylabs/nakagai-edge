@@ -66,8 +66,17 @@ class Connection:
     _ready: asyncio.Future | None = None
     _stop: asyncio.Event | None = None
 
-    def to_dict(self) -> dict:
-        return {
+    def to_dict(self, *, with_tools: bool = False) -> dict:
+        """This connector's runtime state, as data.
+
+        `with_tools` adds the downstream's own tool schemas. Off by default
+        because the two big readers want opposite things: the platform's
+        connector report needs the schemas (it can never dial a broker to read
+        them itself), while `list_connectors` is answered to an agent that pays
+        tokens for every byte and already has `list_connector_tools` for the
+        one connector it cares about.
+        """
+        out = {
             "id": self.spec.id, "name": self.spec.name or self.spec.id,
             "kind": self.spec.kind, "role": self.spec.role,
             "enabled": self.spec.enabled, "status": self.status,
@@ -80,6 +89,18 @@ class Connection:
             # before it calls one, rather than discovering the gap as a refusal.
             "capabilities": self.spec.capability_names,
         }
+        if with_tools:
+            # Three keys per tool, never the whole dict: name and inputSchema
+            # are what a capability map is derived from, description is what
+            # the human approving that map reads. outputSchema, annotations and
+            # _meta would be bytes on the wire nothing upstream looks at. Every
+            # key is always present, so the reader takes three fields off every
+            # entry rather than three off some of them.
+            out["tools"] = [{"name": t.get("name") or "",
+                             "description": t.get("description") or "",
+                             "inputSchema": t.get("inputSchema") or {}}
+                            for t in self.tools]
+        return out
 
 
 def serialize_result(result) -> dict:
@@ -405,17 +426,22 @@ class ConnectorHub:
                 "tools": [t.get("name") for t in conn.tools],
                 "server_info": conn.server_info}
 
-    def status(self) -> dict:
-        """Runtime view of every registered connector (no connection attempted)."""
+    def status(self, *, with_tools: bool = False) -> dict:
+        """Runtime view of every registered connector (no connection attempted).
+
+        `with_tools` carries each connector's tool schemas through: see
+        Connection.to_dict for why the platform's report asks for them and the
+        agent-facing status tools do not.
+        """
         specs = self.load_specs()
         out = []
         for cid, spec in specs.items():
             conn = self._conns.get(cid)
             if conn:
                 conn.spec = spec
-                out.append(conn.to_dict())
+                out.append(conn.to_dict(with_tools=with_tools))
             else:
-                out.append(Connection(spec=spec).to_dict())
+                out.append(Connection(spec=spec).to_dict(with_tools=with_tools))
         return {"connectors": out}
 
 
