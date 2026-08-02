@@ -44,7 +44,8 @@ def test_the_two_connectors_spell_a_buy_differently():
     _, rh = resolve("place_order",
                     SPECS["robinhood-trading"].capability("place_order"),
                     {"side": "buy"})
-    assert alien == {"action": "BUY_TO_OPEN"}
+    # The first alias each connector lists, in the broker's own key.
+    assert alien == {"action": "BUY"}
     assert rh == {"side": "buy"}
 
 

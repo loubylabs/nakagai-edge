@@ -49,7 +49,10 @@ def test_read_entry_refuses_a_container_under_a_declared_key():
 
 
 def test_closing_side_inverts_through_each_connectors_own_words():
-    assert closing_side(ALIEN, "buy_to_open") == "SELL_TO_CLOSE"
+    # The entry is recognized by any alias the connector lists; the exit is
+    # sent as the FIRST one on the opposite side, which is why a connector puts
+    # the spelling that is correct whether it opens or closes at the front.
+    assert closing_side(ALIEN, "buy_to_open") == "SELL"
     assert closing_side(RH, "buy") == "sell"
     assert closing_side(RH, "sell_short") == "buy"
 
@@ -57,7 +60,7 @@ def test_closing_side_inverts_through_each_connectors_own_words():
 def test_exit_order_args_strips_price_and_stop_and_merges_market_args():
     args = exit_order_args(ALIEN, ALIEN_ENTRY, 10.0)
     assert args == {"acct": "AL-1", "ticker": "aapl",
-                    "action": "SELL_TO_CLOSE", "qty": 10.0, "kind": "MARKET"}
+                    "action": "SELL", "qty": 10.0, "kind": "MARKET"}
     assert "limit" not in args and "trigger" not in args
 
 

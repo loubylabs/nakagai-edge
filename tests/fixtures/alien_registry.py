@@ -41,12 +41,19 @@ ALIEN_CONNECTOR = {
             "args": {"symbols": "tickers"},
             "items": ["ticks"],
             "fields": {"symbol": ["tkr"], "price": ["last"]}},
+        # The plain verb FIRST, then the ones the broker also answers with.
+        # Every spelling here is recognized when a side is read back off an
+        # order, and the first is the single one the edge sends when it places
+        # one or builds a stop's exit. Leading with BUY_TO_OPEN would send that
+        # for every buy, including the one meant to cover a short, which is the
+        # trap README:153 warns about; a fixture every migrated path is tested
+        # against should model the practice rather than the trap.
         "place_order": {
             "tool": "submit",
             "args": {"symbol": "ticker", "side": "action", "quantity": "qty",
                      "price": "limit", "stop": "trigger", "account": "acct"},
-            "values": {"side": {"buy": ["BUY_TO_OPEN", "BUY_TO_COVER"],
-                                "sell": ["SELL_TO_CLOSE", "SELL_SHORT"]}},
+            "values": {"side": {"buy": ["BUY", "BUY_TO_OPEN", "BUY_TO_COVER"],
+                                "sell": ["SELL", "SELL_TO_CLOSE", "SELL_SHORT"]}},
             "market_args": {"kind": "MARKET"}},
         "list_orders": {
             "tool": "orders",
@@ -54,8 +61,8 @@ ALIEN_CONNECTOR = {
             "items": ["working"],
             "fields": {"order_id": ["ref"], "symbol": ["tkr"], "side": ["action"],
                        "quantity": ["qty"], "status": ["stage"]},
-            "values": {"side": {"buy": ["BUY_TO_OPEN", "BUY_TO_COVER"],
-                                "sell": ["SELL_TO_CLOSE", "SELL_SHORT"]}}},
+            "values": {"side": {"buy": ["BUY", "BUY_TO_OPEN", "BUY_TO_COVER"],
+                                "sell": ["SELL", "SELL_TO_CLOSE", "SELL_SHORT"]}}},
         "cancel_order": {
             "tool": "scrub",
             "args": {"order_id": "ref", "account": "acct"}},

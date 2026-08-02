@@ -450,7 +450,7 @@ async def test_a_write_infers_the_single_allowed_account(tmp_path):
     await _call(_server(_state(tmp_path), hub), "place_order",
                 symbol="AAPL", side="buy", quantity=1)
 
-    assert hub.args == [{"ticker": "AAPL", "action": "BUY_TO_OPEN", "qty": 1.0,
+    assert hub.args == [{"ticker": "AAPL", "action": "BUY", "qty": 1.0,
                          "acct": "AL-1"}]
 
 
@@ -611,7 +611,7 @@ async def test_place_order_returns_the_approval_envelope_intact(tmp_path):
     # Translated on the way down: the broker's own words are what the human
     # sees on the approval screen and what the edge later executes.
     assert posted[0]["args"] == {"acct": "AL-1", "ticker": "AAPL",
-                                 "action": "BUY_TO_OPEN", "qty": 1.0,
+                                 "action": "BUY", "qty": 1.0,
                                  "limit": 190.0}
 
 
