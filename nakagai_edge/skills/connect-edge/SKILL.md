@@ -12,14 +12,15 @@ up), and the `nakagai-mcp` connector actually reaching the platform's `/mcp/`
 endpoint. Verify all four; the first three can be healthy while the fourth
 401s.
 
-All commands run from the repo that contains this package. Inside the
-monorepo use `uv run nakagai-edge ...`; in a standalone install the
-`nakagai-edge` entrypoint is on PATH.
+Every command below runs from anywhere, with no checkout of anything. `uvx
+nakagai-edge ...` fetches the published package and runs it; if the package is
+already installed, the `nakagai-edge` entrypoint on PATH is the same binary and
+either form works.
 
 ## 1. Establish current state
 
 ```bash
-uv run nakagai-edge status
+uvx nakagai-edge status
 ```
 
 - `"paired": true` with the right `platform_url`: skip to step 3.
@@ -38,7 +39,7 @@ agent". A human must fetch it; there is no CLI path to mint one from the edge
 side.
 
 ```bash
-uv run nakagai-edge setup <code> --platform https://api.nakag.ai
+uvx nakagai-edge setup <code> --platform https://api.nakag.ai
 ```
 
 `setup` is idempotent (pair, sync, optional broker login, serve). To drive
@@ -48,8 +49,8 @@ the steps individually: `pair <code> --platform <url>`, then `sync`, then
 ## 3. Sync, then serve
 
 ```bash
-uv run nakagai-edge sync
-uv run nakagai-edge run          # long-running; background it
+uvx nakagai-edge sync
+uvx nakagai-edge run          # long-running; background it
 ```
 
 `run` serves MCP on `http://127.0.0.1:8330/mcp/` and starts the sync,
@@ -57,11 +58,11 @@ executor, audit-ship, and portfolio loops. Point the agent's MCP client at
 that one URL; it carries platform tools, broker tools, and approval polling.
 
 Registry rewrites are etag-gated: `sync` rewrites `config/connectors.yaml`
-only when the platform bundle changed. After changing the local rewrite logic
-(`nakagai_edge/edge/sync.py`), force a rewrite:
+only when the platform bundle changed. So a registry that looks stale after an
+edge upgrade has simply never been rewritten. Drop the cached etag to force it:
 
 ```bash
-rm ~/.nakagai/edge/cache/meta.json && uv run nakagai-edge sync
+rm ~/.nakagai/edge/cache/meta.json && uvx nakagai-edge sync
 ```
 
 ## 4. Verify, in order
@@ -82,7 +83,7 @@ the proof.
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| `nakagai-mcp` fails with `401 Unauthorized for url .../mcp/` while the same token works on `/api/agent/*` | The connector URL lacks the trailing slash. The platform mounts at `/mcp/` and 307-redirects the bare path; behind a TLS-terminating proxy (Fly) the Location header says `http://`, and httpx drops the Authorization header on a redirect to an insecure origin. | The sync rewrite must emit `<platform>/mcp/` (trailing slash) so no redirect happens; see `_edge_connectors_doc` in `nakagai_edge/edge/sync.py`. After fixing, force a registry rewrite (step 3) and restart `run`. |
+| `nakagai-mcp` fails with `401 Unauthorized for url .../mcp/` while the same token works on `/api/agent/*` | The connector URL lacks the trailing slash. The platform mounts at `/mcp/` and 307-redirects the bare path; behind a TLS-terminating proxy (Fly) the Location header says `http://`, and httpx drops the Authorization header on a redirect to an insecure origin. | The synced registry must carry `<platform>/mcp/` (trailing slash) so no redirect happens. Current releases write it that way, so upgrade the edge, force a registry rewrite (step 3) and restart `run`. Confirm the fix in `~/.nakagai/edge/config/connectors.yaml`: the `nakagai-mcp` url ends in a slash. |
 | Registry edits never appear in `config/connectors.yaml` | Etag-gated sync skipped the rewrite | `rm ~/.nakagai/edge/cache/meta.json` then `sync` |
 | Every connector call refused with "policy stale" | Edge cannot reach the platform and the policy TTL (15 min) expired | Restore connectivity, `sync`; this is fail-closed by design |
 | `edge is not paired` from `run` | No `agent.json` | Step 2 |
@@ -108,7 +109,8 @@ stripped headers), not in pairing.
 
 ## Related
 
-- `docs/public/edge.md` (custody model, write path, the two distinct logins)
-- `docs/public/agent-pairing.md` (token model, minting, revocation)
-- Broker OAuth is separate from platform pairing: `nakagai-edge login <id>`
+- `https://app.nakag.ai/docs/edge` (custody model, write path, the two distinct
+  logins). The docs viewer is behind a login, so it needs the owner's session.
+- `https://app.nakag.ai/docs/agent-pairing` (token model, minting, revocation)
+- Broker OAuth is separate from platform pairing: `uvx nakagai-edge login <id>`
   writes `secrets/tokens/<id>.json`; platform pairing never touches it.

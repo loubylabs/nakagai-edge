@@ -33,7 +33,9 @@ You cannot mint your own credential; the owner does it in the web app:
 - **Edge mode**: shows a single-use pairing code valid for 10 minutes. The
   code is not the credential; it is exchanged for one (step 2b).
 
-Self-hosters can also mint on the platform machine itself:
+Self-hosters can also mint on the platform machine itself. This one is not an
+edge command and there is no `uvx` form of it: it is the platform's own CLI, run
+from a platform checkout with that checkout's environment loaded.
 
 ```bash
 set -a && source .env.local && set +a
@@ -62,7 +64,7 @@ Two rules that prevent the two classic failures:
 
 ## Step 2b: edge connection (pairing code in hand)
 
-Normally the edge CLI does the exchange (`nakagai-edge setup <code>
+Normally the edge CLI does the exchange (`uvx nakagai-edge setup <code>
 --platform https://api.nakag.ai`; see the `connect-edge` skill). The
 underlying contract, for any client that must do it by hand:
 
@@ -90,7 +92,7 @@ Once connected, in order:
    `account_equity` and `day_pnl` together or not at all.
 3. `get_signals(since="today")` on the very first call to bootstrap your
    cursor; afterwards call it bare, the cursor is keyed to your token.
-4. Run `nakagai-edge listen`. It holds the channel for you, so there is no
+4. Run `uvx nakagai-edge listen`. It holds the channel for you, so there is no
    `await_events` loop to write: one JSON object per event, on stdout, with
    the `seq` you should dedupe on.
    **Answer a line only when `reply_expected` is true**, with
@@ -138,7 +140,8 @@ lands on the owner's activity feed.
 
 ## Related
 
-- `docs/public/agent-pairing.md` (token model, the three secrets, full loop
-  walkthrough)
-- `docs/public/edge.md` (custody split, write path)
+- `https://app.nakag.ai/docs/agent-pairing` (token model, the three secrets,
+  full loop walkthrough). The docs viewer is behind a login, so it needs the
+  owner's session.
+- `https://app.nakag.ai/docs/edge` (custody split, write path)
 - `connect-edge` skill (running and debugging the edge itself)

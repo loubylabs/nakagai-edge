@@ -26,7 +26,7 @@ refused = not running: `connect-edge` step 3.
 ## Rung 2: pairing and policy
 
 ```bash
-uv run nakagai-edge status
+uvx nakagai-edge status
 ```
 
 Expect `paired: true`, the intended `platform_url`, and `policy_fresh:
@@ -65,7 +65,7 @@ These prove data flows OUT to the platform, not just that auth works:
 3. `refresh_portfolio()`: expect a portfolio document; it was also pushed
    to the owner's Portfolio page. A rate-limit echo (same snapshot within
    15s) still counts as green.
-4. `nakagai-edge listen` in a scratch terminal: a `[listen] holding from
+4. `uvx nakagai-edge listen` in a scratch terminal: a `[listen] holding from
    cursor N` line on stderr is green, and the owner's chat pane should read
    "Agent connected" while it runs. Ctrl-C to stop. The point is that the
    long-poll channel answers rather than errors.
@@ -111,4 +111,5 @@ than green; unverified and green must never look the same.
 
 - `connect-edge` (repair anything red in rungs 1-3)
 - `pair-agent` (credential problems, revocation, re-pairing)
-- `docs/public/edge.md` (write path and failure-mode reference)
+- `https://app.nakag.ai/docs/edge` (write path and failure-mode reference). The
+  docs viewer is behind a login, so it needs the owner's session.
