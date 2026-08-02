@@ -51,6 +51,15 @@ class CapabilitySpec:
     is_write: bool
 
 
+# The five fields that identify and size one order. A statement about the
+# `place_order` capability, so it belongs here beside the vocabulary rather
+# than in the modules that consume it: config.py validates a declared map
+# against this tuple at parse time, and warrant.py reads an executed entry
+# through it. Two copies would let those two drift, and a `place_order` map the
+# validator accepts but `read_entry` cannot read is a live position with no
+# brake on it.
+ORDER_FIELDS = ("symbol", "side", "quantity", "price", "stop")
+
 CAPABILITIES: dict[str, CapabilitySpec] = {
     "list_accounts": CapabilitySpec(
         args=(), required=("account",), optional=("nickname", "type"),
@@ -71,7 +80,7 @@ CAPABILITIES: dict[str, CapabilitySpec] = {
         optional=("side", "quantity", "status"),
         is_list=True, is_write=False),
     "place_order": CapabilitySpec(
-        args=("symbol", "side", "quantity", "price", "stop", "account"),
+        args=ORDER_FIELDS + ("account",),
         required=(), optional=(), is_list=False, is_write=True),
     "cancel_order": CapabilitySpec(
         args=("order_id", "account"), required=(), optional=(),

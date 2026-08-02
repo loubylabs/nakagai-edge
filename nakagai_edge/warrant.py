@@ -19,7 +19,7 @@ canonical field and declares how that broker spells "market order".
 import math
 import time
 
-from nakagai_edge.capability import Capability
+from nakagai_edge.capability import ORDER_FIELDS, Capability
 from nakagai_edge.signing import verify_artifact
 
 WARRANT_KIND = "exit_warrant"
@@ -130,13 +130,14 @@ def authorizes(public_key: str, warrant: dict, exit_order: dict, *,
 # position records as unguarded.
 
 
-ORDER_FIELDS = ("symbol", "side", "quantity", "price", "stop")
-
-
 def configured(cap: Capability) -> bool:
     """Can this connector's order payload be read at all?
 
-    All five identity-and-size fields must be declared. `market_args` is
+    All five identity-and-size fields must be declared, and config.py refuses
+    a `place_order` map that omits one, so a spec that parsed cannot reach here
+    unconfigured. This stays as the local statement of the rule: a Capability
+    built in code rather than loaded from the registry never went past that
+    validator. `market_args` is
     deliberately not here: a map without it is perfectly READABLE, it just
     cannot express an exit, and the caller says so in the owner's words.
     Folding it in would surface a missing declaration as "the order could not

@@ -105,11 +105,18 @@ def test_a_connector_that_declares_no_place_order_is_not_supervised(tmp_path):
 def test_a_place_order_map_missing_a_field_is_not_supervised(tmp_path):
     # Declared, but not completely: with no stop key there is no level, so
     # there is nothing for the brake to watch.
+    #
+    # The spec is built whole and then broken by hand because config.py now
+    # refuses this map at parse time, so no registry can produce one. The check
+    # inside supervise() stays anyway: a Capability constructed in code never
+    # went past that validator, and the alternative is a ledger record keyed on
+    # field names nobody declared.
     state = EdgeState(tmp_path)
-    partial = PLACE_ORDER.model_copy(update={"args": {
-        k: v for k, v in PLACE_ORDER.args.items() if k != "stop"}})
-    supervise(FakeHub(partial), state, "ap_1", _intent(),
-              _record({"grant_id": "wr_1"}), {})
+    hub = FakeHub()
+    hub.spec("demo").capabilities["place_order"] = PLACE_ORDER.model_copy(
+        update={"args": {k: v for k, v in PLACE_ORDER.args.items()
+                         if k != "stop"}})
+    supervise(hub, state, "ap_1", _intent(), _record({"grant_id": "wr_1"}), {})
     assert load(state) == {}
 
 

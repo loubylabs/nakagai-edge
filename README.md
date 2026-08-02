@@ -142,13 +142,28 @@ package:
         avg_price: [cost]
     place_order:
       tool: submit
-      args: {symbol: ticker, side: action, quantity: qty, account: acct}
+      args:
+        symbol: ticker
+        side: action
+        quantity: qty
+        price: limit
+        stop: trigger
+        account: acct
       values:
         side:
           buy: [BUY]
           sell: [SELL]
       market_args: {kind: MARKET}
 ```
+
+**A `place_order` map has to name all five order keys**: symbol, side,
+quantity, price and stop. The edge reads an executed entry back through them to
+build the ledger record the brake watches, so a map missing one places real
+orders that are then supervised by nothing, absent from `get_open_risk` while
+the Portfolio page still lists them. A connector declaring an incomplete
+`place_order` is refused when the registry is parsed, by name and by which keys
+are missing, rather than found later by a position that had no stop watching
+it. A connector that places no orders at all simply declares no `place_order`.
 
 **The order inside `values.side` is load-bearing.** The list is every spelling
 this connector recognizes when it reads a side back off an order, and the first
