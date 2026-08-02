@@ -700,7 +700,7 @@ def test_status_carries_the_flag_to_every_row_it_builds(tmp_path):
     registered connector with no live Connection object gets the same treatment
     as one that has it. The client decides what to SAY about a connector that
     is not connected; the hub reports uniformly."""
-    state, client, hub = _live_connector(tmp_path)
+    _, _, hub = _live_connector(tmp_path)
     hub._conns.clear()      # registered, never dialed: the placeholder branch
     rows = hub.status(with_tools=True)["connectors"]
     assert [r["status"] for r in rows] == ["disconnected"]
