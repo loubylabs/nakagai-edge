@@ -24,33 +24,124 @@ call, the platform placed the trade. The fix is a custody split:
   `127.0.0.1` to the agent, dials brokers with local credentials, and dials
   the platform as just another connector using the agent's own token.
 
-**One-endpoint topology.** The edge proxies the platform's MCP tools upstream,
-so an agent configures a single MCP endpoint (the edge's localhost port) and
-reaches signals, watchlist, strategies, backtests, sync, and every broker
-connector through it.
+**One-endpoint topology.** Your agent points at one URL,
+`http://127.0.0.1:8330/mcp/`, and finds the whole surface there: the edge's own
+tools (the broker vocabulary, approvals, the brake, check-in and chat) beside
+the platform's own tools, which the edge promotes to first-class names when it
+starts. `get_signals`, `get_mandate`, `get_roster`, `run_backtest` and the rest
+are called by name, not through a generic escape hatch.
 
 ## Quickstart
 
 ```bash
 # In the Nakag.ai web app: Agents page -> "Add agent" -> get a 10-minute pairing code.
 
-# One command: pairs, syncs the registry, and (after you confirm at the
-# prompt) opens a browser to log you into your broker, then serves.
+# One command: pairs, syncs the registry, (after you confirm at the prompt)
+# opens a browser to log you into your broker, connects your agent, then serves.
 uvx nakagai-edge setup <code> --platform https://api.nakag.ai
 ```
 
 `setup` is idempotent: re-running it on a healthy edge just starts the server,
 and it is also the repair path when something has drifted. The individual steps
-remain available: `edge pair`, then `edge sync`, then `edge login <id>`, then
-`edge run`. `edge status` reports pairing and policy freshness without doing
-anything.
+remain available: `nakagai-edge pair`, then `nakagai-edge sync`, then
+`nakagai-edge login <id>`, then `nakagai-edge run`. `nakagai-edge status`
+reports pairing and policy freshness without doing anything.
 
-Point your agent's MCP client (OpenClaw, Claude Code, Hermes, ...) at
-`http://127.0.0.1:8330/mcp/`.
+## Connect your agent
+
+`setup` wires up any agent client it recognizes, and prints the endpoint for any
+it does not. Already set up? `nakagai-edge connect` does the wiring alone,
+without serving:
+
+```bash
+uvx nakagai-edge connect
+```
+
+The one client recognized today is Claude Code, detected by `claude` being on
+your PATH. It gets an MCP entry added with
+`claude mcp add --scope user nakagai --transport http <url>`, at user scope
+because a project-scoped entry needs a per-project approval, and the six skills
+below are copied into `~/.claude/skills/`. A client that is not detected is not
+an obstacle: the snippet below is the whole contract.
+
+`--no-register` withholds the wiring, never the endpoint. Both
+`setup --no-register` and `connect --no-register` still print the URL and the
+snippet, and touch no client config at all.
+
+The contract is one URL, and it carries no credential:
+
+```
+http://127.0.0.1:8330/mcp/
+```
+
+Paste this into any MCP client:
+
+```json
+{
+  "mcpServers": {
+    "nakagai": {
+      "type": "http",
+      "url": "http://127.0.0.1:8330/mcp/"
+    }
+  }
+}
+```
+
+The edge holds your platform token and your broker credentials. Neither ever
+enters your agent's config.
+
+### What is on the endpoint
+
+As it ships today: 16 tools the edge serves itself, plus 17 of the platform's
+promoted to first-class names, 33 in all. Six platform tools share a name with
+one the edge already serves (`agent_checkin`, `call_connector`, `get_approval`,
+`get_connector_status`, `list_connector_tools`, `send_message`). The local tool
+wins outright; nothing is ever exposed twice, and nothing is ever prefixed.
+
+A promoted name is the same call typed a shorter way. It travels the same
+guarded door as `call_connector`: the same classification, the same approval
+policy, the same audit record, and the same refusal once cached policy goes
+stale. Promotion changed which names exist, not what any of them is allowed to
+do.
+
+Promotion happens once, at startup, before the first client connects. If the
+platform is unreachable at that moment, the promoted names are absent for the
+life of that process and the log says so;
+`call_connector("nakagai-mcp", ...)` still reaches every one of them, and a
+restart picks them up. If the platform goes down after startup, the tools stay
+listed and a call comes back with an error naming the `nakagai-mcp` connector,
+because a name that fails legibly beats seventeen that silently vanish.
+
+## Skills
+
+Six skills ship inside the wheel:
+
+- **`connect-edge`**: connect a local edge to a hosted platform, and diagnose
+  the known failure modes.
+- **`pair-agent`**: pair a new agent with the hosted platform, directly or
+  through an edge, and run the first-session protocol.
+- **`verify-edge`**: the health ladder, from the local edge up to the platform
+  relay, with an opt-in write-path drill through approvals.
+- **`daily-brief`**: signals, open risk, portfolio and pending approvals in one
+  pass.
+- **`halt`**: stop trading authority now, and say precisely what is and is not
+  stopped.
+- **`check-the-evidence`**: pull a play's proving record before endorsing it,
+  and say so plainly when there is none.
+
+A client that reads skills as files gets them installed by `connect` (Claude
+Code: `~/.claude/skills/`). Any MCP client can read exactly the same text off
+the endpoint instead: `nakagai://skills` lists them with their descriptions,
+`nakagai://skills/{name}` is one skill's full text, and each is offered as an
+MCP prompt under its own name.
+
+An edit of yours is never overwritten. `connect` records a hash of what it
+wrote, so a later run replaces only a file that still matches, and a skill you
+have tuned is left alone and reported as left alone.
 
 ## Live chat with your agent
 
-`edge run` serves tools. It does not make you reachable. For that, run:
+`nakagai-edge run` serves tools. It does not make you reachable. For that, run:
 
 ```bash
 nakagai-edge listen
@@ -209,9 +300,9 @@ newer shape carries. Losing the capability map that builds a stop's exit order
 records every supervised position as unguarded while every display still calls
 it guarded. Refusing beats half-understanding. A refused bundle leaves the
 previous registry untouched and does not stamp freshness, so the cached policy
-goes on aging and everything is refused once the TTL lapses. `edge sync`
-reports the refusal on the spot and
-`edge status` carries a `schema_error` until a sync succeeds; the fix is to
+goes on aging and everything is refused once the TTL lapses. `nakagai-edge sync`
+reports the refusal on the spot and `nakagai-edge status` carries a
+`schema_error` until a sync succeeds; the fix is to
 upgrade whichever side is behind, or pin an older `nakagai-edge`.
 
 **Two things a registry entry must get right.** Both are the connector author's
@@ -279,7 +370,9 @@ sees both, so it is the one to check before assuming a stop is being watched.
   TTL (default 15 minutes). Reads may continue on the cached policy while the
   TTL holds; once it expires, everything is refused. Writes are impossible by
   construction the whole time: a write needs a live round trip to the
-  platform's approval queue.
+  platform's approval queue. An edge that started while the platform was down
+  serves its own 16 tools and none of the promoted ones, since the tool list is
+  built once at startup; restart it once the platform answers.
 - **Revocation.** Revoking an agent takes effect on the agent's next platform
   call: the bearer token 401s. Writes were already gated on a live platform
   round trip, so revocation closes them structurally.
