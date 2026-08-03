@@ -642,3 +642,32 @@ def test_releasing_does_not_delete_a_lock_another_holder_took(tmp_path):
             ListenLock(tmp_path).acquire()   # the live holder still holds
     finally:
         live.release()
+
+
+# --- signal_digest --------------------------------------------------------
+
+def test_signal_digest_renders_named_fields_through_the_nesting():
+    from nakagai_edge.edge.listen import RENDERERS
+    body = {"window_days": 7, "shown": 1, "total": 3, "secret": "nope",
+            "symbols": [{"symbol": "NVDA", "shape": "escalating",
+                         "direction": "LONG", "sessions": 4,
+                         "confluence_max": 5, "confluence_latest": 5,
+                         "timeframes": ["15m", "1h"],
+                         "latest_bar_ts": "2026-08-03T14:30:00+00:00",
+                         "injected": "drop me"}]}
+    out = RENDERERS["signal_digest"](body)
+    assert out["total"] == 3
+    assert "secret" not in out
+    assert out["symbols"][0]["symbol"] == "NVDA"
+    assert "injected" not in out["symbols"][0]
+
+
+def test_a_digest_row_that_is_not_a_dict_is_dropped():
+    from nakagai_edge.edge.listen import RENDERERS
+    out = RENDERERS["signal_digest"]({"symbols": ["not a row", {"symbol": "A"}]})
+    assert [r["symbol"] for r in out["symbols"]] == ["A"]
+
+
+def test_the_digest_expects_a_reply():
+    from nakagai_edge.edge.listen import REPLY_EXPECTED
+    assert "signal_digest" in REPLY_EXPECTED
