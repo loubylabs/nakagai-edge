@@ -19,6 +19,16 @@ def edge_root(tmp_path, monkeypatch):
     return root
 
 
+@pytest.fixture(autouse=True)
+def no_real_client_wiring(monkeypatch):
+    """`setup` now ends by wiring up whatever agent client it detects, and that
+    means shelling out to `claude mcp add` and writing into ~/.claude/skills.
+    No test in this file is about the wiring, and none of them may edit the
+    machine running the suite, so nothing is ever detected here. The wiring
+    itself is covered against fakes in tests/test_edge_connect_cmd.py."""
+    monkeypatch.setattr("nakagai_edge.edge.clients.detected", lambda: [])
+
+
 def _platform_answered(state, etag="v1"):
     """What the real sync_once does whenever the platform answers us, on both a
     200 and a 304: stamp the fetch. Neither failure path writes it, which is

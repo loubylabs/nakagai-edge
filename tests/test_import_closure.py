@@ -15,29 +15,53 @@ import textwrap
 
 BANNED = ("pandas", "numpy", "pyarrow", "yfinance", "anthropic")
 
-MODULES = [
-    "nakagai_edge._env", "nakagai_edge.approvals", "nakagai_edge.auth",
-    "nakagai_edge.cli", "nakagai_edge.config", "nakagai_edge.guardrails",
-    "nakagai_edge.hub", "nakagai_edge.identity", "nakagai_edge.oauth_login",
-    "nakagai_edge.signing", "nakagai_edge.slug", "nakagai_edge.warrant",
-    "nakagai_edge.edge.audit", "nakagai_edge.edge.brake", "nakagai_edge.edge.client", "nakagai_edge.edge.executor",
-    "nakagai_edge.edge.portfolio", "nakagai_edge.edge.preflight", "nakagai_edge.edge.remote",
-    "nakagai_edge.edge.runtime", "nakagai_edge.edge.setup", "nakagai_edge.edge.state",
-    "nakagai_edge.edge.supervision", "nakagai_edge.edge.sync",
-]
+# Discovered, never listed. A hand-written roster is a guard that narrows every
+# time someone adds a module, and it narrows silently: the suite stays green
+# while covering less. Walking the package means a new module is covered the
+# moment it exists, which is the only way this stays honest.
+_DISCOVER = textwrap.dedent("""
+    import importlib, json, pkgutil, sys
+    import nakagai_edge
+    names = []
+    for mod in pkgutil.walk_packages(nakagai_edge.__path__, "nakagai_edge."):
+        names.append(mod.name)
+    print(json.dumps(sorted(names)))
+""")
+
+
+def _modules() -> list[str]:
+    import json
+    out = subprocess.run([sys.executable, "-c", _DISCOVER],
+                         capture_output=True, text=True, check=True).stdout
+    return json.loads(out)
+
+
+def test_discovery_actually_finds_the_package():
+    """A walk that returns nothing would make every assertion below vacuous, and
+    a guard that passes by scanning zero files is worse than no guard."""
+    found = _modules()
+    assert len(found) > 15, f"discovery found only {found}"
+    assert "nakagai_edge.edge.runtime" in found
+    assert "nakagai_edge.edge.skills" in found
 
 
 def _closure() -> set[str]:
     script = textwrap.dedent(f"""
         import importlib, json, sys
-        for m in {MODULES!r}:
+        for m in {_modules()!r}:
             importlib.import_module(m)
         print(json.dumps(sorted(sys.modules)))
     """)
-    out = subprocess.run([sys.executable, "-c", script],
-                         capture_output=True, text=True, check=True).stdout
     import json
-    return set(json.loads(out))
+    proc = subprocess.run([sys.executable, "-c", script],
+                          capture_output=True, text=True)
+    # Not check=True: a banned module that is not installed fails here as an
+    # ImportError, and CalledProcessError would bury the one line that says
+    # which module and why. Surface the traceback instead.
+    assert proc.returncode == 0, (
+        f"importing the edge modules failed, so the weight guard could not "
+        f"run:\n{proc.stderr}")
+    return set(json.loads(proc.stdout))
 
 
 def test_the_edge_carries_no_platform_weight():

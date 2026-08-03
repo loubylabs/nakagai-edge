@@ -8,10 +8,13 @@ call. Writes additionally require a live platform grant, so they are doubly
 impossible offline."""
 
 import asyncio
+import inspect
 import json
+import keyword
 import logging
 import os
 import time
+from typing import Annotated, Any
 
 import httpx
 
@@ -32,6 +35,10 @@ from nakagai_edge.edge.sync import (POLICY_TTL_S, SYNC_INTERVAL_S, policy_fresh,
 
 EXECUTOR_INTERVAL_S = 5
 AUDIT_SHIP_INTERVAL_S = 30
+
+# The platform, as the edge dials it. sync.py rewrites this one registry entry
+# to point at the real platform with the agent's own bearer token.
+PLATFORM_CONNECTOR = "nakagai-mcp"
 
 
 STALE_POLICY = {"is_error": True, "error":
@@ -79,6 +86,7 @@ def build_hub(state: EdgeState, client: PlatformClient):
 def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAudit,
                     reporter, brake: Brake):
     from mcp.server.fastmcp import FastMCP
+    from pydantic import WithJsonSchema
 
     mcp = FastMCP("nakagai-edge")
 
@@ -646,6 +654,156 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
             "portfolio_heat": round(heat, 2),
             "positions": rows}, default=str)
 
+    # Client-neutral skill delivery. A client with file-based skills installs
+    # them (see `nakagai-edge connect`); a client without still reads exactly
+    # the same content over the one URL it already has.
+    from nakagai_edge.edge import skills as _skills
+
+    @mcp.resource("nakagai://skills")
+    def _skill_index() -> str:
+        """Every skill this edge ships, with its one-line description."""
+        return json.dumps(
+            {n: _skills.skill_description(n) for n in _skills.list_skills()},
+            separators=(",", ":"))
+
+    @mcp.resource("nakagai://skills/{name}")
+    def _skill_body(name: str) -> str:
+        """One skill's full text."""
+        try:
+            return _skills.read_skill(name)
+        except KeyError:
+            return json.dumps({"is_error": True, "error": f"no skill {name!r}"})
+
+    for _name in _skills.list_skills():
+        def _make(skill_name: str):
+            def _prompt() -> str:
+                return _skills.read_skill(skill_name)
+            _prompt.__name__ = skill_name.replace("-", "_")
+            _prompt.__doc__ = _skills.skill_description(skill_name)
+            return _prompt
+        mcp.prompt(name=_name)(_make(_name))
+
+    # ---- the platform's own tools, under names an agent can find ---------
+    #
+    # The platform is already a connector, so its tools were always reachable,
+    # but only as `call_connector("nakagai-mcp", ...)`, which is a capability
+    # nobody discovers. Each one gets a first-class name here.
+    #
+    # Generated, not hand-written: there is a single upstream with no dialect
+    # to reconcile, its docstrings are already written dense for agents, and a
+    # hand-written set would drift the first time the platform adds a tool.
+
+    def _forward_signature(schema: dict) -> tuple | None:
+        """(signature, defaults) built from the platform's own input schema.
+
+        FastMCP derives a tool's published schema from the function signature,
+        so a forwarder declared `**kwargs` advertises one REQUIRED string
+        argument called "kwargs" and nothing else: every call then fails
+        validation, and nothing about the registration says so. Synthesizing
+        the signature from the upstream schema is what closes that, and it also
+        means the agent reads the platform's own types and titles rather than a
+        restatement of them that could disagree.
+
+        None for a schema this cannot express (an argument name that is not a
+        Python identifier). Such a tool is left unpromoted rather than promoted
+        with an argument silently missing; `call_connector` still reaches it.
+        """
+        props = (schema or {}).get("properties")
+        if not isinstance(props, dict):
+            props = {}
+        required = set((schema or {}).get("required") or [])
+        params, defaults = [], {}
+        for arg, prop in props.items():
+            if (not isinstance(arg, str) or not arg.isidentifier()
+                    or keyword.iskeyword(arg) or arg.startswith("_")):
+                return None
+            prop = prop if isinstance(prop, dict) else {}
+            default = inspect.Parameter.empty
+            if arg not in required:
+                # The platform's own default, so the published schema keeps
+                # saying what the platform says. None stands in when it
+                # declared none, which is the only thing an omitted optional
+                # can look like from here.
+                default = prop.get("default")
+                defaults[arg] = default
+            params.append(inspect.Parameter(
+                arg, inspect.Parameter.KEYWORD_ONLY, default=default,
+                annotation=Annotated[Any, WithJsonSchema(prop)]))
+        # `-> str` like every tool above it, and for the same reason FastMCP
+        # cares: the return annotation is what decides whether a result comes
+        # back structured. A synthesized signature that omitted it would hand
+        # the agent a differently-shaped envelope for a promoted name than for
+        # the same call through call_connector.
+        return inspect.Signature(params, return_annotation=str), defaults
+
+    def _supplied(kwargs: dict, defaults: dict) -> dict:
+        """What the agent actually asked for, with the rest left off.
+
+        FastMCP fills every omitted optional with its default before we see it,
+        so forwarding the lot would put keys in the call that
+        `call_connector("nakagai-mcp", ...)` never carries, and those args are
+        what an approval record shows the owner. Dropping one cannot change
+        what the platform does: the value came from the platform's own schema,
+        so sending it and omitting it are the same call.
+        """
+        return {k: v for k, v in kwargs.items()
+                if not (k in defaults and v == defaults[k]
+                        and type(v) is type(defaults[k]))}
+
+    def _register_forwarder(name: str, descriptor: dict) -> None:
+        built = _forward_signature(descriptor.get("inputSchema") or {})
+        if built is None:
+            logging.getLogger("nakagai.edge").warning(
+                "platform tool %r not promoted: its input schema names an "
+                "argument this cannot express as a parameter; "
+                "call_connector(%r, %r, ...) still reaches it",
+                name, PLATFORM_CONNECTOR, name)
+            return
+        signature, defaults = built
+
+        async def _forward(**kwargs) -> str:
+            # Through _guarded, never hub.call. The entry point must not change
+            # a verdict: the guardrails classify the downstream tool, so a
+            # promoted name is the same call typed a shorter way.
+            return json.dumps(
+                await _guarded(PLATFORM_CONNECTOR, name,
+                               _supplied(kwargs, defaults),
+                               capability=f"promoted:{name}"),
+                default=str)
+
+        _forward.__name__ = name
+        _forward.__signature__ = signature
+        mcp.tool(name=name,
+                 description=descriptor.get("description") or "")(_forward)
+
+    async def _promote_platform_tools() -> None:
+        """Give every platform tool a first-class name. Once, at startup.
+
+        A name the edge already serves is never promoted and never prefixed:
+        the local tool wins outright, because two spellings of one intent is
+        how an agent ends up choosing between them at random.
+        """
+        local = {t.name for t in await mcp.list_tools()}
+        try:
+            listing = await hub.list_tools(PLATFORM_CONNECTOR)
+        except Exception as e:  # noqa: BLE001 (never fail startup over this)
+            logging.getLogger("nakagai.edge").warning(
+                "platform tools not promoted (%s); call_connector(%r, ...) "
+                "still reaches every one of them", e, PLATFORM_CONNECTOR)
+            return
+        for descriptor in listing.get("tools") or []:
+            name = descriptor.get("name")
+            if not name or name in local:
+                continue
+            _register_forwarder(name, descriptor)
+
+    # `run()` awaits this before it starts serving. It hangs off the instance
+    # because promotion needs a running loop (it dials the platform) while
+    # create_edge_mcp is called before there is one, and because `_guarded` is
+    # a closure over this function's arguments: a module-level promoter would
+    # have to rebuild the one door every connector call goes through, which is
+    # the single thing this feature must not do.
+    mcp.promote_platform_tools = _promote_platform_tools
     return mcp
 
 
@@ -827,6 +985,19 @@ def run(root, port: int = 8330) -> None:
                          "--platform <url>` first")
     client = PlatformClient(agent["platform_url"], agent["token"])
     sync_once(state, client)                 # best-effort warm start
+
+    # Advisory only. The hard gate is BUNDLE_SCHEMA in sync.py, and a daemon
+    # holding broker credentials never updates itself: it says so, and the
+    # owner decides. Every uninteresting case returns None, so this can slow
+    # startup by at most the timeout and can never stop it.
+    from nakagai_edge.edge.freshness import newer_release
+    from nakagai_edge.identity import package_version
+    _current = package_version()
+    if (_newer := newer_release(_current)) is not None:
+        logging.getLogger("nakagai.edge").warning(
+            "nakagai-edge %s is available (you are on %s): "
+            "upgrade with `uvx nakagai-edge@latest run`", _newer, _current)
+
     hub = build_hub(state, client)
     audit = EdgeAudit(state)
     reporter = PortfolioReporter(state, hub, client)
@@ -841,6 +1012,10 @@ def run(root, port: int = 8330) -> None:
     mcp.settings.host, mcp.settings.port = "127.0.0.1", port
 
     async def main():
+        # Before a single client connects, so the first tool list is the whole
+        # surface. It never raises: a platform that will not answer costs the
+        # promoted names, not the daemon.
+        await mcp.promote_platform_tools()
         tasks = await _loops(state, hub, client, audit, reporter, brake)
         try:
             await mcp.run_streamable_http_async()

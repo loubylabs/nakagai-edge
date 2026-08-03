@@ -49,6 +49,11 @@ packages = ["nakagai_edge"]
 # What ships is a choice, not whatever happened to be tracked. `tests/` and the
 # lockfile earn their place (someone building from source can verify it); agent
 # scaffolding and CI config do not.
+#
+# `.claude` still belongs here after the skills moved into the package. It is
+# not gitignored, and an sdist build sweeps in untracked files, so this is what
+# keeps a developer's local `.claude/worktrees/` and settings out of a release.
+# It reads like dead config now that nothing under it is tracked. It is not.
 exclude = [".claude", ".github"]
 
 [tool.pytest.ini_options]

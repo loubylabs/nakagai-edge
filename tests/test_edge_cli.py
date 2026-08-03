@@ -15,7 +15,8 @@ from nakagai_edge.edge.sync import BUNDLE_SCHEMA, apply_bundle, sync_once
 def test_help_lists_every_subcommand():
     out = subprocess.run([sys.executable, "-m", "nakagai_edge.cli", "--help"],
                          capture_output=True, text=True, check=True).stdout
-    for cmd in ("setup", "pair", "sync", "run", "login", "status", "listen"):
+    for cmd in ("setup", "pair", "sync", "run", "login", "status", "listen",
+                "connect"):
         assert cmd in out
 
 
