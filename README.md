@@ -377,6 +377,13 @@ sees both, so it is the one to check before assuming a stop is being watched.
   call: the bearer token 401s. Writes were already gated on a live platform
   round trip, so revocation closes them structurally.
 
+- **A newer release exists.** On start, the edge checks the package index and
+  logs a line naming the newer version. That is the whole behavior: it never
+  updates itself, and it never refuses to start. This daemon is the sole holder
+  of your broker credentials, so replacing it is your decision, not a web
+  index's. The check is bounded and advisory, and no network means no line.
+  Upgrade when you choose to with `uvx nakagai-edge@latest run`.
+
 ## Development
 
 ```bash
