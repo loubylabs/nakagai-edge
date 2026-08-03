@@ -48,11 +48,19 @@ def _claude_skills_dir() -> Path:
 
 def _claude_register(server_url: str) -> bool:
     """User scope on purpose. A project-scoped .mcp.json needs an approval that
-    nobody gives, which is the defect this whole change exists to remove."""
-    proc = subprocess.run(
-        ["claude", "mcp", "add", "--scope", "user", "nakagai",
-         "--transport", "http", server_url],
-        capture_output=True, text=True)
+    nobody gives, which is the defect this whole change exists to remove.
+
+    Bounded, because `setup` calls this and a hung subprocess would hang the
+    onboarding path. Failing to register prints an instruction the owner can
+    follow; hanging prints nothing and looks like a broken install.
+    """
+    try:
+        proc = subprocess.run(
+            ["claude", "mcp", "add", "--scope", "user", "nakagai",
+             "--transport", "http", server_url],
+            capture_output=True, text=True, timeout=30)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
     return proc.returncode == 0
 
 

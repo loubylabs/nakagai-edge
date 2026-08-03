@@ -18,6 +18,7 @@ def test_registration_uses_user_scope(monkeypatch):
 
     def fake_run(cmd, **kw):
         seen["cmd"] = cmd
+        seen["kw"] = kw
 
         class R:
             returncode = 0
@@ -31,6 +32,26 @@ def test_registration_uses_user_scope(monkeypatch):
 
     assert "--scope" in seen["cmd"] and "user" in seen["cmd"]
     assert "project" not in seen["cmd"]
+    assert seen["kw"].get("timeout"), "an unbounded call would hang `setup`"
+
+
+def test_a_hung_or_missing_claude_is_a_failed_registration(monkeypatch):
+    """`setup` calls this, so neither a hang nor a missing binary may raise out
+    of it. A False prints an instruction the owner can act on; an exception
+    prints a traceback and looks like a broken install."""
+    claude = next(c for c in clients.KNOWN_CLIENTS if c.key == "claude-code")
+
+    def hang(cmd, **kw):
+        raise clients.subprocess.TimeoutExpired(cmd, kw.get("timeout", 0))
+
+    monkeypatch.setattr(clients.subprocess, "run", hang)
+    assert claude.register("http://127.0.0.1:8330/mcp/") is False
+
+    def missing(cmd, **kw):
+        raise FileNotFoundError("claude")
+
+    monkeypatch.setattr(clients.subprocess, "run", missing)
+    assert claude.register("http://127.0.0.1:8330/mcp/") is False
 
 
 def test_undetected_client_is_simply_absent(monkeypatch):
