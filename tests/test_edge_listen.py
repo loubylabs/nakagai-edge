@@ -668,6 +668,45 @@ def test_a_digest_row_that_is_not_a_dict_is_dropped():
     assert [r["symbol"] for r in out["symbols"]] == ["A"]
 
 
+def test_digest_garbage_ahead_of_valid_rows_does_not_bury_them():
+    """The cap must fall on valid rows, not on raw ones. Slicing before the
+    isinstance filter would take a run of garbage as the whole 25 and leave
+    nothing real behind it."""
+    from nakagai_edge.edge.listen import RENDERERS, _DIGEST_MAX
+    garbage = ["not a row"] * (_DIGEST_MAX + 5)
+    valid = [{"symbol": "A"}, {"symbol": "B"}]
+    out = RENDERERS["signal_digest"]({"symbols": garbage + valid})
+    assert [r["symbol"] for r in out["symbols"]] == ["A", "B"]
+
+
+def test_digest_truncates_to_its_own_constant_not_a_number_copied_from_it():
+    from nakagai_edge.edge.listen import RENDERERS, _DIGEST_MAX
+    rows = [{"symbol": f"S{i}"} for i in range(_DIGEST_MAX + 5)]
+    out = RENDERERS["signal_digest"]({"symbols": rows})
+    assert len(out["symbols"]) == _DIGEST_MAX
+
+
+def test_digest_truncation_ignores_what_the_sender_claims_the_count_is():
+    """total and shown are the sender's own count of the same list. Trusting
+    either for the cap would let a sender widen or shrink it at will, which is
+    exactly what an independent ceiling refuses to do."""
+    from nakagai_edge.edge.listen import RENDERERS, _DIGEST_MAX
+    rows = [{"symbol": f"S{i}"} for i in range(_DIGEST_MAX + 5)]
+    out = RENDERERS["signal_digest"]({"symbols": rows, "total": 3, "shown": 3})
+    assert len(out["symbols"]) == _DIGEST_MAX
+
+
+@pytest.mark.parametrize("body", [
+    {"symbols": "not a list"},                 # a string, not a list
+    {"symbols": None},                         # explicitly null
+    {},                                        # the key is absent entirely
+])
+def test_a_non_list_symbols_yields_no_rows_and_never_raises(body):
+    from nakagai_edge.edge.listen import RENDERERS
+    out = RENDERERS["signal_digest"](body)
+    assert out["symbols"] == []
+
+
 def test_the_digest_expects_a_reply():
     from nakagai_edge.edge.listen import REPLY_EXPECTED
     assert "signal_digest" in REPLY_EXPECTED

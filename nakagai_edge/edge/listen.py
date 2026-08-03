@@ -84,12 +84,15 @@ _DIGEST_MAX = 25
 def _digest(body: dict) -> dict:
     rows = body.get("symbols")
     rows = rows if isinstance(rows, list) else []
+    # Filtered before it is sliced: the cap bounds legitimate rows, not raw
+    # ones, so a run of junk ahead of real rows cannot truncate every real row
+    # away.
+    valid = [r for r in rows if isinstance(r, dict)]
     return {
         "window_days": body.get("window_days"),
         "shown": body.get("shown"),
         "total": body.get("total"),
-        "symbols": [{f: r.get(f) for f in _DIGEST_ROW}
-                    for r in rows[:_DIGEST_MAX] if isinstance(r, dict)],
+        "symbols": [{f: r.get(f) for f in _DIGEST_ROW} for r in valid[:_DIGEST_MAX]],
     }
 
 
