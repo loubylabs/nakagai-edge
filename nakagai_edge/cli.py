@@ -174,14 +174,50 @@ def _confirm(question: str) -> bool:
     return answer in ("", "y", "yes")
 
 
+def _cmd_connect(args) -> int:
+    """Print the connection contract, and wire up any client we recognise.
+
+    The printing is unconditional and comes first. The registration is the part
+    that can fail, be declined, or not apply, and a user whose client we have
+    never heard of still leaves with everything they need.
+    """
+    from nakagai_edge.edge import clients
+    from nakagai_edge.edge.install import install_skills
+
+    server_url = clients.url(args.port)
+    print(f"Nakagai MCP endpoint:\n  {server_url}\n")
+    print("Any MCP client can use it directly. Config snippet:\n")
+    print(clients.snippet(args.port))
+    print()
+
+    if args.no_register:
+        return 0
+
+    state_root = default_root()
+    found = clients.detected()
+    if not found:
+        print("No known agent client detected. Paste the snippet above into yours.")
+        return 0
+
+    for client in found:
+        ok = client.register(server_url)
+        print(f"  {client.label}: MCP entry "
+              + ("registered" if ok else "NOT registered (add it by hand)"))
+        report = install_skills(client.skills_dir(),
+                                manifest=state_root / "skills-manifest.json")
+        print(f"  {client.label}: skills {report.summary()}")
+    return 0
+
+
 def _cmd_setup(args) -> int:
-    """pair -> sync -> login -> run, in that order, skipping what is done.
+    """pair -> sync -> login -> connect -> run, in that order, skipping what is done.
 
     The planner decides; this only executes and prints. It is asked twice: once
     on the edge as we found it (for pair and sync), and again once the sync has
     landed (for login and run), because the login decision reads the registry
     and the registry may not have existed a moment ago.
     """
+    from nakagai_edge.edge import clients
     from nakagai_edge.edge.client import EdgeClientError, pair
     from nakagai_edge.edge.preflight import check_platform
     from nakagai_edge.edge.runtime import run
@@ -252,16 +288,20 @@ def _cmd_setup(args) -> int:
             print(f"  !  login      skipped. {BROKER} stays dead until you run: "
                   f"nakagai-edge login {BROKER}")
 
-    # 4. run
+    # 4. connect the agent. On this side of the serve on purpose: run() blocks
+    # until Ctrl-C, so anything placed after it would simply never happen.
+    # _cmd_connect honours --no-register itself, which is why it is called
+    # unconditionally: the flag withholds the wiring, never the endpoint.
+    print()
+    _cmd_connect(args)
+
+    # 5. run
     run_step = steps["run"]
-    url = f"http://127.0.0.1:{args.port}/mcp/"
-    print("\n  point your agent at this one endpoint:")
-    print(f'    {{ "nakagai": {{ "type": "http", "url": "{url}" }} }}\n')
     if not run_step.run:
         print(f"  -  serving    {run_step.reason}")
         print(f"  next: nakagai-edge run --port {args.port}")
         return 0
-    print(f"  -> {run_step.reason} on {url} (Ctrl-C to stop)")
+    print(f"  -> {run_step.reason} on {clients.url(args.port)} (Ctrl-C to stop)")
     run(state.root, port=args.port)
     return 0
 
@@ -386,7 +426,16 @@ def main(argv=None) -> int:
     p_setup.add_argument("--port", type=int, default=8330)
     p_setup.add_argument("--no-run", action="store_true",
                          help="stop after login instead of serving")
+    p_setup.add_argument("--no-register", action="store_true",
+                         help="do not touch any agent client config")
     p_setup.set_defaults(func=_cmd_setup)
+
+    p_connect = sub.add_parser(
+        "connect", help="print the MCP endpoint, and wire up a detected agent client")
+    p_connect.add_argument("--port", type=int, default=8330)
+    p_connect.add_argument("--no-register", action="store_true",
+                           help="print only; do not touch any client config")
+    p_connect.set_defaults(func=_cmd_connect)
 
     p_sync = sub.add_parser("sync", help="pull the connector registry and policy")
     p_sync.set_defaults(func=_cmd_sync)
