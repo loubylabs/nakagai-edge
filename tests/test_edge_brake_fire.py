@@ -784,6 +784,45 @@ async def test_a_quote_discarded_every_tick_counts_as_a_famine(tmp_path):
     assert "AAPL" in client.messages[0]
 
 
+async def test_the_brake_fires_while_the_gated_tool_surface_refuses(tmp_path):
+    """The brake's exemption, pinned against the gate that now covers more.
+
+    Promoting the platform's tools put every one of them behind `_gate()`, so
+    policy staleness now refuses nearly everything an agent can reach. brake.py
+    documents its own exit path as "Deliberately NOT gated on policy freshness
+    or on the kill switch", because a stop supervisor that switches off with
+    everything else is not a safety device, and nothing pinned the two facts
+    together: a later refactor could route the brake through the same door and
+    no test would notice.
+
+    Both halves are asserted in ONE stale state. The refusing half goes through
+    `call_connector` rather than a promoted name because it is the same
+    `_gate()`, and this file has no platform connector; the promoted half is
+    pinned in tests/test_edge_promoted_tools.py. The firing half goes through
+    `tick()` rather than `fire()` directly, so the path the runtime's brake
+    loop actually drives is the one covered.
+    """
+    pytest.importorskip("mcp")
+    from nakagai_edge.edge.runtime import create_edge_mcp
+
+    hub = FakeHub()
+    state, client, brake = _brake(tmp_path, hub, stale=True)
+    record(state, _rec())
+    # No reporter: refresh_portfolio is the only tool that touches one, and it
+    # is not on either path under test here.
+    mcp = create_edge_mcp(state, hub, client, EdgeAudit(state), None, brake)
+
+    result = await mcp.call_tool(
+        "call_connector", {"connector_id": "demo", "tool": "get_equity_positions"})
+    text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+    assert "policy stale" in text, "the gate is not engaged, so this proves nothing"
+
+    assert await brake.tick({"AAPL": _q(46.10, ts=1.0)}, 1.0) == []
+    assert await brake.tick({"AAPL": _q(46.10, ts=16.0)}, 16.0) == ["ap_1"]
+    assert hub.calls[-1][0] == "place_equity_order"
+    assert load(state)["ap_1"]["state"] == "fired"
+
+
 async def test_a_stale_quote_never_fires_the_brake_through_tick(tmp_path):
     # Proves the freshness check in usable() is actually reachable FROM
     # tick(), not just exercised by unit tests of usable() in isolation. If
