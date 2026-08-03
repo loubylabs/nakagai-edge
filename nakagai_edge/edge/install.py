@@ -65,7 +65,15 @@ def install_skills(dest: Path, *, manifest: Path) -> InstallReport:
         target = dest / name / "SKILL.md"
 
         if target.exists():
-            current = target.read_text(encoding="utf-8")
+            try:
+                current = target.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                # Unreadable means unprovable, and unprovable means the owner's.
+                # Without this the whole install raises out of `connect`, which
+                # is the onboarding path, so one odd file would take the rest of
+                # the skills down with it.
+                report.skipped_modified.append(name)
+                continue
             if current == body:
                 # Byte-identical to what we ship, so there is no edit to lose.
                 # Recording it here is what re-adopts a file whose manifest

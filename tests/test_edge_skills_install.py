@@ -33,6 +33,21 @@ def test_a_users_edit_is_never_overwritten(tmp_path):
     assert "halt" not in report.written
 
 
+def test_an_unreadable_target_does_not_abort_the_install(tmp_path):
+    """`connect` is the onboarding path, so one odd file must not take the other
+    five skills down with it. Unreadable is treated as the owner's, same as an
+    edit: we cannot prove we wrote it, so we do not touch it."""
+    dest, manifest = tmp_path / "skills", tmp_path / "manifest.json"
+    install_skills(dest, manifest=manifest)
+    (dest / "halt" / "SKILL.md").write_bytes(b"\xff\xfe not utf-8 \x00")
+
+    report = install_skills(dest, manifest=manifest)
+
+    assert "halt" in report.skipped_modified
+    assert "check-the-evidence" in report.unchanged, "the install stopped early"
+    assert (dest / "halt" / "SKILL.md").read_bytes().startswith(b"\xff\xfe")
+
+
 def test_install_is_a_copy_not_a_reference(tmp_path):
     """Guards the uvx ephemeral-cache trap: the destination must not depend on
     the package still being importable from the same place."""
