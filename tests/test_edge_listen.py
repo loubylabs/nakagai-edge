@@ -642,3 +642,71 @@ def test_releasing_does_not_delete_a_lock_another_holder_took(tmp_path):
             ListenLock(tmp_path).acquire()   # the live holder still holds
     finally:
         live.release()
+
+
+# --- signal_digest --------------------------------------------------------
+
+def test_signal_digest_renders_named_fields_through_the_nesting():
+    from nakagai_edge.edge.listen import RENDERERS
+    body = {"window_days": 7, "shown": 1, "total": 3, "secret": "nope",
+            "symbols": [{"symbol": "NVDA", "shape": "escalating",
+                         "direction": "LONG", "sessions": 4,
+                         "confluence_max": 5, "confluence_latest": 5,
+                         "timeframes": ["15m", "1h"],
+                         "latest_bar_ts": "2026-08-03T14:30:00+00:00",
+                         "injected": "drop me"}]}
+    out = RENDERERS["signal_digest"](body)
+    assert out["total"] == 3
+    assert "secret" not in out
+    assert out["symbols"][0]["symbol"] == "NVDA"
+    assert "injected" not in out["symbols"][0]
+
+
+def test_a_digest_row_that_is_not_a_dict_is_dropped():
+    from nakagai_edge.edge.listen import RENDERERS
+    out = RENDERERS["signal_digest"]({"symbols": ["not a row", {"symbol": "A"}]})
+    assert [r["symbol"] for r in out["symbols"]] == ["A"]
+
+
+def test_digest_garbage_ahead_of_valid_rows_does_not_bury_them():
+    """The cap must fall on valid rows, not on raw ones. Slicing before the
+    isinstance filter would take a run of garbage as the whole 25 and leave
+    nothing real behind it."""
+    from nakagai_edge.edge.listen import RENDERERS, _DIGEST_MAX
+    garbage = ["not a row"] * (_DIGEST_MAX + 5)
+    valid = [{"symbol": "A"}, {"symbol": "B"}]
+    out = RENDERERS["signal_digest"]({"symbols": garbage + valid})
+    assert [r["symbol"] for r in out["symbols"]] == ["A", "B"]
+
+
+def test_digest_truncates_to_its_own_constant_not_a_number_copied_from_it():
+    from nakagai_edge.edge.listen import RENDERERS, _DIGEST_MAX
+    rows = [{"symbol": f"S{i}"} for i in range(_DIGEST_MAX + 5)]
+    out = RENDERERS["signal_digest"]({"symbols": rows})
+    assert len(out["symbols"]) == _DIGEST_MAX
+
+
+def test_digest_truncation_ignores_what_the_sender_claims_the_count_is():
+    """total and shown are the sender's own count of the same list. Trusting
+    either for the cap would let a sender widen or shrink it at will, which is
+    exactly what an independent ceiling refuses to do."""
+    from nakagai_edge.edge.listen import RENDERERS, _DIGEST_MAX
+    rows = [{"symbol": f"S{i}"} for i in range(_DIGEST_MAX + 5)]
+    out = RENDERERS["signal_digest"]({"symbols": rows, "total": 3, "shown": 3})
+    assert len(out["symbols"]) == _DIGEST_MAX
+
+
+@pytest.mark.parametrize("body", [
+    {"symbols": "not a list"},                 # a string, not a list
+    {"symbols": None},                         # explicitly null
+    {},                                        # the key is absent entirely
+])
+def test_a_non_list_symbols_yields_no_rows_and_never_raises(body):
+    from nakagai_edge.edge.listen import RENDERERS
+    out = RENDERERS["signal_digest"](body)
+    assert out["symbols"] == []
+
+
+def test_the_digest_expects_a_reply():
+    from nakagai_edge.edge.listen import REPLY_EXPECTED
+    assert "signal_digest" in REPLY_EXPECTED

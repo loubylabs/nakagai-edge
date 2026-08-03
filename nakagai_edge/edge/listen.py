@@ -69,6 +69,33 @@ def _named(*fields):
     return render
 
 
+# The fields one digest row carries. Named rather than passed through for the
+# same reason every other renderer names its fields: the registry is a security
+# boundary, and a nested list is not exempt from it just because it is nested.
+_DIGEST_ROW = ("symbol", "direction", "shape", "sessions", "confluence_max",
+               "confluence_latest", "timeframes", "latest_bar_ts")
+
+# How many rows survive rendering. The platform caps at 20; this is the
+# independent ceiling, because a renderer that trusted the sender's cap would
+# not be a boundary.
+_DIGEST_MAX = 25
+
+
+def _digest(body: dict) -> dict:
+    rows = body.get("symbols")
+    rows = rows if isinstance(rows, list) else []
+    # Filtered before it is sliced: the cap bounds legitimate rows, not raw
+    # ones, so a run of junk ahead of real rows cannot truncate every real row
+    # away.
+    valid = [r for r in rows if isinstance(r, dict)]
+    return {
+        "window_days": body.get("window_days"),
+        "shown": body.get("shown"),
+        "total": body.get("total"),
+        "symbols": [{f: r.get(f) for f in _DIGEST_ROW} for r in valid[:_DIGEST_MAX]],
+    }
+
+
 # Which kinds reach the agent, and exactly which of their fields do.
 #
 # Naming fields rather than passing `body` through is a security boundary, and
@@ -114,6 +141,16 @@ RENDERERS = {
     # (_envelope's own fields win), and the detector name would vanish.
     "market_event": _named("symbol", "detector", "bar_ts", "timeframe",
                            "magnitude"),
+    # This account's watchlist folded across a week: which tickers have a
+    # multi-day shape. Every value in it is platform-computed, a ticker from
+    # the security master, a shape from a closed vocabulary, or an integer, so
+    # there is no outsider-written text anywhere inside it. That is the same
+    # test `market_event`'s `magnitude` passes and `briefing`'s headline fails.
+    #
+    # It carries no entry, stop, target or RR, so it authorizes nothing: it
+    # says which tickers are worth asking about, and the answer comes from the
+    # platform's get_symbol_trend tool.
+    "signal_digest": _digest,
 }
 
 # The kinds the agent owes an answer to. Everything else is context it absorbs:
@@ -125,7 +162,11 @@ RENDERERS = {
 # context, and a referred signal is a question. Being in this set also puts it
 # on the chat side of _flush's split trim, so a gap full of signals cannot
 # evict it.
-REPLY_EXPECTED = frozenset({"owner_msg", "signal_referred"})
+#
+# `signal_digest` is the second, and it is the one event in the system that can
+# afford to ask: once per account per trading day, pre-open. A digest nobody
+# answers is a digest nobody reads.
+REPLY_EXPECTED = frozenset({"owner_msg", "signal_referred", "signal_digest"})
 
 # A malformed response is a data error, not a transport one: httpx.HTTPError
 # and EdgeClientError do not cover a 200 carrying a Cloudflare interstitial
