@@ -856,6 +856,19 @@ def run(root, port: int = 8330) -> None:
                          "--platform <url>` first")
     client = PlatformClient(agent["platform_url"], agent["token"])
     sync_once(state, client)                 # best-effort warm start
+
+    # Advisory only. The hard gate is BUNDLE_SCHEMA in sync.py, and a daemon
+    # holding broker credentials never updates itself: it says so, and the
+    # owner decides. Every uninteresting case returns None, so this can slow
+    # startup by at most the timeout and can never stop it.
+    from nakagai_edge.edge.freshness import newer_release
+    from nakagai_edge.identity import package_version
+    _current = package_version()
+    if (_newer := newer_release(_current)) is not None:
+        logging.getLogger("nakagai.edge").warning(
+            "nakagai-edge %s is available (you are on %s): "
+            "upgrade with `uvx nakagai-edge@latest run`", _newer, _current)
+
     hub = build_hub(state, client)
     audit = EdgeAudit(state)
     reporter = PortfolioReporter(state, hub, client)
