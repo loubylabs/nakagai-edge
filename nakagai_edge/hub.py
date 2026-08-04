@@ -14,6 +14,7 @@ streams owned by the session.
 
 import asyncio
 import json
+import logging
 import time
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -21,11 +22,14 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from mcp.client.session import ClientSession
 
 from nakagai_edge.config import ConnectorSpec, load_specs, resolve_env_refs
 from nakagai_edge.guardrails import annotate_tools, evaluate
+from nakagai_edge.response_schema import undeclared_properties
 
 RECONNECT_BACKOFF_S = 30.0
+log = logging.getLogger("nakagai.edge")
 
 
 class ConnectorError(Exception):
@@ -49,6 +53,49 @@ def describe_exception(e: BaseException) -> str:
     # httpx status errors bury the interesting part in a multi-line blob.
     first_line = detail.split("\n", 1)[0].strip()
     return f"{type(e).__name__}: {first_line}" if first_line else type(e).__name__
+
+
+class TolerantClientSession(ClientSession):
+    """A session that refuses a broker's bad data, not its bad bookkeeping.
+
+    The SDK validates every result against the server's own declared
+    outputSchema and raises, with no opt-out (`ClientSession.__init__` takes no
+    flag). Robinhood declares its account objects closed and then returns
+    `unsettled_funds`, which took the whole portfolio sweep down over a field
+    no capability map mentions.
+
+    `super()` still owns the schema cache, the missing-structuredContent case
+    and SchemaError, so none of the SDK's control flow is duplicated here and
+    re-validation happens only on the failure path. When the classifier
+    refuses, the SDK's own exception is re-raised untouched, message and all.
+    """
+
+    def __init__(self, *args, connector_id: str = "", **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._connector_id = connector_id
+        self._tolerated: set[tuple[str, tuple[str, ...]]] = set()
+
+    async def _validate_tool_result(self, name: str, result) -> None:
+        try:
+            await super()._validate_tool_result(name, result)
+        except RuntimeError:
+            extras = undeclared_properties(
+                self._tool_output_schemas.get(name),
+                getattr(result, "structuredContent", None))
+            if extras is None:
+                raise
+            seen = (name, tuple(extras))
+            if seen not in self._tolerated:
+                # Once per session per tool per property set. The sweep runs on
+                # a 300s timer, so logging every call would bury the connector's
+                # real errors under a field nobody reads.
+                self._tolerated.add(seen)
+                log.warning(
+                    "connector %r tool %r returned %s, which its own output "
+                    "schema does not declare. Relaying the payload: an "
+                    "undeclared property says nothing about the fields Nakagai "
+                    "reads. A declared field of the wrong type still refuses.",
+                    self._connector_id or "?", name, ", ".join(extras))
 
 
 @dataclass
@@ -189,8 +236,6 @@ class ConnectorHub:
 
         @asynccontextmanager
         async def _open():
-            from mcp.client.session import ClientSession
-
             from nakagai_edge.identity import client_info
 
             timeout = timedelta(seconds=spec.timeout_s)
@@ -199,8 +244,10 @@ class ConnectorHub:
                 params = StdioServerParameters(command=spec.command, args=spec.args,
                                                env=env or None)
                 async with stdio_client(params) as (read, write):
-                    async with ClientSession(read, write, read_timeout_seconds=timeout,
-                                             client_info=client_info()) as s:
+                    async with TolerantClientSession(read, write,
+                                                     read_timeout_seconds=timeout,
+                                                     client_info=client_info(),
+                                                     connector_id=spec.id) as s:
                         await s.initialize()
                         yield s
             else:
@@ -210,8 +257,10 @@ class ConnectorHub:
                 http_client = build_http_client(spec, self.root)
                 async with streamable_http_client(spec.url, http_client=http_client) as (
                         read, write, _get_session_id):
-                    async with ClientSession(read, write, read_timeout_seconds=timeout,
-                                             client_info=client_info()) as s:
+                    async with TolerantClientSession(read, write,
+                                                     read_timeout_seconds=timeout,
+                                                     client_info=client_info(),
+                                                     connector_id=spec.id) as s:
                         await s.initialize()
                         yield s
 
