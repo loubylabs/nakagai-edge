@@ -26,3 +26,29 @@ def test_the_base_hub_is_the_edges():
     from nakagai_edge.hub import ConnectorError, ConnectorHub, GuardrailDenied  # noqa: F401
 
     assert not hasattr(ConnectorHub, "decide")
+
+
+def test_the_sdk_still_exposes_the_seam_tolerance_overrides():
+    """TolerantClientSession overrides a private SDK method and reads a private
+    SDK attribute. Both are load-bearing, and neither is a public interface.
+
+    An SDK upgrade that renames either would leave our override dead: the
+    payload Robinhood sends today would start raising again. That failure is
+    loud rather than silent, so nothing bad reaches the ledger, but a red line
+    here beats an owner discovering it through a blank Positions page.
+    """
+    import inspect
+
+    from mcp.client.session import ClientSession
+
+    from nakagai_edge.hub import TolerantClientSession
+
+    assert inspect.iscoroutinefunction(ClientSession._validate_tool_result), (
+        "the SDK's output-schema validation is no longer an async method by "
+        "this name; TolerantClientSession._validate_tool_result overrides "
+        "nothing and hard failures are back")
+    assert "_tool_output_schemas" in inspect.getsource(ClientSession.__init__), (
+        "the SDK no longer caches output schemas under this name; "
+        "TolerantClientSession can no longer find the schema to classify")
+    assert TolerantClientSession._validate_tool_result is not \
+        ClientSession._validate_tool_result, "the override went missing"
