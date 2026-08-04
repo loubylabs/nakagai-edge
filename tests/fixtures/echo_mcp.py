@@ -4,7 +4,7 @@ Stands in for a broker: one annotated read tool, one unannotated read-ish tool,
 one account-scoped read, one write. Runnable as a stdio server so the real
 `stdio_client` transport gets exercised too:
 
-    uv run --group mcp python tests/fixtures/echo_mcp.py
+    uv run python tests/fixtures/echo_mcp.py
 """
 
 from mcp.server.fastmcp import FastMCP

@@ -11,7 +11,7 @@ lie the way a real broker does.
 
 Runnable as a stdio server, like the other fixtures here:
 
-    uv run --group mcp python tests/fixtures/lying_broker_mcp.py
+    uv run python tests/fixtures/lying_broker_mcp.py
 """
 
 import json
