@@ -21,6 +21,7 @@ from typing import Any
 
 from jsonschema import SchemaError
 from jsonschema.validators import validator_for
+from referencing.exceptions import Unresolvable
 
 
 def _is_undeclared_property(error) -> bool:
@@ -32,10 +33,16 @@ def _is_undeclared_property(error) -> bool:
     have a shape, and jsonschema descends into it and yields ordinary typed
     errors instead of this one.
 
-    An error carrying `.context` came from `anyOf`/`oneOf`. It is never treated
-    as tolerable, however tolerable its leaves look: under `anyOf` the instance
-    is invalid only when every branch failed, and deciding that a branch failed
-    only over extras means re-running branch selection here. Fail closed.
+    An error carrying `.context` came from `anyOf`/`oneOf`. In jsonschema 4.26
+    that alone already excludes it here: a context-carrying error's own
+    `validator` reads `"anyOf"`/`"oneOf"`, never `"additionalProperties"`, so
+    the check below never matches one anyway. The `.context` check is kept as
+    an explicit guard against that coupling changing under us, not because it
+    currently does any work of its own. Either way, an `anyOf`/`oneOf` error
+    is never treated as tolerable: under `anyOf` the instance is invalid only
+    when every branch failed, and deciding that a branch failed only over
+    extras means re-running branch selection here, which this module does
+    not do. Fail closed.
     """
     if error.context:
         return False
@@ -73,6 +80,14 @@ def undeclared_properties(schema: dict | None, instance: Any) -> list[str] | Non
     (an unknown `type` value, say) surfaces as whatever exception the type
     checker happens to raise rather than as `SchemaError`. Checking first
     routes every such case through the one branch meant to catch it.
+
+    A dangling `$ref` passes `check_schema`: pointing at a `$defs` entry that
+    does not exist is syntactically valid against the meta-schema, and only
+    fails once `iter_errors` tries to resolve it. jsonschema wraps that in
+    `jsonschema.exceptions._WrappedReferencingError`, which is private and not
+    meant to be imported. Its base, `referencing.exceptions.Unresolvable`, is
+    the stable public name and catches it the same way, since Python's
+    `except` matches by the whole MRO.
     """
     if not isinstance(schema, dict):
         return None
@@ -80,8 +95,9 @@ def undeclared_properties(schema: dict | None, instance: Any) -> list[str] | Non
         validator = validator_for(schema)(schema)
         validator.check_schema(schema)
         errors = list(validator.iter_errors(instance))
-    except SchemaError:
-        # A schema that will not compile says nothing about the payload.
+    except (SchemaError, Unresolvable):
+        # A schema that will not compile, or will not resolve, says nothing
+        # about the payload.
         return None
     if not errors:
         return None

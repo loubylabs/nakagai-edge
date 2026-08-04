@@ -123,6 +123,15 @@ def test_a_broken_schema_is_fatal():
     assert undeclared_properties({"type": "not-a-real-type"}, {"a": 1}) is None
 
 
+def test_an_unresolvable_ref_is_fatal():
+    """A `$ref` pointing at a `$defs` entry that does not exist passes
+    check_schema (it is syntactically valid) and only fails once iter_errors
+    tries to resolve it. That failure must return None like every other
+    "cannot judge this" case, not raise into the caller."""
+    schema = {"type": "object", "properties": {"x": {"$ref": "#/$defs/missing"}}}
+    assert undeclared_properties(schema, {"x": 1}) is None
+
+
 @pytest.mark.parametrize("instance", ["a string", 7, None, ["a", "list"]])
 def test_a_non_object_payload_is_fatal(instance):
     assert undeclared_properties(ACCOUNTS, instance) is None
