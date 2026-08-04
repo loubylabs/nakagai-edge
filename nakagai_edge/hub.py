@@ -9,7 +9,12 @@ AsyncExitStack-across-tasks pool (and `ClientSessionGroup`, which also can't
 carry an httpx OAuth `auth`) is the wrong shape here.
 
 Calls from other tasks are safe: `ClientSession.call_tool` only writes to memory
-streams owned by the session.
+streams owned by the session. `TolerantClientSession._tolerated` (below) is
+mutated on that same call path from those same other tasks, and is safe for a
+different reason: the check-then-add against it has no `await` between the
+membership test and the `add`, so the whole thing is one atomic step under
+asyncio's cooperative scheduling. Put an `await` inside that block and this
+stops being true.
 """
 
 import asyncio
@@ -64,11 +69,31 @@ class TolerantClientSession(ClientSession):
     `unsettled_funds`, which took the whole portfolio sweep down over a field
     no capability map mentions.
 
-    `super()` still owns the schema cache, the missing-structuredContent case
-    and SchemaError, so none of the SDK's control flow is duplicated here and
-    re-validation happens only on the failure path. When the classifier
-    refuses, the SDK's own exception is re-raised untouched, message and all.
+    `super()._validate_tool_result` wraps three different failures into the
+    same `RuntimeError`: missing `structuredContent`, a `ValidationError` from
+    `jsonschema.validate`, and a `SchemaError` from a schema that will not even
+    compile. All three land in the `except RuntimeError` below and are decided
+    by `undeclared_properties`, which re-runs `check_schema` and `iter_errors`
+    on the same schema and instance. For the first two, that rerun turns up
+    errors that are not `additionalProperties: false` refusals, so the
+    classifier returns None and the SDK's own RuntimeError is re-raised
+    untouched, message and all. For the third, re-running `check_schema` hits
+    `jsonschema.SchemaError` again, which is why `response_schema.py` catches
+    it too: without that branch, this override would raise a fresh SchemaError
+    out of an active except block instead of relaying the SDK's message.
     """
+
+    # The dedupe key is (tool, property set), and the property set is the
+    # broker's to choose: nothing here bounds how many distinct sets a session
+    # sees, so a broker that varies an undeclared property per call (a
+    # per-request id, a date-stamped balance key) would otherwise grow this
+    # set once per call, forever, in a daemon that holds one session for the
+    # whole life of the connection. The cap bounds memory instead of the
+    # broker; past it, a call with a never-before-seen property set logs again
+    # rather than being remembered, which trades log noise for a fixed
+    # ceiling. That is the right trade here: a broker noisy enough to hit the
+    # cap is already the case this warning exists to surface.
+    _MAX_TOLERATED = 1024
 
     def __init__(self, *args, connector_id: str = "", **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -86,10 +111,12 @@ class TolerantClientSession(ClientSession):
                 raise
             seen = (name, tuple(extras))
             if seen not in self._tolerated:
-                # Once per session per tool per property set. The sweep runs on
-                # a 300s timer, so logging every call would bury the connector's
-                # real errors under a field nobody reads.
-                self._tolerated.add(seen)
+                # Once per session per tool per property set, up to
+                # _MAX_TOLERATED. The sweep runs on a 300s timer, so logging
+                # every call would bury the connector's real errors under a
+                # field nobody reads.
+                if len(self._tolerated) < self._MAX_TOLERATED:
+                    self._tolerated.add(seen)
                 log.warning(
                     "connector %r tool %r returned %s, which its own output "
                     "schema does not declare. Relaying the payload: an "

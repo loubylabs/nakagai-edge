@@ -112,6 +112,18 @@ def test_additional_properties_as_a_schema_is_not_this_case():
     assert undeclared_properties(schema, {"a": "x", "b": 7}) is None
 
 
+def test_a_pattern_matched_property_is_not_undeclared():
+    """`patternProperties` legally declares a key even though it never
+    appears in `properties`. Only a key neither names is undeclared, so the
+    warning must not name a legal property as the culprit."""
+    schema = {"type": "object",
+              "properties": {"a": {"type": "string"}},
+              "patternProperties": {"^x_": {"type": "string"}},
+              "additionalProperties": False}
+    payload = {"a": "keep", "x_fine": "legal", "junk": "not declared"}
+    assert undeclared_properties(schema, payload) == ["junk"]
+
+
 def test_a_null_schema_is_fatal():
     """A tool with no declared output schema never reaches validation, so a
     None here means the caller lost track of which tool it was validating."""
@@ -127,7 +139,16 @@ def test_an_unresolvable_ref_is_fatal():
     """A `$ref` pointing at a `$defs` entry that does not exist passes
     check_schema (it is syntactically valid) and only fails once iter_errors
     tries to resolve it. That failure must return None like every other
-    "cannot judge this" case, not raise into the caller."""
+    "cannot judge this" case, not raise into the caller.
+
+    This exercises the classifier's own fail-closed contract, not the hub
+    path: `hub.call` cannot reach here with a dangling $ref. The SDK's own
+    validate() only catches ValidationError and SchemaError, so the
+    jsonschema-internal exception a dangling $ref raises escapes
+    `_validate_tool_result`, and then `hub.call`, uncaught, rather than
+    becoming the RuntimeError our override classifies. It stays fail-closed
+    either way, because the payload is refused rather than relayed, whichever
+    route raises it."""
     schema = {"type": "object", "properties": {"x": {"$ref": "#/$defs/missing"}}}
     assert undeclared_properties(schema, {"x": 1}) is None
 

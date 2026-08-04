@@ -17,6 +17,7 @@ guardrails.py and warrant.py, so the whole rule is testable without a broker.
 The caller in hub.py owns the logging and the decision to re-raise.
 """
 
+import re
 from typing import Any
 
 from jsonschema import SchemaError
@@ -53,12 +54,21 @@ def _names(error) -> set[str]:
     """The property names one undeclared-property error is about.
 
     Computed from the instance and the schema rather than parsed out of
-    jsonschema's message prose, which is not an interface.
+    jsonschema's message prose, which is not an interface. A key matching any
+    `patternProperties` regex is legally declared even though it is absent
+    from `properties`, so it is excluded here too: `additionalProperties`
+    only governs keys neither names, and reporting a pattern-matched key as
+    undeclared would name a legal property as the culprit and widen the
+    dedupe key on every change to the broker's pattern-matched keys, not just
+    on a genuinely new undeclared one.
     """
     if not isinstance(error.instance, dict):
         return set()
-    declared = set((error.schema or {}).get("properties") or {})
-    return set(error.instance) - declared
+    schema = error.schema or {}
+    declared = set(schema.get("properties") or {})
+    patterns = [re.compile(p) for p in (schema.get("patternProperties") or {})]
+    return {name for name in set(error.instance) - declared
+            if not any(p.search(name) for p in patterns)}
 
 
 def undeclared_properties(schema: dict | None, instance: Any) -> list[str] | None:
@@ -84,10 +94,20 @@ def undeclared_properties(schema: dict | None, instance: Any) -> list[str] | Non
     A dangling `$ref` passes `check_schema`: pointing at a `$defs` entry that
     does not exist is syntactically valid against the meta-schema, and only
     fails once `iter_errors` tries to resolve it. jsonschema wraps that in
-    `jsonschema.exceptions._WrappedReferencingError`, which is private and not
-    meant to be imported. Its base, `referencing.exceptions.Unresolvable`, is
-    the stable public name and catches it the same way, since Python's
-    `except` matches by the whole MRO.
+    `jsonschema.exceptions._WrappedReferencingError`, which derives from
+    `Exception` and `referencing.exceptions.Unresolvable`, not from
+    `RuntimeError` or `ValidationError`.
+
+    That means `hub.call` never actually reaches this branch with one: the
+    SDK's own `validate()` only catches `ValidationError` and `SchemaError`,
+    so a dangling `$ref` escapes `_validate_tool_result` uncaught and
+    propagates out of `hub.call` as that jsonschema-internal exception,
+    rather than becoming the `RuntimeError` `TolerantClientSession` catches
+    and hands to this function. This catch guards this function's own
+    contract instead: a pure classifier that never raises, for callers other
+    than the hub, present or future. Either way the payload is refused, not
+    relayed, so both paths are fail-closed; a caller through the hub just
+    sees a different exception type than a caller that arrives here directly.
     """
     if not isinstance(schema, dict):
         return None
@@ -97,7 +117,11 @@ def undeclared_properties(schema: dict | None, instance: Any) -> list[str] | Non
         errors = list(validator.iter_errors(instance))
     except (SchemaError, Unresolvable):
         # A schema that will not compile, or will not resolve, says nothing
-        # about the payload.
+        # about the payload. The Unresolvable half is never reached from
+        # hub.call: a dangling $ref escapes the SDK's own validate()
+        # uncaught, before it can become the RuntimeError our caller catches.
+        # This branch guards this function's own fail-closed contract for
+        # callers other than the hub.
         return None
     if not errors:
         return None
