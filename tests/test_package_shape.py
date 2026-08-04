@@ -39,7 +39,9 @@ def test_the_sdk_still_exposes_the_seam_tolerance_overrides():
     """
     import inspect
 
+    import anyio
     from mcp.client.session import ClientSession
+    from mcp.shared.message import SessionMessage
 
     from nakagai_edge.hub import TolerantClientSession
 
@@ -47,8 +49,27 @@ def test_the_sdk_still_exposes_the_seam_tolerance_overrides():
         "the SDK's output-schema validation is no longer an async method by "
         "this name; TolerantClientSession._validate_tool_result overrides "
         "nothing and hard failures are back")
-    assert "_tool_output_schemas" in inspect.getsource(ClientSession.__init__), (
-        "the SDK no longer caches output schemas under this name; "
-        "TolerantClientSession can no longer find the schema to classify")
+
+    # ClientSession.__init__ does no I/O: it only stores its arguments, so a
+    # real instance can be built from a pair of unconnected memory streams
+    # without entering the session's async context. A source-text search for
+    # the attribute name would still pass if the SDK renamed it to something
+    # that merely contains the old name (`_new_tool_output_schemas_v2`
+    # contains `_tool_output_schemas`); checking a live instance cannot.
+    read_writer, read_stream = anyio.create_memory_object_stream[
+        SessionMessage | Exception](0)
+    write_stream, write_reader = anyio.create_memory_object_stream[
+        SessionMessage](0)
+    session = TolerantClientSession(read_stream, write_stream, connector_id="guard")
+    try:
+        assert hasattr(session, "_tool_output_schemas"), (
+            "the SDK no longer caches output schemas under this name; "
+            "TolerantClientSession can no longer find the schema to classify")
+    finally:
+        read_writer.close()
+        read_stream.close()
+        write_stream.close()
+        write_reader.close()
+
     assert TolerantClientSession._validate_tool_result is not \
         ClientSession._validate_tool_result, "the override went missing"
