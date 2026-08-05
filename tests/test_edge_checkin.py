@@ -184,10 +184,24 @@ async def test_edge_agent_can_arm_autopilot_after_checking_in_with_equity(
     doc["preset"] = "autopilot"
     store.save(doc)
 
-    # No equity report yet: the default 3.0% dial is on and unenforceable.
+    # No equity report yet, so the platform cannot price what it needs equity
+    # for and the arm precheck refuses.
+    #
+    # Assert the BEHAVIOUR, never the copy. The 422's detail is prose the
+    # platform composes for an owner to read, and it is free to improve it: it
+    # has widened once already, from naming only the daily-loss breaker to
+    # naming the risk caps that also need the figure. A substring match here
+    # turns every legitimate reword on that side into a red "the published edge
+    # and this platform disagree", which is a claim about the PAIRING and was
+    # false both times it fired.
+    #
+    # What this test is actually for is the transition: refused before a
+    # check-in, armed after one. A status code and the stored state say that,
+    # and they say it identically against any platform old or new enough to
+    # have the precheck at all.
     before = owner.post("/api/mandate/arm", json={"armed": True}, headers=owner_headers)
     assert before.status_code == 422
-    assert "no agent has reported account equity" in before.json()["detail"]
+    assert store.load()["autopilot_state"]["armed"] is False
 
     token = _enroll(platform_app, name="edge-shim")
     platform_client = _bridged_platform_client(platform_app, token)
