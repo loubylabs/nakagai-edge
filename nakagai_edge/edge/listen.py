@@ -151,6 +151,16 @@ RENDERERS = {
     # says which tickers are worth asking about, and the answer comes from the
     # platform's get_symbol_trend tool.
     "signal_digest": _digest,
+    # Which nakagai-edge this owner is running, which one their platform
+    # ships, and which one the index has. Every value is a version string or
+    # the platform's own name for the agent, so there is no outsider-written
+    # text anywhere in it: the same test `market_event`'s magnitude passes.
+    #
+    # It deliberately carries no upgrade command. The platform does not know
+    # how this edge was installed and must not claim to, and a shell command
+    # arriving over the channel and landing in an agent's context is exactly
+    # what this registry exists to keep out. `nakagai-edge status` knows.
+    "edge_update": _named("agent", "running", "server", "latest"),
 }
 
 # The kinds the agent owes an answer to. Everything else is context it absorbs:
