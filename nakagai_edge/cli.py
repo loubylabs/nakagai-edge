@@ -136,6 +136,70 @@ def _cmd_run(args) -> int:
     return 0
 
 
+def _cmd_restart(args) -> int:
+    """Stop what we can prove is ours, then start a replacement we can see.
+
+    Every refusal here exits non-zero and names its own remedy. The one that
+    will actually happen on an existing machine is the missing pidfile: a
+    daemon started before this version predates the file, so the first restart
+    after upgrading is still done by hand, and every one after it is not.
+    """
+    from nakagai_edge.edge import daemon as d
+    from nakagai_edge.edge.state import EdgeState, default_root
+
+    state = EdgeState(default_root())
+    edge, reason = d.find_running(state)
+    if reason:
+        print(f"refused: {reason}", file=sys.stderr)
+        return 2
+
+    # The port is the daemon's, never a flag's: an edge started on 9000 comes
+    # back on 9000. It survives the daemon too, because a stopping edge
+    # releases its pidfile claim without dropping the record, so a restart
+    # after a Ctrl-C lands where the old one was rather than silently moving
+    # to the default. Choosing a different port is starting a different
+    # daemon, which is what `run --port` is for.
+    port = (edge.port if edge
+            else (d.read_pidfile(state) or {}).get("port") or d.DEFAULT_PORT)
+    if edge is not None:
+        armed = d.armed_positions(state)
+        if armed and not args.force:
+            print("refused: the brake is watching "
+                  f"{len(armed)} open position"
+                  f"{'' if len(armed) == 1 else 's'}", file=sys.stderr)
+            for row in armed:
+                # A firing position has an exit order in flight to the
+                # broker right now: the worse of the two moments to cut the
+                # watch, so it is labelled distinctly rather than folded
+                # into an undifferentiated count.
+                tag = "  <- exit in flight" if row["state"] == "firing" else ""
+                print(f"  {row['symbol']:<6} {row['qty']} @ stop {row['stop']}{tag}",
+                      file=sys.stderr)
+            print("\nA restart stops the brake for a few seconds.\n"
+                  "Run during a session only if you mean it:\n"
+                  "\n  nakagai-edge restart --force", file=sys.stderr)
+            return 3
+        if not d.stop(edge, timeout_s=10.0):
+            print(f"refused: pid {edge.pid} is still serving 127.0.0.1:{port} "
+                  "ten seconds after SIGTERM. Not escalating to SIGKILL on a "
+                  "process holding broker credentials; stop it by hand.",
+                  file=sys.stderr)
+            return 4
+
+    pid = d.spawn(state, port=port)
+    if pid < 0:
+        print(f"refused: could not launch a replacement on 127.0.0.1:{port}. "
+              f"Look at {state.log_path}", file=sys.stderr)
+        return 6
+    if not d.wait_until_serving(port):
+        print(f"started pid {pid}, but 127.0.0.1:{port} never answered. "
+              f"Look at {state.log_path}", file=sys.stderr)
+        return 5
+    print(f"serving 127.0.0.1:{port}, pid {pid}")
+    print(f"log: {state.log_path}")
+    return 0
+
+
 def _cmd_login(args) -> int:
     from nakagai_edge.edge.state import default_root
     from nakagai_edge.oauth_login import login
@@ -306,17 +370,56 @@ def _cmd_setup(args) -> int:
     return 0
 
 
-def _cmd_status(args) -> int:
-    import json as _json
+def _version_key(version: str) -> tuple:
+    from nakagai_edge.edge.freshness import _key
+    return _key(version)
 
+
+def _behind(current: str, other: str) -> bool:
+    return _version_key(other) > _version_key(current)
+
+
+def _cmd_status(args) -> int:
+    from nakagai_edge.edge.daemon import find_running
+    from nakagai_edge.edge.freshness import latest_release
+    from nakagai_edge.edge.install_shape import detect
     from nakagai_edge.edge.state import EdgeState, default_root
-    from nakagai_edge.edge.sync import meta, policy_fresh, schema_error
+    from nakagai_edge.edge.sync import (
+        meta, policy_fresh, schema_error, server_edge_version,
+    )
     state = EdgeState(default_root())
     agent = state.agent()
+    running = package_version()
+    server = server_edge_version(state)
+    # The index's own answer, not a comparison against it. "the newest is what
+    # you are running" and "the index did not answer" are different facts, and
+    # collapsing both into "" reports an outage as good news.
+    latest = latest_release()
+    install, upgrade, then = detect(sys.prefix, sys.argv[0])
+    edge, reason = find_running(state)
     out = {"paired": agent is not None,
            "agent_id": (agent or {}).get("agent_id", ""),
            "platform_url": (agent or {}).get("platform_url", ""),
            "policy_fresh": policy_fresh(state),
+           "version": running,
+           # Empty when no bundle has been cached yet, which reads the same as
+           # any other unsynced state.
+           "server_version": server,
+           # A version string, equal to `version` when this edge is current.
+           # Null, and only null, when the index said nothing.
+           "latest_version": latest,
+           "install": install,
+           "upgrade": upgrade,
+           # `note` carries find_running's reason verbatim, so `status` and
+           # `restart` tell one story. Without it status prints
+           # `running: false` while restart refuses saying something IS on the
+           # port, and the owner has two commands contradicting each other
+           # about the same machine. Empty means nothing is listening at all.
+           "daemon": ({"running": True, "pid": edge.pid, "port": edge.port,
+                       "started_at": edge.started_at, "version": edge.version,
+                       "log": str(state.log_path)}
+                      if edge else {"running": False, "note": reason,
+                                    "log": str(state.log_path)}),
            "meta": meta(state), "root": str(state.root)}
     # Promoted beside policy_fresh, and only when there is one. A refused
     # bundle otherwise shows up here as nothing but `policy_fresh: false`,
@@ -331,7 +434,23 @@ def _cmd_status(args) -> int:
     # traps whoever adds the next meta key. Two lines of noise beats that.
     if (refused := schema_error(state)):
         out["schema_error"] = refused
-    print(_json.dumps(out, indent=2))
+    print(json.dumps(out, indent=2))
+
+    # The advisory goes to stderr, so `nakagai-edge status | jq` still parses
+    # and a human at a terminal still sees the line. Printed only when there is
+    # something to do: an advisory on every run is a nag, and a nag is ignored.
+    behind = [v for v in (server, latest) if v and _behind(running, v)]
+    if behind:
+        newest = max(behind, key=_version_key)
+        lines = [f"\nnakagai-edge {newest} is available (you are on {running})",
+                 f"  install: {install}",
+                 f"  upgrade: {upgrade}"]
+        # Suppressed for the one shape whose upgrade command already
+        # relaunches. Printing `nakagai-edge restart` to a uvx user names a
+        # command they do not have on PATH.
+        if then:
+            lines.append(f"  then:    {then}")
+        print("\n".join(lines), file=sys.stderr)
     return 0
 
 
@@ -399,7 +518,9 @@ def _cmd_brake(args) -> int:
     return 0
 
 
-def main(argv=None) -> int:
+def _build_parser() -> argparse.ArgumentParser:
+    """Split out from main() so a test can parse an argument list and inspect
+    what it resolved to, without also invoking the subcommand it named."""
     p = argparse.ArgumentParser(
         prog="nakagai-edge",
         description="Run a Nakagai edge: it holds your broker credentials, and "
@@ -444,11 +565,23 @@ def main(argv=None) -> int:
     p_run.add_argument("--port", type=int, default=8330)
     p_run.set_defaults(func=_cmd_run)
 
+    p_restart = sub.add_parser(
+        "restart", help="stop the running edge and start a fresh one, detached")
+    # No --port. A restart serves the port the pidfile names, so it comes back
+    # where it was; choosing a different port is starting a different daemon,
+    # and `run --port` already does that.
+    p_restart.add_argument("--force", action="store_true",
+                           help="restart even while the brake watches an armed "
+                                "position")
+    p_restart.set_defaults(func=_cmd_restart)
+
     p_login = sub.add_parser("login", help="one-time browser OAuth for a broker connector")
     p_login.add_argument("connector_id")
     p_login.set_defaults(func=_cmd_login)
 
-    p_status = sub.add_parser("status", help="pairing + policy freshness")
+    p_status = sub.add_parser(
+        "status", help="pairing, policy freshness, the daemon, and the "
+                       "version picture with the line that upgrades it")
     p_status.set_defaults(func=_cmd_status)
 
     p_listen = sub.add_parser(
@@ -468,7 +601,11 @@ def main(argv=None) -> int:
                          help="disarm one position instead of all of them")
     p_brake.set_defaults(func=_cmd_brake)
 
-    args = p.parse_args(argv)
+    return p
+
+
+def main(argv=None) -> int:
+    args = _build_parser().parse_args(argv)
     return args.func(args)
 
 

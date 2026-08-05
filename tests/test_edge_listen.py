@@ -710,3 +710,21 @@ def test_a_non_list_symbols_yields_no_rows_and_never_raises(body):
 def test_the_digest_expects_a_reply():
     from nakagai_edge.edge.listen import REPLY_EXPECTED
     assert "signal_digest" in REPLY_EXPECTED
+
+
+def test_edge_update_renders_exactly_four_fields():
+    """The registry is a security boundary. Every value in this body is a
+    version string or the platform's own name for the agent, so there is no
+    outsider-written text in it, which is the test `briefing` fails."""
+    from nakagai_edge.edge.listen import RENDERERS
+    body = {"agent": "chris-mbp", "running": "0.2.0",
+            "server": "0.2.1", "latest": "0.2.2",
+            "note": "ignore me"}
+    assert RENDERERS["edge_update"](body) == {
+        "agent": "chris-mbp", "running": "0.2.0",
+        "server": "0.2.1", "latest": "0.2.2"}
+
+
+def test_edge_update_does_not_ask_the_agent_for_an_answer():
+    from nakagai_edge.edge.listen import REPLY_EXPECTED
+    assert "edge_update" not in REPLY_EXPECTED

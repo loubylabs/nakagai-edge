@@ -986,17 +986,10 @@ def run(root, port: int = 8330) -> None:
     client = PlatformClient(agent["platform_url"], agent["token"])
     sync_once(state, client)                 # best-effort warm start
 
-    # Advisory only. The hard gate is BUNDLE_SCHEMA in sync.py, and a daemon
-    # holding broker credentials never updates itself: it says so, and the
-    # owner decides. Every uninteresting case returns None, so this can slow
-    # startup by at most the timeout and can never stop it.
-    from nakagai_edge.edge.freshness import newer_release
-    from nakagai_edge.identity import package_version
-    _current = package_version()
-    if (_newer := newer_release(_current)) is not None:
-        logging.getLogger("nakagai.edge").warning(
-            "nakagai-edge %s is available (you are on %s): "
-            "upgrade with `uvx nakagai-edge@latest run`", _newer, _current)
+    # So `restart` has something it can prove. Best effort by design: a daemon
+    # that cannot write this still serves.
+    from nakagai_edge.edge.daemon import release_pidfile, write_pidfile
+    write_pidfile(state, port=port)
 
     hub = build_hub(state, client)
     audit = EdgeAudit(state)
@@ -1024,4 +1017,10 @@ def run(root, port: int = 8330) -> None:
                 t.cancel()
             await hub.aclose()
 
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    finally:
+        # Only this process's own claim, and never the port. By the time this
+        # runs the server has already freed the port, so a `restart` may
+        # already have a replacement serving and recorded.
+        release_pidfile(state)

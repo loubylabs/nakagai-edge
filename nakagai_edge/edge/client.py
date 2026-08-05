@@ -7,6 +7,8 @@ import json
 
 import httpx
 
+from nakagai_edge.identity import package_version
+
 
 class EdgeClientError(Exception):
     """The platform refused or could not be reached.
@@ -68,7 +70,18 @@ class PlatformClient:
                  *, transport=None) -> None:
         self._client = httpx.Client(
             base_url=platform_url.rstrip("/"), timeout=timeout, transport=transport,
-            headers={"Authorization": f"Bearer {token}"})
+            # The version rides on every request rather than on one dedicated
+            # call, because the daemon has no heartbeat of its own: agent_checkin
+            # is a tool the AGENT invokes, so an edge whose agent is idle would
+            # never report. Whatever the syncer does next carries it instead, and
+            # the platform learns the version at the earliest moment it could.
+            #
+            # Advisory only, and self-asserted. Nothing but a chat message may
+            # ever depend on it, for the same reason report_connectors has
+            # exactly one reader: an edge that can lie about its own health must
+            # never lie its way into authority.
+            headers={"Authorization": f"Bearer {token}",
+                     "X-Nakagai-Edge-Version": package_version()})
         # connector id -> digest of the tool list the platform has actually
         # taken, so report_connectors can leave unchanged schemas at home. In
         # memory on purpose: a restart re-sends once, which costs one payload

@@ -45,3 +45,21 @@ def test_a_prerelease_is_not_advised():
 def test_an_index_of_only_prereleases_is_never_fatal():
     assert freshness.newer_release(
         "0.1.0", transport=_index(["0.2.0rc1"])) is None
+
+
+def test_latest_release_answers_even_when_it_is_what_you_are_running():
+    """The distinction `newer_release` cannot make. "the newest published
+    version is the one you have" and "the index did not answer" are different
+    facts, and `status` reports this value verbatim so an owner can tell them
+    apart. Collapsing both into nothing reports an outage as good news."""
+    assert freshness.latest_release(transport=_index(["0.1.0", "0.3.1"])) == "0.3.1"
+
+
+def test_latest_release_is_none_only_when_the_index_says_nothing():
+    def boom(request):
+        raise httpx.ConnectError("no network")
+    assert freshness.latest_release(transport=httpx.MockTransport(boom)) is None
+    bad = httpx.MockTransport(lambda r: httpx.Response(200, json={"nope": 1}))
+    assert freshness.latest_release(transport=bad) is None
+    # An index carrying nothing this edge would ever install is also nothing.
+    assert freshness.latest_release(transport=_index(["0.2.0rc1"])) is None

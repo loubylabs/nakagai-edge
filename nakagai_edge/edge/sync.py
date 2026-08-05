@@ -200,6 +200,23 @@ def policy_fresh(state: EdgeState, ttl_s: int = POLICY_TTL_S) -> bool:
     return bool(fetched) and (time.time() - fetched) < ttl_s
 
 
+def server_edge_version(state: EdgeState) -> str:
+    """Which nakagai-edge the platform was built against, per its last bundle.
+
+    Read off disk rather than fetched, so `status` answers the skew question
+    with no network call. An empty string covers every uninteresting case: no
+    bundle cached yet, or a bundle from a platform that predates the key. That
+    is the same "not synced yet" the rest of this file already reports, and it
+    needs no special case downstream.
+    """
+    try:
+        doc = json.loads(state.bundle_path.read_text())
+        version = doc.get("edge_version") or ""
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return ""
+    return version if isinstance(version, str) else ""
+
+
 def sync_once(state: EdgeState, client: PlatformClient) -> bool:
     """One conditional fetch. Returns True when the bundle changed. No
     exception ever escapes: network trouble, a non-JSON body, a bad 304
