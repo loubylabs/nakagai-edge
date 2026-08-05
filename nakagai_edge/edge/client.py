@@ -123,11 +123,18 @@ class PlatformClient:
         return self._check(self._client.get(f"/api/agent/approvals/{approval_id}"))
 
     def report_execution(self, approval_id: str, *, ok: bool, result=None,
-                         error: str = "", outcome_unknown: bool = False) -> dict:
+                         error: str = "", outcome_unknown: bool = False,
+                         order_id: str = "") -> dict:
+        # `order_id` is the broker's own id for the order this approval placed,
+        # read through the connector's `place_order` map. It is the left side of
+        # the join that tells an owner-placed fill from an agent one: the fill
+        # journal carries the right side, and a fill no approval claims is the
+        # owner's. Empty when the connector declares no path to it, which is
+        # honest rather than a guess; those approvals simply match nothing.
         return self._check(self._client.post(
             f"/api/agent/approvals/{approval_id}/execution",
             json={"ok": ok, "result": result, "error": error,
-                  "outcome_unknown": outcome_unknown}))
+                  "outcome_unknown": outcome_unknown, "order_id": order_id}))
 
     def agent_checkin(self, status: str, note: str = "",
                       account_equity: float | None = None,
@@ -223,6 +230,15 @@ class PlatformClient:
     def ship_audit(self, events: list[dict]) -> dict:
         return self._check(self._client.post("/api/agent/audit",
                                              json={"events": events}))
+
+    def report_fills(self, fills: list[dict]) -> dict:
+        # Deliberately NOT ship_audit. The audit trail is the record of what
+        # the edge did, and it is what answers for the agent's conduct; a trade
+        # the owner placed in the broker's own app is an observation about the
+        # broker, not an edge action. Sharing the pipe would stop the audit
+        # trail answering the one question it exists for.
+        return self._check(self._client.post("/api/agent/fills",
+                                             json={"fills": fills}))
 
     def renew_warrants(self, positions: list[dict]) -> dict:
         # Warrants expire in 24h so a stolen one dies quickly; the edge

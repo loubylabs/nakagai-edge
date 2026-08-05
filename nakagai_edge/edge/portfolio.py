@@ -72,7 +72,7 @@ async def connector_snapshot(hub, spec) -> dict:
     """
     entry: dict = {"id": spec.id, "error": "", "accounts": []}
     try:
-        listed = await _listed(hub, spec)
+        listed = await listed_accounts(hub, spec)
     except Exception as e:  # noqa: BLE001 (per-connector degradation, by design)
         # CapabilityError arrives here too. A connector that never declared
         # list_accounts says so in its own entry and contributes no accounts,
@@ -105,8 +105,12 @@ async def connector_snapshot(hub, spec) -> dict:
     return entry
 
 
-async def _listed(hub, spec) -> list[dict]:
+async def listed_accounts(hub, spec) -> list[dict]:
     """The broker's accounts, normalized one row at a time.
+
+    Public because the fill journal sweeps the same accounts this does, and two
+    readers of `list_accounts` that could disagree about which accounts exist is
+    a way for one sweep to silently cover a set the other does not.
 
     `read_partial`, not `extract`, for exactly the reason `_positions` uses it.
     `account` is a required field, so `extract` would DROP a row whose

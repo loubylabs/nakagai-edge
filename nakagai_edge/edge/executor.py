@@ -7,7 +7,7 @@ import time
 
 import httpx
 
-from nakagai_edge.capability import CapabilityError
+from nakagai_edge.capability import CapabilityError, first, read_partial
 from nakagai_edge.edge.audit import EdgeAudit
 from nakagai_edge.edge.client import EdgeClientError, PlatformClient
 from nakagai_edge.edge.remote import drop_intent, intents
@@ -44,31 +44,57 @@ def _verify(state: EdgeState, approval_id: str, intent: dict, artifact) -> str:
     return ""
 
 
-_FILL_PRICE_KEYS = ("average_price", "filled_price", "execution_price", "price")
+def _placed(cap, result) -> dict:
+    """What the broker said back about an order it accepted, canonically.
+
+    This used to be a hardcoded list of candidate price keys plus a hand-rolled
+    peel of a nested `data` envelope: exactly the two things the capability
+    layer exists to abolish, surviving in the one module nobody re-read when it
+    landed. The map now says where the envelope sits (`items`) and where the
+    fields live (`fields`), the same as every other read in the edge.
+
+    Never raises. A connector that declares no `place_order` map at all, or one
+    that declares no result fields, yields {} and every caller falls back to
+    what it knew before. Bookkeeping must not relabel a really-executed trade.
+    """
+    try:
+        payload = (result or {}).get("data")
+        node = first(payload, cap.items) if cap.items else payload
+        return read_partial("place_order", cap, node) if isinstance(node, dict) else {}
+    except Exception:  # noqa: BLE001 (the broker already executed; see supervise)
+        return {}
 
 
-def _fill_price(result, fallback: float) -> float:
+def placed_order_id(hub, intent: dict, result) -> str:
+    """The broker's own id for the order this intent just placed, or "".
+
+    The left side of the attribution join: the fill journal records every order
+    the broker reports, and one that no approval claims by id is a trade the
+    OWNER placed by hand. Empty is the honest answer for a connector declaring
+    no path to it, and an empty id matches nothing rather than matching wrongly.
+
+    Never raises, for the same reason `supervise` never does: the broker has
+    already executed by the time this runs, and no bookkeeping failure may
+    relabel a real trade.
+    """
+    try:
+        cap = hub.spec(intent["connector_id"]).capability("place_order")
+    except Exception:  # noqa: BLE001 (nothing declared, nothing to read)
+        return ""
+    return str(_placed(cap, result).get("order_id", "") or "")
+
+
+def _fill_price(placed: dict, fallback: float) -> float:
     """What the position actually cost, when the broker says so.
 
     R is measured from the entry, so a fill 6 cents from the limit is 6 cents
-    of error in every R this position ever reports. Best effort: brokers differ
-    in what they return, and the order's own price is an honest fallback. A
-    zero or negative value is what a broker plausibly returns for an order
-    accepted but not yet filled, not a real price, so only a strictly
-    positive number may displace the fallback.
+    of error in every R this position ever reports. A zero or negative value is
+    what a broker plausibly returns for an order accepted but not yet filled,
+    not a real price, so only a strictly positive number may displace the
+    order's own price.
     """
-    payload = (result or {}).get("data")
-    if isinstance(payload, dict) and "data" in payload:
-        payload = payload["data"]
-    if isinstance(payload, dict):
-        for key in _FILL_PRICE_KEYS:
-            try:
-                value = float(payload.get(key))
-            except (TypeError, ValueError):
-                continue
-            if value > 0:
-                return value
-    return fallback
+    value = placed.get("fill_price")
+    return value if isinstance(value, float) and value > 0 else fallback
 
 
 def supervise(hub, state: EdgeState, approval_id: str, intent: dict,
@@ -128,7 +154,7 @@ def supervise(hub, state: EdgeState, approval_id: str, intent: dict,
             "signal_id": record_doc.get("signal_id", ""),
             "entry_args": intent.get("args") or {},
             "entry_qty": entry["qty"],
-            "entry_price": _fill_price(result, entry["price"]),
+            "entry_price": _fill_price(_placed(cap, result), entry["price"]),
             "stop": entry["stop"],
             "confirmed_qty": entry["qty"], "last_confirmed_at": 0.0,
             "unguarded_qty": 0.0,
@@ -228,7 +254,8 @@ async def poll_once(hub, state: EdgeState, client: PlatformClient,
             except Exception:  # noqa: BLE001 (journal is best-effort here)
                 pass
             try:
-                client.report_execution(approval_id, ok=True, result=result)
+                client.report_execution(approval_id, ok=True, result=result,
+                                        order_id=placed_order_id(hub, intent, result))
             except Exception:  # noqa: BLE001 (never re-arm an executed intent)
                 pass
             supervise(hub, state, approval_id, intent, record, result)

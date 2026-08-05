@@ -23,6 +23,7 @@ from nakagai_edge.edge.audit import EdgeAudit
 from nakagai_edge.edge.brake import BRAKE_INTERVAL_S, Brake, normalize_quote
 from nakagai_edge.edge.client import EdgeClientError, PlatformClient
 from nakagai_edge.edge.executor import poll_once
+from nakagai_edge.edge.fills import FILLS_INTERVAL_S, FillsReporter
 from nakagai_edge.edge.portfolio import PORTFOLIO_INTERVAL_S, PortfolioReporter
 from nakagai_edge.edge.remote import RemoteApprovalQueue
 from nakagai_edge.edge.state import EdgeState
@@ -875,7 +876,7 @@ async def _quotes(hub, state: EdgeState, symbols: list[str]) -> dict:
 
 
 async def _loops(state: EdgeState, hub, client: PlatformClient, audit: EdgeAudit,
-                 reporter, brake: Brake):
+                 reporter, brake: Brake, fills):
     from nakagai_edge.edge.client import EdgeClientError
 
     async def syncer():
@@ -958,6 +959,22 @@ async def _loops(state: EdgeState, hub, client: PlatformClient, audit: EdgeAudit
                     "portfolio snapshot failed this cycle: %s", e)
             await asyncio.sleep(PORTFOLIO_INTERVAL_S)
 
+    async def fills_loop():
+        while True:
+            try:
+                # Its own loop rather than a step inside portfolio_loop: the
+                # two read different things for different reasons, and a broker
+                # that will not answer for its order history must not cost the
+                # owner their position snapshot. It also keeps the sweep clear
+                # of refresh_portfolio's rate limiter, which exists to stop an
+                # agent hammering the broker and has nothing to say about a
+                # timer nobody can poke.
+                await fills.sweep()
+            except Exception as e:  # noqa: BLE001 (same posture as the loops above)
+                logging.getLogger("nakagai.edge").warning(
+                    "fill journal sweep failed this cycle: %s", e)
+            await asyncio.sleep(FILLS_INTERVAL_S)
+
     async def brake_loop():
         while True:
             try:
@@ -974,6 +991,7 @@ async def _loops(state: EdgeState, hub, client: PlatformClient, audit: EdgeAudit
             asyncio.create_task(executor(), name="executor"),
             asyncio.create_task(shipper(), name="shipper"),
             asyncio.create_task(portfolio_loop(), name="portfolio_loop"),
+            asyncio.create_task(fills_loop(), name="fills_loop"),
             asyncio.create_task(brake_loop(), name="brake_loop")]
 
 
@@ -994,6 +1012,7 @@ def run(root, port: int = 8330) -> None:
     hub = build_hub(state, client)
     audit = EdgeAudit(state)
     reporter = PortfolioReporter(state, hub, client)
+    fills = FillsReporter(state, hub, client)
     brake = Brake(state, hub, client, audit)
     for pid in recover_interrupted(state):
         # Spent its warrant, then the edge stopped before the broker answered.
@@ -1009,7 +1028,7 @@ def run(root, port: int = 8330) -> None:
         # surface. It never raises: a platform that will not answer costs the
         # promoted names, not the daemon.
         await mcp.promote_platform_tools()
-        tasks = await _loops(state, hub, client, audit, reporter, brake)
+        tasks = await _loops(state, hub, client, audit, reporter, brake, fills)
         try:
             await mcp.run_streamable_http_async()
         finally:
