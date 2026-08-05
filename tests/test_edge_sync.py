@@ -13,7 +13,8 @@ from nakagai_edge.edge.state import EdgeState
 import nakagai_edge.edge.sync as sync
 from nakagai_edge.edge.sync import (BUNDLE_SCHEMA, BundleSchemaError, apply_bundle,
                                cached_bundle, fetched_at, meta, policy_fresh,
-                               public_key, schema_error, sync_once)
+                               public_key, schema_error, server_edge_version,
+                               sync_once)
 
 BUNDLE = {"bundle_version": "v1", "schema_version": 2,
           "connectors": {"connectors": [{"id": "demo", "kind": "mcp-http",
@@ -30,6 +31,26 @@ def test_apply_bundle_writes_registry_and_meta(tmp_path):
     assert cached_bundle(s)["bundle_version"] == "v1"
     assert meta(s)["etag"] == "v1"
     assert public_key(s) == "PUBKEY"
+
+
+def test_server_edge_version_reads_the_cached_bundle(tmp_path):
+    """The one thing `status` needs to answer the skew question: which
+    nakagai-edge the platform was built against, read off the last bundle
+    with no network call. A mutation that unconditionally returns "" would
+    pass every OTHER test in this file, since none of them ever names a
+    real value here; this is the one that would catch it."""
+    s = EdgeState(tmp_path)
+    apply_bundle(s, {**BUNDLE, "edge_version": "0.3.0"}, "v1")
+    assert server_edge_version(s) == "0.3.0"
+
+
+def test_server_edge_version_is_empty_when_the_key_is_absent(tmp_path):
+    """The real case for a platform that predates the field: today's BUNDLE
+    fixture carries no `edge_version` at all, and that has to read as "not
+    synced yet" rather than raise or fabricate a value."""
+    s = EdgeState(tmp_path)
+    apply_bundle(s, BUNDLE, "v1")
+    assert server_edge_version(s) == ""
 
 
 def test_policy_freshness_ttl(tmp_path, monkeypatch):

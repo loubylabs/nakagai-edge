@@ -155,6 +155,14 @@ def test_an_outage_after_a_refusal_reports_the_outage(tmp_path, monkeypatch, cap
 
 
 def test_a_good_bundle_after_a_refusal_syncs_and_clears(tmp_path, monkeypatch, capsys):
+    # The final `status` call below routes through find_running, and a
+    # tmp_path root with no pidfile falls back to DEFAULT_PORT: pin it to a
+    # dead port rather than the real edge this machine happens to run on
+    # 127.0.0.1:8330. newer_release is mocked too, so this stays offline
+    # rather than making a live call to pypi.org on every run.
+    monkeypatch.setattr("nakagai_edge.edge.daemon.DEFAULT_PORT", 1)
+    monkeypatch.setattr("nakagai_edge.edge.freshness.newer_release",
+                        lambda current, **kw: None)
     monkeypatch.setenv("NAKAGAI_EDGE_ROOT", str(tmp_path))
     _synced_edge(tmp_path)
     monkeypatch.setattr("nakagai_edge.cli._edge_client",
@@ -174,8 +182,11 @@ def test_status_is_quiet_about_the_schema_when_the_bundle_reads_fine(tmp_path,
                                                                      capsys):
     # A dead port: `status` now also calls find_running, and a tmp_path root
     # with no pidfile would otherwise fall back to the real daemon this
-    # machine happens to be running on 127.0.0.1:8330.
+    # machine happens to be running on 127.0.0.1:8330. newer_release is
+    # mocked too, so this test does not depend on a live call to pypi.org.
     monkeypatch.setattr("nakagai_edge.edge.daemon.DEFAULT_PORT", 1)
+    monkeypatch.setattr("nakagai_edge.edge.freshness.newer_release",
+                        lambda current, **kw: None)
     monkeypatch.setenv("NAKAGAI_EDGE_ROOT", str(tmp_path))
     state = EdgeState(tmp_path)
     state.save_agent("https://api.test", "ag1", "nk_agent_t")
@@ -193,8 +204,11 @@ def test_status_reports_a_schema_mismatch_and_names_the_fix(tmp_path, monkeypatc
     """`status` is where an owner goes when the edge has gone quiet. A refused
     bundle only shows up later as everything refusing on stale policy, so this
     has to say what actually happened and what to do about it."""
-    # Same reason as the test above: keep find_running off the real daemon.
+    # Same reason as the test above: keep find_running off the real daemon,
+    # and newer_release off the real pypi.org.
     monkeypatch.setattr("nakagai_edge.edge.daemon.DEFAULT_PORT", 1)
+    monkeypatch.setattr("nakagai_edge.edge.freshness.newer_release",
+                        lambda current, **kw: None)
     monkeypatch.setenv("NAKAGAI_EDGE_ROOT", str(tmp_path))
     state = EdgeState(tmp_path)
     state.save_agent("https://api.test", "ag1", "nk_agent_t")
@@ -235,6 +249,26 @@ def test_status_keeps_its_documented_keys_and_gains_the_version_picture(
     assert doc["daemon"]["running"] is False
     assert doc["install"] and doc["upgrade"]
     assert "9.9.9" in out.err                   # the advisory, not on stdout
+
+
+def test_status_carries_the_synced_edge_version_through(tmp_path, monkeypatch, capsys):
+    """The version picture is only worth having if it survives the trip from
+    the cached bundle to the printed JSON. A mutation that made
+    server_edge_version always return "" would still pass the "nothing
+    synced" assertion in the test above, since "" is also the right answer
+    there; only a bundle that actually names a version can catch it."""
+    monkeypatch.setenv("NAKAGAI_EDGE_ROOT", str(tmp_path))
+    monkeypatch.setattr("nakagai_edge.edge.daemon.DEFAULT_PORT", 1)
+    monkeypatch.setattr("nakagai_edge.edge.freshness.newer_release",
+                        lambda current, **kw: None)
+    state = EdgeState(tmp_path)
+    state.save_agent("https://api.test", "ag1", "nk_agent_t")
+    apply_bundle(state, {"bundle_version": "v1", "schema_version": BUNDLE_SCHEMA,
+                         "connectors": {"connectors": []},
+                         "signing_public_key": "k", "edge_version": "0.4.0"}, "v1")
+    assert main(["status"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["server_version"] == "0.4.0"
 
 
 def test_status_says_nothing_on_stderr_when_current(tmp_path, monkeypatch, capsys):
