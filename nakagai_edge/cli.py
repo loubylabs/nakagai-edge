@@ -136,6 +136,54 @@ def _cmd_run(args) -> int:
     return 0
 
 
+def _cmd_restart(args) -> int:
+    """Stop what we can prove is ours, then start a replacement we can see.
+
+    Every refusal here exits non-zero and names its own remedy. The one that
+    will actually happen on an existing machine is the missing pidfile: a
+    daemon started before this version predates the file, so the first restart
+    after upgrading is still done by hand, and every one after it is not.
+    """
+    from nakagai_edge.edge import daemon as d
+    from nakagai_edge.edge.state import EdgeState, default_root
+
+    state = EdgeState(default_root())
+    edge, reason = d.find_running(state)
+    if reason:
+        print(f"refused: {reason}", file=sys.stderr)
+        return 2
+
+    port = edge.port if edge else args.port
+    if edge is not None:
+        armed = d.armed_positions(state)
+        if armed and not args.force:
+            print("refused: the brake is watching "
+                  f"{len(armed)} armed position"
+                  f"{'' if len(armed) == 1 else 's'}", file=sys.stderr)
+            for row in armed:
+                print(f"  {row['symbol']:<6} {row['qty']} @ stop {row['stop']}",
+                      file=sys.stderr)
+            print("\nA restart stops the brake for a few seconds.\n"
+                  "Run during a session only if you mean it:\n"
+                  "\n  nakagai-edge restart --force", file=sys.stderr)
+            return 3
+        if not d.stop(edge, timeout_s=10.0):
+            print(f"refused: pid {edge.pid} is still serving 127.0.0.1:{port} "
+                  "ten seconds after SIGTERM. Not escalating to SIGKILL on a "
+                  "process holding broker credentials; stop it by hand.",
+                  file=sys.stderr)
+            return 4
+
+    pid = d.spawn(state, port=port)
+    if not d.wait_until_serving(port):
+        print(f"started pid {pid}, but 127.0.0.1:{port} never answered. "
+              f"Look at {state.log_path}", file=sys.stderr)
+        return 5
+    print(f"serving 127.0.0.1:{port}, pid {pid}")
+    print(f"log: {state.log_path}")
+    return 0
+
+
 def _cmd_login(args) -> int:
     from nakagai_edge.edge.state import default_root
     from nakagai_edge.oauth_login import login
@@ -443,6 +491,16 @@ def main(argv=None) -> int:
     p_run = sub.add_parser("run", help="serve MCP to the agent on 127.0.0.1")
     p_run.add_argument("--port", type=int, default=8330)
     p_run.set_defaults(func=_cmd_run)
+
+    p_restart = sub.add_parser(
+        "restart", help="stop the running edge and start a fresh one, detached")
+    p_restart.add_argument("--port", type=int, default=8330,
+                           help="only used when nothing is running; a restart "
+                                "otherwise serves the port the old daemon did")
+    p_restart.add_argument("--force", action="store_true",
+                           help="restart even while the brake watches an armed "
+                                "position")
+    p_restart.set_defaults(func=_cmd_restart)
 
     p_login = sub.add_parser("login", help="one-time browser OAuth for a broker connector")
     p_login.add_argument("connector_id")

@@ -16,7 +16,10 @@ out of the way and let a human look.
 
 import json
 import os
+import signal
 import socket
+import subprocess
+import sys
 import time
 from dataclasses import dataclass
 
@@ -48,7 +51,7 @@ def write_pidfile(state: EdgeState, *, port: int) -> None:
         state.pid_path.write_text(json.dumps(
             {"pid": os.getpid(), "port": int(port),
              "started_at": time.time(), "version": package_version()}))
-    except OSError:
+    except Exception:
         pass
 
 
@@ -127,3 +130,83 @@ def find_running(state: EdgeState) -> tuple[RunningEdge | None, str]:
                 f"its own. A daemon started before this version predates the "
                 f"pidfile: stop it by hand, then `nakagai-edge run`.")
     return None, ""
+
+
+def armed_positions(state: EdgeState) -> list[dict]:
+    """What a restart would stop watching, read straight off the ledger.
+
+    Deliberately NOT gated on whether the brake is locally disarmed. A
+    disarmed brake is a decision the owner made and can revisit; a restart is
+    a process event that ends the watch either way, so what matters here is
+    what is open, not what is currently being watched.
+    """
+    from nakagai_edge.edge.supervision import TERMINAL, load
+    rows = []
+    for rec in load(state).values():
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("state") in TERMINAL or rec.get("state") != "armed":
+            continue
+        rows.append({"symbol": rec.get("symbol", "?"),
+                     "qty": rec.get("quantity"),
+                     "stop": rec.get("stop_price"),
+                     "state": rec.get("state", "")})
+    return rows
+
+
+def stop(edge: RunningEdge, *, timeout_s: float = 10.0) -> bool:
+    """SIGTERM, then wait for the port. Never SIGKILL.
+
+    A daemon holding broker credentials can be mid-write to the audit journal
+    or mid-flight on an exit order, and `recover_interrupted` can only report
+    an interrupted exit if the process got far enough to record it. A
+    convenience command does not get to make that call: it reports the refusal
+    and lets a human decide.
+    """
+    try:
+        os.kill(edge.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return not port_listening(edge.port)
+    except OSError:
+        return False
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if not port_listening(edge.port):
+            return True
+        time.sleep(0.2)
+    return not port_listening(edge.port)
+
+
+def spawn(state: EdgeState, *, port: int) -> int:
+    """Relaunch through argv[0], so the install shape is inherited.
+
+    Whoever invoked `restart` invoked it from some install, and that install is
+    the one they want serving. `uvx nakagai-edge@latest restart` therefore
+    leaves latest running and `uv run nakagai-edge restart` leaves that
+    project's venv running, with nothing recorded and no ps output parsed.
+
+    The log is the other half of the problem this solves: a daemon started
+    from a terminal that later closes has been writing into a closed stream,
+    which is why there is nothing to read after the fact.
+    """
+    state.log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    log = open(state.log_path, "ab", buffering=0)
+    try:
+        proc = subprocess.Popen(
+            [sys.argv[0], "run", "--port", str(port)],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+            start_new_session=True, cwd=str(state.root))
+    finally:
+        log.close()
+    return proc.pid
+
+
+def wait_until_serving(port: int, *, timeout_s: float = 20.0) -> bool:
+    """Proof, not assertion. A command that prints "restarted" without
+    checking the port is theater."""
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        if port_listening(port):
+            return True
+        time.sleep(0.3)
+    return port_listening(port)
