@@ -342,3 +342,22 @@ def test_a_report_that_failed_prunes_nothing_either():
     p.fail = False
     c.report_connectors([_connector([GET_ACCOUNT])])
     assert p.entry(2)["tools_unchanged"] is True
+
+
+def test_every_request_carries_the_running_version():
+    """One header on the shared client, so the platform learns the version
+    from whatever call happens first after a restart rather than from a
+    check-in the daemon may never make on its own."""
+    seen = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers.get("x-nakagai-edge-version"))
+        return httpx.Response(200, json={"ok": True})
+
+    from nakagai_edge.identity import package_version
+    c = PlatformClient("https://p.example", "nk_agent_x",
+                       transport=httpx.MockTransport(handler))
+    c.agent_checkin("idle")
+    c.ship_audit([])
+    assert seen == [package_version(), package_version()]
+    assert package_version() != ""
