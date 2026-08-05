@@ -242,9 +242,13 @@ def test_starts_one_when_nothing_is_running(root, monkeypatch):
 
     `--port 8330` is passed explicitly rather than left to the CLI default:
     the restart subparser's default IS `daemon.DEFAULT_PORT` (read at
-    argparse-build time), so leaving it implicit here would pick up this
-    test's own DEFAULT_PORT patch instead of proving the real, unpatched
-    default a user gets by typing nothing at all.
+    argparse-build time), so leaving it implicit here would silently pick up
+    this test's own DEFAULT_PORT patch instead of the literal this test
+    means to exercise. This proves only that a cold start spawns onto
+    whatever port `--port` names; it proves nothing about what the default
+    actually is when no flag is given at all, that is
+    `test_restart_port_default_is_daemon_default_port` below, which never
+    binds a real port to find out.
     """
     dead_port = 1
     spawned = []
@@ -255,3 +259,20 @@ def test_starts_one_when_nothing_is_running(root, monkeypatch):
                         lambda p, host="127.0.0.1": p != dead_port)
     assert main(["restart", "--port", "8330"]) == 0
     assert spawned == [8330]
+
+
+def test_restart_port_default_is_daemon_default_port():
+    """What a user actually gets typing `nakagai-edge restart` with no flags.
+
+    Parses only, never executes: `_build_parser().parse_args` builds the
+    argparse tree and resolves defaults, but nothing here calls `args.func`,
+    so this asserts the default without binding a real port or touching
+    find_running at all. daemon.DEFAULT_PORT is read live rather than
+    hardcoded to 8330, so this fails the moment the two constants drift
+    apart instead of only when both happen to still say 8330.
+    """
+    from nakagai_edge.cli import _build_parser
+    from nakagai_edge.edge import daemon as d
+
+    args = _build_parser().parse_args(["restart"])
+    assert args.port == d.DEFAULT_PORT

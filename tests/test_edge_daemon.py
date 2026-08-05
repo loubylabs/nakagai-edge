@@ -240,3 +240,30 @@ def test_spawn_reports_a_launch_failure_instead_of_raising(state, monkeypatch):
 
     monkeypatch.setattr(subprocess, "Popen", _boom)
     assert daemon.spawn(state, port=9999) == -1
+
+
+def test_spawn_reports_a_log_open_failure_instead_of_raising(tmp_path):
+    """The other half of spawn()'s try/except OSError: the failure can also
+    come from mkdir/open on state.log_path, before Popen is ever called.
+    Forced here by making the log's directory a plain file: mkdir(exist_ok=
+    True) still refuses when the path exists and is not a directory."""
+    root = tmp_path / "not_a_directory"
+    root.write_text("occupied")
+    state = EdgeState(root)
+    assert daemon.spawn(state, port=9999) == -1
+
+
+def test_wait_until_serving_is_false_when_nothing_answers():
+    """A dead port: bind, then let go, so nothing else has had the chance to
+    claim it in between."""
+    sock, port = _listener()
+    sock.close()
+    assert daemon.wait_until_serving(port, timeout_s=0.1) is False
+
+
+def test_wait_until_serving_is_true_once_something_answers():
+    sock, port = _listener()
+    try:
+        assert daemon.wait_until_serving(port, timeout_s=1.0) is True
+    finally:
+        sock.close()

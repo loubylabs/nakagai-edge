@@ -456,7 +456,10 @@ def _cmd_brake(args) -> int:
     return 0
 
 
-def main(argv=None) -> int:
+def _build_parser() -> argparse.ArgumentParser:
+    """Split out from main() so a test can inspect a parsed default (what
+    port does `restart` pick with no flags at all?) without also invoking
+    whatever subcommand it defaulted to."""
     from nakagai_edge.edge.daemon import DEFAULT_PORT
 
     p = argparse.ArgumentParser(
@@ -537,7 +540,11 @@ def main(argv=None) -> int:
                          help="disarm one position instead of all of them")
     p_brake.set_defaults(func=_cmd_brake)
 
-    args = p.parse_args(argv)
+    return p
+
+
+def main(argv=None) -> int:
+    args = _build_parser().parse_args(argv)
     return args.func(args)
 
 
