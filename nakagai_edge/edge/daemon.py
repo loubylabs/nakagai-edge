@@ -135,17 +135,21 @@ def find_running(state: EdgeState) -> tuple[RunningEdge | None, str]:
 def armed_positions(state: EdgeState) -> list[dict]:
     """What a restart would stop watching, read straight off the ledger.
 
-    Deliberately NOT gated on whether the brake is locally disarmed. A
-    disarmed brake is a decision the owner made and can revisit; a restart is
-    a process event that ends the watch either way, so what matters here is
+    Gates on "armed" and "firing" both. A firing position has an exit order
+    in flight to the broker; cutting the watch there is the exact hazard
+    `stop()`'s own docstring names, and `recover_interrupted` can only mark it
+    `outcome_unknown` after the fact, it cannot undo a restart that already
+    happened. Not gated on whether the brake is locally disarmed: a disarmed
+    brake is a decision the owner made and can revisit, a restart is a
+    process event that ends the watch either way, so what matters here is
     what is open, not what is currently being watched.
     """
-    from nakagai_edge.edge.supervision import TERMINAL, load
+    from nakagai_edge.edge.supervision import load
     rows = []
     for rec in load(state).values():
         if not isinstance(rec, dict):
             continue
-        if rec.get("state") in TERMINAL or rec.get("state") != "armed":
+        if rec.get("state") not in ("armed", "firing"):
             continue
         rows.append({"symbol": rec.get("symbol", "?"),
                      "qty": rec.get("quantity"),
@@ -188,14 +192,25 @@ def spawn(state: EdgeState, *, port: int) -> int:
     The log is the other half of the problem this solves: a daemon started
     from a terminal that later closes has been writing into a closed stream,
     which is why there is nothing to read after the fact.
+
+    Returns -1 rather than raising when the log cannot be opened or the
+    launch itself fails. This is called after the old daemon (if any) is
+    already stopped, so an exception escaping here would surface as a bare
+    traceback with nothing left serving and no `edge.log` remedy printed;
+    the caller checks the return value and reports it instead.
     """
-    state.log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    log = open(state.log_path, "ab", buffering=0)
+    try:
+        state.log_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        log = open(state.log_path, "ab", buffering=0)
+    except OSError:
+        return -1
     try:
         proc = subprocess.Popen(
             [sys.argv[0], "run", "--port", str(port)],
             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
             start_new_session=True, cwd=str(state.root))
+    except OSError:
+        return -1
     finally:
         log.close()
     return proc.pid

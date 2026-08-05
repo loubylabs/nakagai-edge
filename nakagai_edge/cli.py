@@ -158,10 +158,15 @@ def _cmd_restart(args) -> int:
         armed = d.armed_positions(state)
         if armed and not args.force:
             print("refused: the brake is watching "
-                  f"{len(armed)} armed position"
+                  f"{len(armed)} open position"
                   f"{'' if len(armed) == 1 else 's'}", file=sys.stderr)
             for row in armed:
-                print(f"  {row['symbol']:<6} {row['qty']} @ stop {row['stop']}",
+                # A firing position has an exit order in flight to the
+                # broker right now: the worse of the two moments to cut the
+                # watch, so it is labelled distinctly rather than folded
+                # into an undifferentiated count.
+                tag = "  <- exit in flight" if row["state"] == "firing" else ""
+                print(f"  {row['symbol']:<6} {row['qty']} @ stop {row['stop']}{tag}",
                       file=sys.stderr)
             print("\nA restart stops the brake for a few seconds.\n"
                   "Run during a session only if you mean it:\n"
@@ -175,6 +180,10 @@ def _cmd_restart(args) -> int:
             return 4
 
     pid = d.spawn(state, port=port)
+    if pid < 0:
+        print(f"refused: could not launch a replacement on 127.0.0.1:{port}. "
+              f"Look at {state.log_path}", file=sys.stderr)
+        return 6
     if not d.wait_until_serving(port):
         print(f"started pid {pid}, but 127.0.0.1:{port} never answered. "
               f"Look at {state.log_path}", file=sys.stderr)
@@ -448,6 +457,8 @@ def _cmd_brake(args) -> int:
 
 
 def main(argv=None) -> int:
+    from nakagai_edge.edge.daemon import DEFAULT_PORT
+
     p = argparse.ArgumentParser(
         prog="nakagai-edge",
         description="Run a Nakagai edge: it holds your broker credentials, and "
@@ -494,7 +505,7 @@ def main(argv=None) -> int:
 
     p_restart = sub.add_parser(
         "restart", help="stop the running edge and start a fresh one, detached")
-    p_restart.add_argument("--port", type=int, default=8330,
+    p_restart.add_argument("--port", type=int, default=DEFAULT_PORT,
                            help="only used when nothing is running; a restart "
                                 "otherwise serves the port the old daemon did")
     p_restart.add_argument("--force", action="store_true",

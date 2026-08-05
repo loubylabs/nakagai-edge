@@ -7,6 +7,8 @@ something that was never ours.
 
 import json
 import socket
+import subprocess
+import sys
 
 import pytest
 
@@ -132,3 +134,109 @@ def test_a_dead_pid_on_a_live_port_refuses(state):
         assert reason
     finally:
         sock.close()
+
+
+def _child_that_listens(*, ignore_sigterm: bool) -> tuple[subprocess.Popen, int]:
+    """A real process this test owns start to finish, never a pid found lying
+    around. It binds its own ephemeral port and prints it back so the test
+    can build a RunningEdge without touching the daemon's pidfile machinery.
+
+    The accept loop is not cosmetic: `stop()` polls `port_listening`, which
+    completes a TCP handshake and closes its side, every ~0.2-0.35s. A child
+    that never calls accept() leaves each of those in the kernel's backlog
+    unclaimed, and a small backlog fills within a couple of probes, after
+    which further connects time out even though the child, and its listening
+    socket, are both still completely alive. That reads as "the port freed"
+    to a timeout-based check and is a fake positive of exactly the kind
+    `stop()` must not produce, so the child accepts and drops each connection
+    the way a real server would, and the backlog never gets the chance.
+    """
+    src = (
+        "import signal, socket, threading, time\n"
+        + ("signal.signal(signal.SIGTERM, signal.SIG_IGN)\n" if ignore_sigterm else "")
+        + "s = socket.socket(); s.bind(('127.0.0.1', 0)); s.listen(5)\n"
+        "print(s.getsockname()[1], flush=True)\n"
+        "def _drain():\n"
+        "    while True:\n"
+        "        try:\n"
+        "            conn, _ = s.accept()\n"
+        "        except OSError:\n"
+        "            return\n"
+        "        conn.close()\n"
+        "threading.Thread(target=_drain, daemon=True).start()\n"
+        "time.sleep(30)\n"
+    )
+    proc = subprocess.Popen([sys.executable, "-c", src],
+                            stdout=subprocess.PIPE, text=True)
+    port = int(proc.stdout.readline())
+    return proc, port
+
+
+def test_stop_sigterms_a_real_child_and_confirms_the_port_freed():
+    """SIGTERM is enough for a cooperative process: stop() must report True
+    and the port must actually be free, not merely assumed free."""
+    child, port = _child_that_listens(ignore_sigterm=False)
+    try:
+        edge = daemon.RunningEdge(pid=child.pid, port=port,
+                                  started_at=0.0, version="test")
+        assert daemon.stop(edge, timeout_s=5.0) is True
+        assert child.wait(timeout=2) is not None
+        assert port_listening(port) is False
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=2)
+
+
+def test_stop_never_escalates_past_sigterm():
+    """A child that ignores SIGTERM must come back False, and must still be
+    ALIVE afterward: stop()'s own docstring says it never escalates to
+    SIGKILL, and that is the one promise this test exists to hold it to."""
+    child, port = _child_that_listens(ignore_sigterm=True)
+    try:
+        edge = daemon.RunningEdge(pid=child.pid, port=port,
+                                  started_at=0.0, version="test")
+        assert daemon.stop(edge, timeout_s=1.0) is False
+        assert child.poll() is None          # still running: never SIGKILL'd
+    finally:
+        child.kill()
+        child.wait(timeout=2)
+
+
+def test_spawn_relaunches_through_argv0_into_the_log(state, monkeypatch):
+    """argv[0] carries the install shape (uvx, a project venv, ...), and the
+    child's stdout/stderr must land in state.log_path rather than a closed
+    terminal stream. subprocess.Popen is faked so no real process is
+    launched; only the call it would have made is inspected."""
+    calls = []
+
+    class _FakeProc:
+        pid = 4242
+
+    def _fake_popen(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return _FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", _fake_popen)
+    pid = daemon.spawn(state, port=9999)
+    assert pid == 4242
+    assert len(calls) == 1
+    argv, kwargs = calls[0]
+    assert argv == [sys.argv[0], "run", "--port", "9999"]
+    assert kwargs["start_new_session"] is True
+    assert kwargs["stdin"] == subprocess.DEVNULL
+    assert kwargs["stderr"] == subprocess.STDOUT
+    assert kwargs["cwd"] == str(state.root)
+    assert kwargs["stdout"].name == str(state.log_path)
+
+
+def test_spawn_reports_a_launch_failure_instead_of_raising(state, monkeypatch):
+    """A restart calls spawn() only after the old daemon is already stopped:
+    an exception escaping here would leave nothing serving and no chance for
+    _cmd_restart to print its `edge.log` remedy. spawn() must catch it and
+    hand the caller a value to check instead."""
+    def _boom(argv, **kwargs):
+        raise OSError("no such executable")
+
+    monkeypatch.setattr(subprocess, "Popen", _boom)
+    assert daemon.spawn(state, port=9999) == -1

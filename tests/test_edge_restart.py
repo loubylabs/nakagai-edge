@@ -56,6 +56,17 @@ def test_refuses_on_a_live_port_it_cannot_claim(root, capsys):
 
 
 def test_refuses_while_a_position_is_armed(root, capsys, monkeypatch):
+    """The gate itself.
+
+    `d.stop` and `d.spawn` are patched to fail the test loudly rather than
+    left real: `pid` here is `os.getpid()`, this very pytest process, because
+    the pidfile has to name a pid `find_running` can prove alive. If the gate
+    above them ever regresses and lets control reach `d.stop`, the previous
+    version of this test called the REAL `stop()`, which sends a real
+    SIGTERM to `os.getpid()`, meaning the gate's own test killed the test
+    runner (RC=143, no output, every later test silently never ran). A
+    failing assertion beats that outcome by a wide margin.
+    """
     import os
     sock, port = _listener()
     try:
@@ -65,10 +76,54 @@ def test_refuses_while_a_position_is_armed(root, capsys, monkeypatch):
             {"position_id": "p1", "symbol": "AAPL", "quantity": 120,
              "stop_price": 224.10, "state": "armed", "blocked": ""},
         ])
+        import nakagai_edge.edge.daemon as d
+        monkeypatch.setattr(d, "stop", lambda edge, **kw: pytest.fail(
+            "the gate let a restart reach stop() on a live pid: this would "
+            "have sent a real SIGTERM to the pytest runner"))
+        monkeypatch.setattr(d, "spawn", lambda st, *, port: pytest.fail(
+            "the gate let a restart spawn past an armed position"))
         assert main(["restart"]) != 0
         err = capsys.readouterr().err
         assert "AAPL" in err          # names what is in flight, not just a count
         assert "--force" in err       # and how to override
+    finally:
+        sock.close()
+
+
+def test_refuses_on_a_firing_position_without_force(root, capsys, monkeypatch):
+    """The worse moment than "armed": an exit order is in flight to the
+    broker right now. This is the hazard `stop()`'s own docstring names, and
+    `recover_interrupted` can only mark it `outcome_unknown` afterward, it
+    cannot undo a restart that already happened.
+
+    `d.stop` and `d.spawn` are patched to fail loudly for the same reason as
+    the armed-position gate test above: pid is `os.getpid()`, this pytest
+    process, and a regressed gate that reached the real `stop()` would send
+    it a real SIGTERM rather than raise an assertion. Proven the hard way
+    while writing this test: an earlier version without this patch measured
+    RC=143 and no output the moment the gate was (deliberately, temporarily)
+    broken to check that this test would catch it.
+    """
+    import os
+    sock, port = _listener()
+    try:
+        state = EdgeState(root)
+        _pidfile(state, pid=os.getpid(), port=port)
+        _supervised(state, [
+            {"position_id": "p1", "symbol": "AAPL", "quantity": 120,
+             "stop_price": 224.10, "state": "firing", "blocked": ""},
+        ])
+        import nakagai_edge.edge.daemon as d
+        monkeypatch.setattr(d, "stop", lambda edge, **kw: pytest.fail(
+            "the gate let a restart reach stop() on a live pid: this would "
+            "have sent a real SIGTERM to the pytest runner"))
+        monkeypatch.setattr(d, "spawn", lambda st, *, port: pytest.fail(
+            "the gate let a restart spawn past a firing position"))
+        assert main(["restart"]) != 0
+        err = capsys.readouterr().err
+        assert "AAPL" in err
+        assert "--force" in err
+        assert "exit in flight" in err   # labelled distinctly from a plain armed row
     finally:
         sock.close()
 
@@ -92,6 +147,7 @@ def test_force_restarts_past_an_armed_position(root, monkeypatch):
         monkeypatch.setattr(d, "port_listening", lambda p, host="127.0.0.1": True)
         assert main(["restart", "--force"]) == 0
         assert spawned == [port]
+        assert len(stopped) == 1 and stopped[0].pid == os.getpid()
     finally:
         sock.close()
 
@@ -130,7 +186,16 @@ def test_a_stop_that_never_frees_the_port_fails_loudly(root, monkeypatch):
 
 def test_a_daemon_that_never_comes_up_is_reported_not_claimed(root, monkeypatch, capsys):
     """The theater test. Printing success without checking the port is the
-    failure this asserts against."""
+    failure this asserts against.
+
+    `wait_until_serving` is patched directly rather than faking
+    `port_listening` False: faking `port_listening` would also blind
+    `find_running` to the real listener this test binds below, so it would
+    read "nothing running" and exercise the cold-start branch on the literal
+    default port instead of the restart branch this test is named for, and it
+    would run `wait_until_serving`'s real 20s default timeout for real, since
+    nothing would ever free a port that was never actually held.
+    """
     import os
     sock, port = _listener()
     try:
@@ -139,9 +204,26 @@ def test_a_daemon_that_never_comes_up_is_reported_not_claimed(root, monkeypatch,
         import nakagai_edge.edge.daemon as d
         monkeypatch.setattr(d, "stop", lambda edge, **kw: True)
         monkeypatch.setattr(d, "spawn", lambda st, *, port: 4242)
-        monkeypatch.setattr(d, "port_listening", lambda p, host="127.0.0.1": False)
+        monkeypatch.setattr(d, "wait_until_serving", lambda p, **kw: False)
         assert main(["restart"]) != 0
         assert "edge.log" in capsys.readouterr().err   # points at where to look
+    finally:
+        sock.close()
+
+
+def test_a_spawn_that_cannot_launch_is_reported_not_raised(root, monkeypatch, capsys):
+    """spawn() returning -1 (Popen itself failed) must be reported, not left
+    to surface as a bare traceback after the old daemon is already stopped."""
+    import os
+    sock, port = _listener()
+    try:
+        state = EdgeState(root)
+        _pidfile(state, pid=os.getpid(), port=port)
+        import nakagai_edge.edge.daemon as d
+        monkeypatch.setattr(d, "stop", lambda edge, **kw: True)
+        monkeypatch.setattr(d, "spawn", lambda st, *, port: -1)
+        assert main(["restart"]) != 0
+        assert "edge.log" in capsys.readouterr().err
     finally:
         sock.close()
 
@@ -157,6 +239,12 @@ def test_starts_one_when_nothing_is_running(root, monkeypatch):
     directions instead of faking "the port always answers", which would hide
     the real daemon behind a blanket True and make this pass for the wrong
     reason.
+
+    `--port 8330` is passed explicitly rather than left to the CLI default:
+    the restart subparser's default IS `daemon.DEFAULT_PORT` (read at
+    argparse-build time), so leaving it implicit here would pick up this
+    test's own DEFAULT_PORT patch instead of proving the real, unpatched
+    default a user gets by typing nothing at all.
     """
     dead_port = 1
     spawned = []
@@ -165,5 +253,5 @@ def test_starts_one_when_nothing_is_running(root, monkeypatch):
     monkeypatch.setattr(d, "spawn", lambda st, *, port: spawned.append(port) or 4242)
     monkeypatch.setattr(d, "port_listening",
                         lambda p, host="127.0.0.1": p != dead_port)
-    assert main(["restart"]) == 0
+    assert main(["restart", "--port", "8330"]) == 0
     assert spawned == [8330]
