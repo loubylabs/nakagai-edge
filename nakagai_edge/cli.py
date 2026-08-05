@@ -363,17 +363,50 @@ def _cmd_setup(args) -> int:
     return 0
 
 
+def _version_key(version: str) -> tuple:
+    from nakagai_edge.edge.freshness import _key
+    return _key(version)
+
+
+def _behind(current: str, other: str) -> bool:
+    return _version_key(other) > _version_key(current)
+
+
 def _cmd_status(args) -> int:
     import json as _json
+    import sys as _sys
 
+    from nakagai_edge.edge.daemon import find_running
+    from nakagai_edge.edge.freshness import newer_release
+    from nakagai_edge.edge.install_shape import detect
     from nakagai_edge.edge.state import EdgeState, default_root
-    from nakagai_edge.edge.sync import meta, policy_fresh, schema_error
+    from nakagai_edge.edge.sync import (
+        meta, policy_fresh, schema_error, server_edge_version,
+    )
     state = EdgeState(default_root())
     agent = state.agent()
+    running = package_version()
+    server = server_edge_version(state)
+    latest = newer_release(running) or ""
+    install, upgrade = detect(_sys.prefix, _sys.argv[0])
+    edge, _reason = find_running(state)
     out = {"paired": agent is not None,
            "agent_id": (agent or {}).get("agent_id", ""),
            "platform_url": (agent or {}).get("platform_url", ""),
            "policy_fresh": policy_fresh(state),
+           "version": running,
+           # Empty rather than null when unknown, and the two unknowns differ:
+           # no bundle cached yet for the server, no network for the index.
+           # Neither is worth a distinct type at the top level.
+           "server_version": server,
+           "latest_version": latest,
+           "install": install,
+           "upgrade": upgrade,
+           "daemon": ({"running": True, "pid": edge.pid, "port": edge.port,
+                       "started_at": edge.started_at, "version": edge.version,
+                       "log": str(state.log_path)}
+                      if edge else {"running": False,
+                                    "log": str(state.log_path)}),
            "meta": meta(state), "root": str(state.root)}
     # Promoted beside policy_fresh, and only when there is one. A refused
     # bundle otherwise shows up here as nothing but `policy_fresh: false`,
@@ -389,6 +422,17 @@ def _cmd_status(args) -> int:
     if (refused := schema_error(state)):
         out["schema_error"] = refused
     print(_json.dumps(out, indent=2))
+
+    # The advisory goes to stderr, so `nakagai-edge status | jq` still parses
+    # and a human at a terminal still sees the line. Printed only when there is
+    # something to do: an advisory on every run is a nag, and a nag is ignored.
+    behind = [v for v in (server, latest) if v and _behind(running, v)]
+    if behind:
+        newest = max(behind, key=_version_key)
+        print(f"\nnakagai-edge {newest} is available (you are on {running})\n"
+              f"  install: {install}\n"
+              f"  upgrade: {upgrade}\n"
+              f"  then:    nakagai-edge restart", file=_sys.stderr)
     return 0
 
 
