@@ -21,6 +21,14 @@ from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.sync import BUNDLE_SCHEMA, apply_bundle, sync_once
 from tests.fixtures.alien_registry import ALIEN_CONNECTOR, ROBINHOOD_CONNECTOR
 
+
+class _NoFills:
+    """The fill sweep, stubbed out. These tests are about the other loops, and a
+    real sweep would dial the hub for order history no fixture here declares."""
+
+    async def sweep(self):
+        return []
+
 pytestmark = pytest.mark.anyio
 
 
@@ -700,7 +708,7 @@ async def test_the_syncer_ships_a_live_connectors_schemas_upstream(
     state, client, hub = _live_connector(tmp_path, handler)
     audit = EdgeAudit(state)
     tasks = await runtime._loops(state, hub, client, audit, _Reporter(),
-                                 Brake(state, hub, client, audit))
+                                 Brake(state, hub, client, audit), _NoFills())
     for _ in range(200):
         if seen:
             break
@@ -764,7 +772,7 @@ async def test_the_syncer_survives_a_report_that_raises(tmp_path, monkeypatch, c
 
     caplog.set_level(logging.WARNING, logger="nakagai.edge")
     tasks = await runtime._loops(state, hub, client, audit, _Reporter(),
-                                 Brake(state, hub, client, audit))
+                                 Brake(state, hub, client, audit), _NoFills())
     for _ in range(200):
         if calls["report"] >= 2:
             break

@@ -19,6 +19,14 @@ from nakagai_edge.edge.runtime import _loops, create_edge_mcp
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.sync import BUNDLE_SCHEMA, apply_bundle
 
+
+class _NoFills:
+    """The fill sweep, stubbed out. These tests are about the other loops, and a
+    real sweep would dial the hub for order history no fixture here declares."""
+
+    async def sweep(self):
+        return []
+
 pytestmark = pytest.mark.anyio
 
 
@@ -84,7 +92,7 @@ async def test_the_timer_loop_pushes_on_its_own_cadence(tmp_path, monkeypatch):
     client = _client()
     audit = EdgeAudit(state)
     tasks = await _loops(state, hub, client, audit, reporter,
-                         Brake(state, hub, client, audit))
+                         Brake(state, hub, client, audit), _NoFills())
     await _run_briefly_then_cancel(tasks, lambda: reporter.pushes >= 2)
     assert reporter.pushes >= 2
 
@@ -152,7 +160,7 @@ async def test_a_resolved_intent_triggers_a_courtesy_push(tmp_path, monkeypatch)
     client = _client()
     audit = EdgeAudit(state)
     tasks = await _loops(state, hub, client, audit, reporter,
-                         Brake(state, hub, client, audit))
+                         Brake(state, hub, client, audit), _NoFills())
 
     # Wait for the executor's one resolution to land, then keep everything
     # running a while longer: if the executor's `if await poll_once(...)`

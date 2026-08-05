@@ -17,6 +17,10 @@ PLACE_ORDER = Capability(
     tool="place_equity_order",
     args={"symbol": "symbol", "side": "side", "quantity": "quantity",
           "price": "limit_price", "stop": "stop_price"},
+    # What the broker says BACK. `fill_price` is what the entry price is read
+    # from; it used to be guessed from a list of candidate key names compiled
+    # into executor.py, which is the leak the capability layer exists to stop.
+    fields={"order_id": ["order_id"], "fill_price": ["average_price"]},
     values={"side": {"buy": ["buy", "buy_to_open", "buy_to_cover"],
                      "sell": ["sell", "sell_to_open", "sell_short"]}},
     market_args={"order_type": "market"})
@@ -125,6 +129,20 @@ def test_a_reported_fill_price_beats_the_order_price(tmp_path):
     supervise(FakeHub(), state, "ap_1", _intent(), _record({"grant_id": "wr_1"}),
               {"data": {"order_id": "42", "average_price": "47.61"}})
     assert load(state)["ap_1"]["entry_price"] == 47.61
+
+
+def test_an_undeclared_fill_price_falls_back_to_the_order_price(tmp_path):
+    # The connector names no path to a fill price, and the broker's payload uses
+    # a key the edge used to guess at. Nothing may read it: a price the map
+    # never pointed at is a price no connector author chose. This is the test
+    # that fails if the guess-list in executor.py ever comes back.
+    state = EdgeState(tmp_path)
+    hub = FakeHub()
+    hub.spec("demo").capabilities["place_order"] = PLACE_ORDER.model_copy(
+        update={"fields": {}})
+    supervise(hub, state, "ap_1", _intent(), _record({"grant_id": "wr_1"}),
+              {"data": {"order_id": "42", "average_price": "47.61"}})
+    assert load(state)["ap_1"]["entry_price"] == 47.55
 
 
 def test_a_zero_fill_price_falls_back_to_the_order_price(tmp_path):

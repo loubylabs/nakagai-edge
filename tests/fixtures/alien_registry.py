@@ -122,14 +122,21 @@ ROBINHOOD_CONNECTOR = {
             "values": {"side": {"buy": ["buy", "buy_to_open", "buy_to_cover"],
                                 "sell": ["sell", "sell_to_open", "sell_short"]}},
             "market_args": {"type": "market", "time_in_force": "gfd"}},
+        # The broker that declares everything the fill journal can use: both
+        # enrichment fields, and a word for `filled` so the sweep can ask for
+        # filled orders instead of taking the default. The alien fixture above
+        # deliberately declares neither, so both halves stay exercised.
         "list_orders": {
             "tool": "get_orders",
             "args": {"account": "account_number", "status": "status"},
             "items": ["data.orders"],
             "fields": {"order_id": ["id"], "symbol": ["symbol"], "side": ["side"],
-                       "quantity": ["quantity"], "status": ["state"]},
+                       "quantity": ["quantity"], "status": ["state"],
+                       "fill_price": ["average_price"],
+                       "filled_at": ["last_transaction_at"]},
             "values": {"side": {"buy": ["buy", "buy_to_open", "buy_to_cover"],
-                                "sell": ["sell", "sell_to_open", "sell_short"]}}},
+                                "sell": ["sell", "sell_to_open", "sell_short"]},
+                       "status": {"filled": ["filled"]}}},
         "cancel_order": {
             "tool": "cancel_order",
             "args": {"order_id": "order_id", "account": "account_number"}},

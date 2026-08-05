@@ -384,6 +384,44 @@ entirely; the Portfolio page still shows them unguarded, because a position
 with no record cannot be marked guarded. The Portfolio page is the surface that
 sees both, so it is the one to check before assuming a stop is being watched.
 
+## The fill journal
+
+Positions you open by hand, in your broker's own app, already reach the
+platform: the portfolio sweep reports what the broker holds, not what the agent
+did, so they are on the Portfolio page like any other. What they lack is
+everything downstream of the supervision ledger. There is no approval behind
+them, so there is no ledger record, no stop, no exit warrant, and nothing that
+will exit them. They are absent from `get_open_risk` and contribute nothing to
+portfolio heat, exactly like an agent order placed without a stop.
+
+The fill journal is what tells the platform they were yours. Every
+`FILLS_INTERVAL_S` (300s) the edge reads each broker's order history through
+its `list_orders` capability, records what it has not seen before, and ships it
+to the platform. A connector that declares no `list_orders` has no history to
+read and is skipped in silence.
+
+Three properties are deliberate:
+
+- **First sight anchors; it does not backfill.** The first sweep of an account
+  records the order ids it finds and ships **nothing**. `list_orders` has no
+  `since` argument, so without this the first sweep would upload however much
+  of your personal trading history the broker chose to return. The journal
+  means "since you connected", and the anchor is never evicted.
+- **Attribution joins on the broker's own order id.** When the edge places an
+  order it reads the broker's id for it off the `place_order` map and reports
+  it, so the platform can match a fill to the approval that caused it. A fill
+  no approval claims is one you placed. "Not in the supervision ledger" would
+  not do: a stopless agent order is not in it either.
+- **Nothing labels a position.** A broker's position rows carry no order id, so
+  a holding you bought part of by hand and part through the agent has no clean
+  origin. The Portfolio page therefore says nothing about origin at all, rather
+  than splitting a row by arithmetic that drifts wrong after the first transfer
+  or corporate action. The journal is the record.
+
+The journal is local-first, like the audit trail and for the same reason: it is
+written here before the platform is told, so an outage costs latency and never
+a record.
+
 ## Failure modes
 
 - **Platform unreachable.** The edge caches the bootstrap bundle with a policy

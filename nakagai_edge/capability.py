@@ -30,11 +30,16 @@ COERCIONS = {
     "symbol": UPPER_STR,
     "side": SIDE,
     "quantity": FLOAT, "price": FLOAT, "stop": FLOAT,
-    "bid": FLOAT, "ask": FLOAT, "avg_price": FLOAT,
+    "bid": FLOAT, "ask": FLOAT, "avg_price": FLOAT, "fill_price": FLOAT,
 }
 # Everything absent from COERCIONS is VERBATIM: equity, cash, buying_power,
-# market_value, currency, nickname, type, status, order_id, account. The edge
-# relays those figures and never does arithmetic on them.
+# market_value, currency, nickname, type, status, order_id, filled_at, account.
+# The edge relays those figures and never does arithmetic on them.
+#
+# `filled_at` is verbatim for the same reason `status` is. Brokers spell
+# timestamps a dozen ways, and a moment this module parsed into a float would
+# be a moment it had done arithmetic on. The platform reads it; the edge only
+# carries it.
 
 
 class CapabilityError(Exception):
@@ -77,11 +82,17 @@ CAPABILITIES: dict[str, CapabilitySpec] = {
         is_list=True, is_write=False),
     "list_orders": CapabilitySpec(
         args=("account", "status"), required=("order_id", "symbol"),
-        optional=("side", "quantity", "status"),
+        optional=("side", "quantity", "status", "fill_price", "filled_at"),
         is_list=True, is_write=False),
+    # `optional` here is the RESULT of placing an order, not its arguments:
+    # `args` above is what goes out, these are what can be read back. The fill
+    # journal joins on `order_id`, and `fill_price` is what retired the
+    # guess-list of broker price keys that used to live in executor.py. A
+    # connector declaring neither still places orders exactly as before.
     "place_order": CapabilitySpec(
         args=ORDER_FIELDS + ("account",),
-        required=(), optional=(), is_list=False, is_write=True),
+        required=(), optional=("order_id", "fill_price"),
+        is_list=False, is_write=True),
     "cancel_order": CapabilitySpec(
         args=("order_id", "account"), required=(), optional=(),
         is_list=False, is_write=True),

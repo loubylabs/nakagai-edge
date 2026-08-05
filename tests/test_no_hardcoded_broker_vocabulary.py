@@ -47,6 +47,15 @@ FORBIDDEN = {
     "average_buy_price": set(),
     "last_trade_price": set(),
     "total_value": set(),
+    # The guess-list executor.py used to try in order for an entry's fill
+    # price, beside a hand-rolled peel of Robinhood's `data` envelope. It
+    # predated the capability layer and survived it, because the layer landed
+    # in the read paths and nobody re-read the write path. `fill_price` is a
+    # canonical field now and the map says where it lives, so none of these
+    # three has a canonical twin and all three are forbidden everywhere.
+    "average_price": set(),
+    "filled_price": set(),
+    "execution_price": set(),
     "buying_power": {"capability.py", "edge/runtime.py"},
     "account_number": {"config.py", "edge/portfolio.py", "edge/supervision.py"},
 }

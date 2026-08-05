@@ -1,10 +1,17 @@
 """Local-first audit: every call, denial, execution, and error is journaled on
 the edge before it ships. Offline decisions reach the platform on reconnect;
-secrets never do; scrub() runs on the way into the journal."""
+secrets never do; scrub() runs on the way into the journal.
 
-import json
+The append/watermark/ship mechanics live in edge/journal.py, shared with the
+fill journal. What stays here is what is genuinely audit's own: scrubbing, the
+event shape, and the decision that an unreadable line ships as a visible
+`corrupt` marker rather than vanishing. A line lost out of the record of what
+the agent did is exactly the thing an audit trail must not swallow.
+"""
+
 import time
 
+from nakagai_edge.edge.journal import Journal
 from nakagai_edge.edge.state import EdgeState
 
 SECRET_MARKERS = ("token", "authorization", "secret", "password")
@@ -13,7 +20,7 @@ SECRET_MARKERS = ("token", "authorization", "secret", "password")
 class EdgeAudit:
     def __init__(self, state: EdgeState) -> None:
         self.state = state
-        self._watermark = state.audit_path.with_suffix(".shipped")
+        self._journal = Journal(state.audit_path)
 
     def scrub(self, detail: dict) -> dict:
         out = {}
@@ -32,30 +39,21 @@ class EdgeAudit:
 
     def record(self, kind: str, connector_id: str = "", tool: str = "",
                detail: dict | None = None) -> None:
-        event = {"ts": time.time(), "kind": kind, "connector_id": connector_id,
-                 "tool": tool, "detail": self.scrub(detail or {})}
-        self.state.audit_path.parent.mkdir(parents=True, exist_ok=True)
-        with self.state.audit_path.open("a") as f:
-            f.write(json.dumps(event) + "\n")
-
-    def _shipped(self) -> int:
-        try:
-            return int(self._watermark.read_text())
-        except (OSError, ValueError):
-            return 0
+        self._journal.append({"ts": time.time(), "kind": kind,
+                              "connector_id": connector_id, "tool": tool,
+                              "detail": self.scrub(detail or {})})
 
     def pending(self, limit: int = 200) -> list[dict]:
-        if not self.state.audit_path.exists():
-            return []
-        lines = self.state.audit_path.read_text().splitlines()
-        out = []
-        for line in lines[self._shipped():self._shipped() + limit]:
-            try:
-                out.append(json.loads(line))
-            except json.JSONDecodeError:
-                out.append({"ts": time.time(), "kind": "corrupt", "detail": {}})
-        return out
+        """The next unshipped events, an unreadable line standing in as a
+        `corrupt` marker rather than being dropped.
+
+        The returned count still matches the lines consumed, which is what lets
+        the caller `mark_shipped(len(batch))` without stranding the bad line and
+        re-reading it forever.
+        """
+        return [event if event is not None
+                else {"ts": time.time(), "kind": "corrupt", "detail": {}}
+                for event in self._journal.pending(limit)]
 
     def mark_shipped(self, n: int) -> None:
-        self._watermark.parent.mkdir(parents=True, exist_ok=True)
-        self._watermark.write_text(str(self._shipped() + n))
+        self._journal.mark_shipped(n)
