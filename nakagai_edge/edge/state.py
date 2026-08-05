@@ -8,6 +8,8 @@
     cache/supervised.json    positions the brake watches, and their warrants
     cache/brake-off.json     local disarm; its presence never needs the network
     results/audit.jsonl local audit journal, shipped in batches
+    edge.pid            the serving daemon: pid, port, start, version
+    edge.log            that daemon's output, when `restart` started it
 """
 
 import json
@@ -52,6 +54,14 @@ class EdgeState:
     @property
     def audit_path(self) -> Path:
         return self.root / "results" / "audit.jsonl"
+
+    @property
+    def pid_path(self) -> Path:
+        return self.root / "edge.pid"
+
+    @property
+    def log_path(self) -> Path:
+        return self.root / "edge.log"
 
     def _write_private(self, path: Path, doc: dict) -> None:
         # The root itself holds secrets (agent.json, broker tokens), so keep it

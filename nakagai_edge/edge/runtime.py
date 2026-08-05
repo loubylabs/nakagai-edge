@@ -986,6 +986,11 @@ def run(root, port: int = 8330) -> None:
     client = PlatformClient(agent["platform_url"], agent["token"])
     sync_once(state, client)                 # best-effort warm start
 
+    # So `restart` has something it can prove. Best effort by design: a daemon
+    # that cannot write this still serves.
+    from nakagai_edge.edge.daemon import clear_pidfile, write_pidfile
+    write_pidfile(state, port=port)
+
     # Advisory only. The hard gate is BUNDLE_SCHEMA in sync.py, and a daemon
     # holding broker credentials never updates itself: it says so, and the
     # owner decides. Every uninteresting case returns None, so this can slow
@@ -1024,4 +1029,7 @@ def run(root, port: int = 8330) -> None:
                 t.cancel()
             await hub.aclose()
 
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    finally:
+        clear_pidfile(state)
