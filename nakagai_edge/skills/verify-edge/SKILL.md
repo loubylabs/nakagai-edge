@@ -23,6 +23,12 @@ curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8330/mcp/
 `307` = up (that redirect is the healthy answer for a bare GET). Connection
 refused = not running: `connect-edge` step 3.
 
+`uvx nakagai-edge status` answers the same rung from the edge's own record:
+`daemon.running` with the pid, port, uptime and log path, and `daemon.note`
+when something holds the port that this edge cannot claim. Both are worth
+having. The curl proves the port answers; the record proves which process is
+supposed to be on it.
+
 ## Rung 2: pairing and policy
 
 ```bash
@@ -31,8 +37,17 @@ uvx nakagai-edge status
 
 Expect `paired: true`, the intended `platform_url`, and `policy_fresh:
 true`. Stale policy with the platform reachable means the sync loop is not
-running (restart `run`); stale with the platform unreachable is the
-fail-closed design doing its job.
+running, so bounce the daemon with `uvx nakagai-edge@latest restart`; stale
+with the platform unreachable is the fail-closed design doing its job.
+
+The same output carries the version picture: `version` against
+`server_version` and `latest_version`. An edge behind either is amber, not
+red, and the fix is the `upgrade` line printed beside `install`. Report
+`latest_version: null` as NOT VERIFIED rather than green: it means the index
+did not answer, never that this edge is current.
+
+Never run `restart` on your own initiative mid-task. It severs the edge MCP
+connection you are speaking through. Hand the command to the owner.
 
 ## Rung 3: connectors
 

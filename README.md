@@ -44,8 +44,28 @@ uvx nakagai-edge setup <code> --platform https://api.nakag.ai
 `setup` is idempotent: re-running it on a healthy edge just starts the server,
 and it is also the repair path when something has drifted. The individual steps
 remain available: `nakagai-edge pair`, then `nakagai-edge sync`, then
-`nakagai-edge login <id>`, then `nakagai-edge run`. `nakagai-edge status`
-reports pairing and policy freshness without doing anything.
+`nakagai-edge login <id>`, then `nakagai-edge run`.
+
+Two commands answer for the daemon once it is up:
+
+```bash
+nakagai-edge status     # pairing, policy freshness, what is running, what is available
+nakagai-edge restart     # stop it and start a fresh one, detached, with a log
+```
+
+`status` does nothing but report. Its JSON goes to stdout, so a pipe into `jq`
+keeps working, and the upgrade advice goes to stderr when there is any.
+
+`restart` stops the daemon it can prove is its own, then relaunches through the
+same install you invoked it from, detached, with output appended to
+`~/.nakagai/edge/edge.log`. It comes back on the port the old daemon served,
+takes no `--port`, and waits for the port to answer before reporting success.
+It refuses rather than guessing: while the brake is watching an open position
+(`--force` overrides), and when something is on the port that this edge cannot
+prove is its own, which is what a daemon started before the pidfile existed
+looks like. That first restart on an existing machine is still done by hand.
+The stop is SIGTERM and only SIGTERM; a process holding your broker credentials
+is not something a convenience command escalates on.
 
 ## Connect your agent
 
@@ -372,17 +392,21 @@ sees both, so it is the one to check before assuming a stop is being watched.
   construction the whole time: a write needs a live round trip to the
   platform's approval queue. An edge that started while the platform was down
   serves its own 16 tools and none of the promoted ones, since the tool list is
-  built once at startup; restart it once the platform answers.
+  built once at startup; run `nakagai-edge restart` once the platform answers.
 - **Revocation.** Revoking an agent takes effect on the agent's next platform
   call: the bearer token 401s. Writes were already gated on a live platform
   round trip, so revocation closes them structurally.
 
-- **A newer release exists.** On start, the edge checks the package index and
-  logs a line naming the newer version. That is the whole behavior: it never
-  updates itself, and it never refuses to start. This daemon is the sole holder
-  of your broker credentials, so replacing it is your decision, not a web
-  index's. The check is bounded and advisory, and no network means no line.
-  Upgrade when you choose to with `uvx nakagai-edge@latest run`.
+- **A newer release exists.** `nakagai-edge status` names it, alongside the
+  version the platform ships, and prints the upgrade line for the install shape
+  it detected. That is the whole behavior: the edge never updates itself, and
+  it never refuses to start. This daemon is the sole holder of your broker
+  credentials, so replacing it is your decision, not a web index's. No network
+  means `latest_version: null`, which is why that key is null rather than empty
+  when the index says nothing: "you are current" and "nobody answered" must not
+  look the same. On the quickstart's uvx install the upgrade is one command,
+  `uvx nakagai-edge@latest restart`, which stops the old daemon and relaunches
+  from latest.
 
 ## Development
 

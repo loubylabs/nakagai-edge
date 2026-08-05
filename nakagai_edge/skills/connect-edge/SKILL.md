@@ -27,6 +27,13 @@ uvx nakagai-edge status
 - Not paired, or paired to the wrong platform: step 2.
 - `policy_fresh: false` just means the edge has not synced recently; it does
   not require re-pairing.
+- `daemon.running` answers whether a daemon is up at all, with its pid, port,
+  uptime and log path. When it is false, `daemon.note` carries the reason if
+  something is nonetheless holding the port; empty means nothing is listening.
+- `version`, `server_version` (what the platform ships) and `latest_version`
+  (what is on PyPI, and `null`, only ever `null`, when the index did not
+  answer) are the version picture. `upgrade` is the line for the install shape
+  detected here, printed beside `install` so a wrong guess is visible.
 
 State lives in `~/.nakagai/edge/`: `agent.json` (platform URL + agent token),
 `config/connectors.yaml` (synced registry), `cache/meta.json` (bundle etag +
@@ -57,6 +64,34 @@ uvx nakagai-edge run          # long-running; background it
 executor, audit-ship, and portfolio loops. Point the agent's MCP client at
 that one URL; it carries platform tools, broker tools, and approval polling.
 
+To bounce an edge that is already up, do not stop and `run` again by hand:
+
+```bash
+uvx nakagai-edge@latest restart
+```
+
+`restart` stops the daemon it can prove is its own, relaunches it detached
+with output appended to `~/.nakagai/edge/edge.log`, and waits for the port to
+answer before reporting success. It comes back on whatever port the old daemon
+served and takes no `--port`. Run under `uvx nakagai-edge@latest` it is also
+the upgrade: the relaunch inherits the invocation, so latest is what ends up
+serving.
+
+It refuses rather than guessing, and each refusal names its own remedy:
+
+- The brake is watching an open position. `--force` overrides; a restart takes
+  the brake off the tape for a few seconds, so during a session mean it.
+- Something is on the port that this edge cannot prove is its own. That is what
+  a daemon started before the pidfile existed looks like, so on a long-running
+  machine the first restart is still done by hand.
+- The old process is still there ten seconds after SIGTERM. It stops at
+  SIGTERM and never escalates: the process holds broker credentials, so that
+  call belongs to a human.
+
+Never restart on an agent's own initiative while it is mid-task. A restart
+severs the edge MCP connection the agent is speaking through. Raise the notice
+and hand over the command instead.
+
 Registry rewrites are etag-gated: `sync` rewrites `config/connectors.yaml`
 only when the platform bundle changed. So a registry that looks stale after an
 edge upgrade has simply never been rewritten. Drop the cached etag to force it:
@@ -83,7 +118,7 @@ the proof.
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| `nakagai-mcp` fails with `401 Unauthorized for url .../mcp/` while the same token works on `/api/agent/*` | The connector URL lacks the trailing slash. The platform mounts at `/mcp/` and 307-redirects the bare path; behind a TLS-terminating proxy (Fly) the Location header says `http://`, and httpx drops the Authorization header on a redirect to an insecure origin. | The synced registry must carry `<platform>/mcp/` (trailing slash) so no redirect happens. Current releases write it that way, so upgrade the edge, force a registry rewrite (step 3) and restart `run`. Confirm the fix in `~/.nakagai/edge/config/connectors.yaml`: the `nakagai-mcp` url ends in a slash. |
+| `nakagai-mcp` fails with `401 Unauthorized for url .../mcp/` while the same token works on `/api/agent/*` | The connector URL lacks the trailing slash. The platform mounts at `/mcp/` and 307-redirects the bare path; behind a TLS-terminating proxy (Fly) the Location header says `http://`, and httpx drops the Authorization header on a redirect to an insecure origin. | The synced registry must carry `<platform>/mcp/` (trailing slash) so no redirect happens. Current releases write it that way, so upgrade the edge, force a registry rewrite (step 3) and `uvx nakagai-edge@latest restart`. Confirm the fix in `~/.nakagai/edge/config/connectors.yaml`: the `nakagai-mcp` url ends in a slash. |
 | Registry edits never appear in `config/connectors.yaml` | Etag-gated sync skipped the rewrite | `rm ~/.nakagai/edge/cache/meta.json` then `sync` |
 | Every connector call refused with "policy stale" | Edge cannot reach the platform and the policy TTL (15 min) expired | Restore connectivity, `sync`; this is fail-closed by design |
 | `edge is not paired` from `run` | No `agent.json` | Step 2 |
