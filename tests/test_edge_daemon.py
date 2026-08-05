@@ -6,6 +6,7 @@ something that was never ours.
 """
 
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -14,7 +15,7 @@ import pytest
 
 from nakagai_edge.edge import daemon
 from nakagai_edge.edge.daemon import (
-    clear_pidfile, find_running, port_listening, read_pidfile, write_pidfile,
+    find_running, port_listening, read_pidfile, release_pidfile, write_pidfile,
 )
 from nakagai_edge.edge.state import EdgeState
 
@@ -27,7 +28,12 @@ def state(tmp_path):
 def _listener():
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
-    s.listen(1)
+    # A generous backlog because nothing here ever accepts. `port_listening`
+    # completes a handshake and closes its side on every probe, and each of
+    # those sits in the accept queue unclaimed; on a listen(1) socket the
+    # second probe finds the queue full and times out, which reads back as
+    # "the port freed" and is a fake negative in every test below.
+    s.listen(64)
     return s, s.getsockname()[1]
 
 
@@ -52,11 +58,58 @@ def test_unreadable_pidfile_reads_as_none(state):
     assert read_pidfile(state) is None
 
 
-def test_clear_is_idempotent(state):
-    clear_pidfile(state)          # nothing there, must not raise
-    write_pidfile(state, port=8330)
-    clear_pidfile(state)
+def test_releasing_a_record_that_is_not_there_does_not_raise(state):
+    release_pidfile(state)
     assert read_pidfile(state) is None
+
+
+def test_release_gives_up_our_own_claim(state, monkeypatch):
+    """A released record can never be claimed again. pid 0 is not a live pid,
+    so nothing can be signalled on the strength of one.
+
+    DEFAULT_PORT is pinned to a dead port: a record that went missing rather
+    than being released would send find_running's fallback at the real 8330,
+    where this machine runs a live edge holding a broker session.
+    """
+    monkeypatch.setattr(daemon, "DEFAULT_PORT", 1)
+    sock, port = _listener()
+    try:
+        write_pidfile(state, port=port)
+        assert find_running(state)[0] is not None      # ours while we hold it
+        release_pidfile(state)
+        assert (read_pidfile(state) or {}).get("pid") == 0
+        edge, reason = find_running(state)
+        assert edge is None
+        assert reason                                  # something IS on that port
+        assert "pid 0" not in reason                   # and it does not say "pid 0"
+    finally:
+        sock.close()
+
+
+def test_release_leaves_a_successors_record_untouched(state):
+    """The race this exists for, and the one an unconditional unlink loses.
+
+    `run()` releases from a `finally` that fires after the server has already
+    let go of the port, so `stop()` has returned and a `restart` can have
+    spawned a replacement that has already written its own pidfile. Deleting
+    that leaves a live daemon with no record: `status` reports
+    `running: false` and the next `restart` refuses with "stop it by hand",
+    which is the exact state this whole feature exists to remove.
+    """
+    state.pid_path.parent.mkdir(parents=True, exist_ok=True)
+    successor = {"pid": os.getpid() + 1, "port": 9000,
+                 "started_at": 5.0, "version": "0.2.2"}
+    state.pid_path.write_text(json.dumps(successor))
+    release_pidfile(state)
+    assert read_pidfile(state) == successor
+
+
+def test_the_port_outlives_the_daemon_that_served_it(state):
+    """An edge started on 9317 must come back on 9317, and the process that
+    knew is gone by the time anyone asks. The record is what remembers."""
+    write_pidfile(state, port=9317)
+    release_pidfile(state)
+    assert read_pidfile(state)["port"] == 9317
 
 
 def test_port_listening_is_true_only_while_something_listens():
@@ -203,31 +256,75 @@ def test_stop_never_escalates_past_sigterm():
         child.wait(timeout=2)
 
 
-def test_spawn_relaunches_through_argv0_into_the_log(state, monkeypatch):
-    """argv[0] carries the install shape (uvx, a project venv, ...), and the
-    child's stdout/stderr must land in state.log_path rather than a closed
-    terminal stream. subprocess.Popen is faked so no real process is
-    launched; only the call it would have made is inspected."""
-    calls = []
+class _FakeProc:
+    pid = 4242
 
-    class _FakeProc:
-        pid = 4242
+
+def _record_popen(monkeypatch) -> list:
+    """Fake Popen, so no real process is launched and only the call it would
+    have made is inspected."""
+    calls = []
 
     def _fake_popen(argv, **kwargs):
         calls.append((argv, kwargs))
         return _FakeProc()
 
     monkeypatch.setattr(subprocess, "Popen", _fake_popen)
+    return calls
+
+
+def test_spawn_relaunches_through_argv0_into_the_log(state, monkeypatch):
+    """argv[0] carries the install shape (uvx, a project venv, ...), and the
+    child's stdout/stderr must land in state.log_path rather than a closed
+    terminal stream."""
+    calls = _record_popen(monkeypatch)
     pid = daemon.spawn(state, port=9999)
     assert pid == 4242
     assert len(calls) == 1
     argv, kwargs = calls[0]
-    assert argv == [sys.argv[0], "run", "--port", "9999"]
+    assert argv == [os.path.abspath(sys.argv[0]), "run", "--port", "9999"]
     assert kwargs["start_new_session"] is True
     assert kwargs["stdin"] == subprocess.DEVNULL
     assert kwargs["stderr"] == subprocess.STDOUT
     assert kwargs["cwd"] == str(state.root)
     assert kwargs["stdout"].name == str(state.log_path)
+
+
+def test_a_relative_argv0_is_absolute_by_the_time_the_child_gets_it(
+        state, monkeypatch, tmp_path):
+    """`.venv/bin/nakagai-edge restart`, typed from a project directory.
+
+    Popen resolves a relative argv[0] against the CHILD's cwd, and spawn hands
+    the child `state.root`. Passed through unchanged, this stops the daemon
+    and then looks for the replacement under ~/.nakagai/edge, finds nothing,
+    and leaves the owner with no edge and an empty log to read about it. A
+    bare name on PATH never showed the bug, which is why it shipped.
+    """
+    calls = _record_popen(monkeypatch)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", [".venv/bin/nakagai-edge", "restart"])
+    assert daemon.spawn(state, port=9999) == 4242
+    argv0 = calls[0][0][0]
+    assert os.path.isabs(argv0)
+    assert argv0 == os.path.join(os.getcwd(), ".venv/bin/nakagai-edge")
+
+
+def test_a_bare_name_is_resolved_the_way_the_shell_resolved_it(
+        state, monkeypatch, tmp_path):
+    """The control for the case above: a name with no directory component has
+    to come back as the PATH entry it actually ran from, not as a bare name
+    joined onto the cwd, which would name a file that does not exist."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    exe = bin_dir / "nakagai-edge"
+    exe.write_text("#!/bin/sh\n")
+    exe.chmod(0o755)
+    calls = _record_popen(monkeypatch)
+    monkeypatch.setenv("PATH", str(bin_dir))
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["nakagai-edge", "restart"])
+    assert daemon.spawn(state, port=9999) == 4242
+    assert calls[0][0][0] == str(exe)
 
 
 def test_spawn_reports_a_launch_failure_instead_of_raising(state, monkeypatch):

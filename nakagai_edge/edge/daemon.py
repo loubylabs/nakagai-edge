@@ -12,10 +12,17 @@ reason means nothing is listening, so there is nothing to stop and a caller
 may simply start one. A non-empty reason means something IS listening and we
 cannot say what, which is the one case where a convenience command must get
 out of the way and let a human look.
+
+The record outlives the daemon. A stopping edge releases its claim by writing
+pid 0 rather than deleting the file, because the port it served is a fact the
+next `restart` needs and the process is not around to be asked. See
+`release_pidfile`, which is also where the race with its own successor is
+handled.
 """
 
 import json
 import os
+import shutil
 import signal
 import socket
 import subprocess
@@ -73,9 +80,32 @@ def read_pidfile(state: EdgeState) -> dict | None:
         return None
 
 
-def clear_pidfile(state: EdgeState) -> None:
+def release_pidfile(state: EdgeState) -> None:
+    """Give up THIS process's claim on the port, and keep the port itself.
+
+    Two hazards meet here, and both are races the obvious `unlink()` loses.
+
+    Only our own record may be released. `run()` calls this from a `finally`
+    that fires after the server has already let go of the port, so by the time
+    this line runs a `restart` can have spawned a replacement that has already
+    written its own pidfile. Unlinking unconditionally deletes the successor's
+    record and leaves a live daemon with no proof of itself, which is the exact
+    state `restart` refuses on and this whole feature exists to remove. A
+    record naming someone else is therefore left exactly as found.
+
+    And the port outlives the process that served it. An edge started on 9000
+    that stops must come back on 9000, so the record is rewritten with pid 0
+    rather than removed. Zero is never a live pid, so `find_running` can never
+    claim a released record and nothing can be signalled on the strength of
+    one; all that survives is the number `restart` needs.
+    """
+    doc = read_pidfile(state)
+    if doc is None or doc["pid"] != os.getpid():
+        return
     try:
-        state.pid_path.unlink()
+        state.pid_path.write_text(json.dumps(
+            {"pid": 0, "port": doc["port"], "started_at": 0.0,
+             "version": doc["version"]}))
     except OSError:
         pass
 
@@ -114,10 +144,15 @@ def find_running(state: EdgeState) -> tuple[RunningEdge | None, str]:
             return RunningEdge(pid=doc["pid"], port=port,
                                started_at=doc["started_at"],
                                version=doc["version"]), ""
+        # pid 0 is a released record: the daemon that wrote it stopped, and
+        # something else has taken the port since. Naming "pid 0" would read
+        # as a corrupt file rather than what it is.
+        stale = (f"the recorded pid {doc['pid']} is gone" if doc["pid"] > 0
+                 else "the record there names no live daemon")
         return None, (
-            f"something is serving 127.0.0.1:{port} but the recorded pid "
-            f"{doc['pid']} is gone, so this edge cannot prove that process is "
-            f"its own. Stop it by hand and run `nakagai-edge run` again.")
+            f"something is serving 127.0.0.1:{port} but {stale}, so this edge "
+            f"cannot prove that process is its own. Stop it by hand and run "
+            f"`nakagai-edge run` again.")
     # Nothing on the recorded port. Check the default before declaring the
     # coast clear, because the common case for a missing pidfile is a daemon
     # started before this file existed, and it is almost always on
@@ -181,6 +216,24 @@ def stop(edge: RunningEdge, *, timeout_s: float = 10.0) -> bool:
     return not port_listening(edge.port)
 
 
+def relaunch_argv0() -> str:
+    """The absolute path to the executable that invoked us.
+
+    Absolute is not cosmetic. `spawn` hands the child `cwd=state.root`, and
+    Popen resolves a relative argv[0] against the CHILD's cwd, not ours. So
+    `.venv/bin/nakagai-edge restart`, typed from a project directory, would
+    stop the daemon and then look for `~/.nakagai/edge/.venv/bin/nakagai-edge`,
+    which is nothing, leaving the owner with no edge and an empty log. A bare
+    name on PATH never showed the bug, because the shebang hands that case an
+    absolute argv[0] already.
+
+    `which` first, so a bare name resolves the way the shell resolved it, then
+    abspath, which covers both a relative path with a directory component and
+    a name `which` could not find at all.
+    """
+    return os.path.abspath(shutil.which(sys.argv[0]) or sys.argv[0])
+
+
 def spawn(state: EdgeState, *, port: int) -> int:
     """Relaunch through argv[0], so the install shape is inherited.
 
@@ -206,7 +259,7 @@ def spawn(state: EdgeState, *, port: int) -> int:
         return -1
     try:
         proc = subprocess.Popen(
-            [sys.argv[0], "run", "--port", str(port)],
+            [relaunch_argv0(), "run", "--port", str(port)],
             stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
             start_new_session=True, cwd=str(state.root))
     except OSError:

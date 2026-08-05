@@ -988,7 +988,7 @@ def run(root, port: int = 8330) -> None:
 
     # So `restart` has something it can prove. Best effort by design: a daemon
     # that cannot write this still serves.
-    from nakagai_edge.edge.daemon import clear_pidfile, write_pidfile
+    from nakagai_edge.edge.daemon import release_pidfile, write_pidfile
     write_pidfile(state, port=port)
 
     hub = build_hub(state, client)
@@ -1020,4 +1020,7 @@ def run(root, port: int = 8330) -> None:
     try:
         asyncio.run(main())
     finally:
-        clear_pidfile(state)
+        # Only this process's own claim, and never the port. By the time this
+        # runs the server has already freed the port, so a `restart` may
+        # already have a replacement serving and recorded.
+        release_pidfile(state)

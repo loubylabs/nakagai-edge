@@ -153,7 +153,14 @@ def _cmd_restart(args) -> int:
         print(f"refused: {reason}", file=sys.stderr)
         return 2
 
-    port = edge.port if edge else args.port
+    # The port is the daemon's, never a flag's: an edge started on 9000 comes
+    # back on 9000. It survives the daemon too, because a stopping edge
+    # releases its pidfile claim without dropping the record, so a restart
+    # after a Ctrl-C lands where the old one was rather than silently moving
+    # to the default. Choosing a different port is starting a different
+    # daemon, which is what `run --port` is for.
+    port = (edge.port if edge
+            else (d.read_pidfile(state) or {}).get("port") or d.DEFAULT_PORT)
     if edge is not None:
         armed = d.armed_positions(state)
         if armed and not args.force:
@@ -373,11 +380,8 @@ def _behind(current: str, other: str) -> bool:
 
 
 def _cmd_status(args) -> int:
-    import json as _json
-    import sys as _sys
-
     from nakagai_edge.edge.daemon import find_running
-    from nakagai_edge.edge.freshness import newer_release
+    from nakagai_edge.edge.freshness import latest_release
     from nakagai_edge.edge.install_shape import detect
     from nakagai_edge.edge.state import EdgeState, default_root
     from nakagai_edge.edge.sync import (
@@ -387,25 +391,34 @@ def _cmd_status(args) -> int:
     agent = state.agent()
     running = package_version()
     server = server_edge_version(state)
-    latest = newer_release(running) or ""
-    install, upgrade = detect(_sys.prefix, _sys.argv[0])
-    edge, _reason = find_running(state)
+    # The index's own answer, not a comparison against it. "the newest is what
+    # you are running" and "the index did not answer" are different facts, and
+    # collapsing both into "" reports an outage as good news.
+    latest = latest_release()
+    install, upgrade, then = detect(sys.prefix, sys.argv[0])
+    edge, reason = find_running(state)
     out = {"paired": agent is not None,
            "agent_id": (agent or {}).get("agent_id", ""),
            "platform_url": (agent or {}).get("platform_url", ""),
            "policy_fresh": policy_fresh(state),
            "version": running,
-           # Empty rather than null when unknown, and the two unknowns differ:
-           # no bundle cached yet for the server, no network for the index.
-           # Neither is worth a distinct type at the top level.
+           # Empty when no bundle has been cached yet, which reads the same as
+           # any other unsynced state.
            "server_version": server,
+           # A version string, equal to `version` when this edge is current.
+           # Null, and only null, when the index said nothing.
            "latest_version": latest,
            "install": install,
            "upgrade": upgrade,
+           # `note` carries find_running's reason verbatim, so `status` and
+           # `restart` tell one story. Without it status prints
+           # `running: false` while restart refuses saying something IS on the
+           # port, and the owner has two commands contradicting each other
+           # about the same machine. Empty means nothing is listening at all.
            "daemon": ({"running": True, "pid": edge.pid, "port": edge.port,
                        "started_at": edge.started_at, "version": edge.version,
                        "log": str(state.log_path)}
-                      if edge else {"running": False,
+                      if edge else {"running": False, "note": reason,
                                     "log": str(state.log_path)}),
            "meta": meta(state), "root": str(state.root)}
     # Promoted beside policy_fresh, and only when there is one. A refused
@@ -421,7 +434,7 @@ def _cmd_status(args) -> int:
     # traps whoever adds the next meta key. Two lines of noise beats that.
     if (refused := schema_error(state)):
         out["schema_error"] = refused
-    print(_json.dumps(out, indent=2))
+    print(json.dumps(out, indent=2))
 
     # The advisory goes to stderr, so `nakagai-edge status | jq` still parses
     # and a human at a terminal still sees the line. Printed only when there is
@@ -429,10 +442,15 @@ def _cmd_status(args) -> int:
     behind = [v for v in (server, latest) if v and _behind(running, v)]
     if behind:
         newest = max(behind, key=_version_key)
-        print(f"\nnakagai-edge {newest} is available (you are on {running})\n"
-              f"  install: {install}\n"
-              f"  upgrade: {upgrade}\n"
-              f"  then:    nakagai-edge restart", file=_sys.stderr)
+        lines = [f"\nnakagai-edge {newest} is available (you are on {running})",
+                 f"  install: {install}",
+                 f"  upgrade: {upgrade}"]
+        # Suppressed for the one shape whose upgrade command already
+        # relaunches. Printing `nakagai-edge restart` to a uvx user names a
+        # command they do not have on PATH.
+        if then:
+            lines.append(f"  then:    {then}")
+        print("\n".join(lines), file=sys.stderr)
     return 0
 
 
@@ -501,11 +519,8 @@ def _cmd_brake(args) -> int:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    """Split out from main() so a test can inspect a parsed default (what
-    port does `restart` pick with no flags at all?) without also invoking
-    whatever subcommand it defaulted to."""
-    from nakagai_edge.edge.daemon import DEFAULT_PORT
-
+    """Split out from main() so a test can parse an argument list and inspect
+    what it resolved to, without also invoking the subcommand it named."""
     p = argparse.ArgumentParser(
         prog="nakagai-edge",
         description="Run a Nakagai edge: it holds your broker credentials, and "
@@ -552,9 +567,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_restart = sub.add_parser(
         "restart", help="stop the running edge and start a fresh one, detached")
-    p_restart.add_argument("--port", type=int, default=DEFAULT_PORT,
-                           help="only used when nothing is running; a restart "
-                                "otherwise serves the port the old daemon did")
+    # No --port. A restart serves the port the pidfile names, so it comes back
+    # where it was; choosing a different port is starting a different daemon,
+    # and `run --port` already does that.
     p_restart.add_argument("--force", action="store_true",
                            help="restart even while the brake watches an armed "
                                 "position")
@@ -564,7 +579,9 @@ def _build_parser() -> argparse.ArgumentParser:
     p_login.add_argument("connector_id")
     p_login.set_defaults(func=_cmd_login)
 
-    p_status = sub.add_parser("status", help="pairing + policy freshness")
+    p_status = sub.add_parser(
+        "status", help="pairing, policy freshness, the daemon, and the "
+                       "version picture with the line that upgrades it")
     p_status.set_defaults(func=_cmd_status)
 
     p_listen = sub.add_parser(

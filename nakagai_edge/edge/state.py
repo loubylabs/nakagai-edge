@@ -8,7 +8,9 @@
     cache/supervised.json    positions the brake watches, and their warrants
     cache/brake-off.json     local disarm; its presence never needs the network
     results/audit.jsonl local audit journal, shipped in batches
-    edge.pid            the serving daemon: pid, port, start, version
+    edge.pid            the serving daemon: pid, port, start, version.
+                        pid 0 once it has stopped: the claim is released,
+                        the port stays, so a restart comes back where it was
     edge.log            that daemon's output, when `restart` started it
 """
 

@@ -228,51 +228,65 @@ def test_a_spawn_that_cannot_launch_is_reported_not_raised(root, monkeypatch, ca
         sock.close()
 
 
-def test_starts_one_when_nothing_is_running(root, monkeypatch):
-    """No pidfile, nothing bound: find_running should read this as "go ahead".
+def test_starts_one_on_the_default_port_when_there_is_no_record_at_all(
+        root, monkeypatch):
+    """A first-ever restart: no pidfile, nothing bound. find_running reads
+    that as "go ahead", and with nothing to inherit the port is DEFAULT_PORT.
 
-    This machine has a real edge listening on daemon.DEFAULT_PORT (8330) that
-    this suite must never touch, so DEFAULT_PORT is repointed at a dead value
-    this test owns, and port_listening is faked to answer False only for that
-    dead value: everything else, including the port `restart` actually spawns
-    onto, reads back as listening. That keeps the assertion honest in both
-    directions instead of faking "the port always answers", which would hide
-    the real daemon behind a blanket True and make this pass for the wrong
-    reason.
-
-    `--port 8330` is passed explicitly rather than left to the CLI default:
-    the restart subparser's default IS `daemon.DEFAULT_PORT` (read at
-    argparse-build time), so leaving it implicit here would silently pick up
-    this test's own DEFAULT_PORT patch instead of the literal this test
-    means to exercise. This proves only that a cold start spawns onto
-    whatever port `--port` names; it proves nothing about what the default
-    actually is when no flag is given at all, that is
-    `test_restart_port_default_is_daemon_default_port` below, which never
-    binds a real port to find out.
+    This machine has a real edge listening on the real DEFAULT_PORT (8330)
+    which this suite must never touch, so DEFAULT_PORT is repointed at a dead
+    value this test owns and `port_listening` answers False for everything:
+    nothing here may reach out to a port it did not create. `wait_until_serving`
+    is patched separately rather than leaning on `port_listening`, so the two
+    facts stay independent.
     """
     dead_port = 1
     spawned = []
     import nakagai_edge.edge.daemon as d
     monkeypatch.setattr(d, "DEFAULT_PORT", dead_port)
+    monkeypatch.setattr(d, "port_listening", lambda p, host="127.0.0.1": False)
     monkeypatch.setattr(d, "spawn", lambda st, *, port: spawned.append(port) or 4242)
-    monkeypatch.setattr(d, "port_listening",
-                        lambda p, host="127.0.0.1": p != dead_port)
-    assert main(["restart", "--port", "8330"]) == 0
-    assert spawned == [8330]
+    monkeypatch.setattr(d, "wait_until_serving", lambda p, **kw: True)
+    assert main(["restart"]) == 0
+    assert spawned == [dead_port]
 
 
-def test_restart_port_default_is_daemon_default_port():
-    """What a user actually gets typing `nakagai-edge restart` with no flags.
+def test_a_restart_after_a_clean_stop_comes_back_on_the_same_port(
+        root, monkeypatch):
+    """An edge started on a non-default port, stopped, then restarted.
 
-    Parses only, never executes: `_build_parser().parse_args` builds the
-    argparse tree and resolves defaults, but nothing here calls `args.func`,
-    so this asserts the default without binding a real port or touching
-    find_running at all. daemon.DEFAULT_PORT is read live rather than
-    hardcoded to 8330, so this fails the moment the two constants drift
-    apart instead of only when both happen to still say 8330.
+    The daemon that knew the port is gone by the time `restart` runs, so the
+    record is what remembers: `release_pidfile` gives up the claim and keeps
+    the port. Without that, this comes back on 8330 and the owner's agent,
+    pointed at the port they chose, finds nothing there. The pidfile is
+    written and released through the real functions rather than hand-rolled,
+    so this fails if either end of that contract moves.
+    """
+    spawned = []
+    import nakagai_edge.edge.daemon as d
+    state = EdgeState(root)
+    d.write_pidfile(state, port=9317)
+    d.release_pidfile(state)                 # what run()'s `finally` does
+    monkeypatch.setattr(d, "DEFAULT_PORT", 1)
+    monkeypatch.setattr(d, "port_listening", lambda p, host="127.0.0.1": False)
+    monkeypatch.setattr(d, "spawn", lambda st, *, port: spawned.append(port) or 4242)
+    monkeypatch.setattr(d, "wait_until_serving", lambda p, **kw: True)
+    # A released record names pid 0 and nothing is listening, so there is
+    # nothing to stop. Reaching stop() here would mean the code believed a
+    # record it must never believe.
+    monkeypatch.setattr(d, "stop", lambda edge, **kw: pytest.fail(
+        "tried to stop a daemon on the strength of a released record"))
+    assert main(["restart"]) == 0
+    assert spawned == [9317]                 # not 8330, and not the patched 1
+
+
+def test_restart_takes_no_port_flag():
+    """Choosing a port is starting a different daemon, and `run --port`
+    already does that. A `--port` here would silently move an edge that a
+    restart is supposed to leave exactly where it was.
+
+    Parses only: nothing calls `args.func`, so this touches no port at all.
     """
     from nakagai_edge.cli import _build_parser
-    from nakagai_edge.edge import daemon as d
-
-    args = _build_parser().parse_args(["restart"])
-    assert args.port == d.DEFAULT_PORT
+    with pytest.raises(SystemExit):
+        _build_parser().parse_args(["restart", "--port", "9000"])
