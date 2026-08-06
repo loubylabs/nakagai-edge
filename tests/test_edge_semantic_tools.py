@@ -77,7 +77,7 @@ PAYLOADS = {
         {"symbol": "AAPL", "quantity": "25", "average_buy_price": "187.20"}]}},
     "get_quotes": {"data": {"quotes": [{"symbol": "AAPL",
                                         "last_trade_price": "190.00"}]}},
-    "get_orders": {"data": {"orders": [{"id": "RH-ORD-9", "symbol": "AAPL",
+    "get_equity_orders": {"data": {"orders": [{"id": "RH-ORD-9", "symbol": "AAPL",
                                         "side": "buy", "quantity": "25",
                                         "state": "confirmed"}]}},
     "place_equity_order": {"id": "RH-ORD-9", "state": "confirmed"},
@@ -297,9 +297,13 @@ async def test_list_orders_reads_both_brokers_into_one_shape(tmp_path, connector
                             "symbol": "AAPL", "side": "buy", "quantity": 25.0,
                             "status": {ALIEN: "working",
                                        ROBINHOOD: "confirmed"}[connector]}]
+    # Both brokers happen to call the filter `state`, and they reach it from
+    # opposite directions: the alien map renames `status` to `state`, and
+    # Robinhood's own parameter simply IS `state`. The map declared `status`
+    # here until 2026-08-06, which sent Robinhood a key it ignores.
     assert hub.args == [{ALIEN: {"acct": "AL-1", "state": "open"},
                          ROBINHOOD: {"account_number": "463605220",
-                                     "status": "open"}}[connector]]
+                                     "state": "open"}}[connector]]
 
 
 # ---- arguments the caller must actually supply ---------------------------

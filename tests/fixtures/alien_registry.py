@@ -126,9 +126,27 @@ ROBINHOOD_CONNECTOR = {
         # enrichment fields, and a word for `filled` so the sweep can ask for
         # filled orders instead of taking the default. The alien fixture above
         # deliberately declares neither, so both halves stay exercised.
+        #
+        # `tool` and `args.status` here are the REAL broker's, not this
+        # fixture's to choose. Unlike ALIEN_CONNECTOR above, which exists to
+        # prove translation works and may spell things however it likes, this
+        # entry carries the live connector's id and url, so the platform's
+        # shipped registry was written by copying it.
+        #
+        # It said `get_orders` and `status` until 2026-08-06. Robinhood serves
+        # neither: the tool is `get_equity_orders` and the filter parameter is
+        # `state`. The copy reached production, every fill-journal cycle failed
+        # with "order history unreadable", and no fill the owner placed in the
+        # Robinhood app ever reached the platform (chrvsd/nakagai#327, fixed
+        # there by #328). These tests passed throughout, because a fixture that
+        # invents a tool name and a hub that serves the invented name agree
+        # with each other perfectly.
+        #
+        # So: change these two only against a live tool list. The platform side
+        # now pins every name in its own map against a recorded one.
         "list_orders": {
-            "tool": "get_orders",
-            "args": {"account": "account_number", "status": "status"},
+            "tool": "get_equity_orders",
+            "args": {"account": "account_number", "status": "state"},
             "items": ["data.orders"],
             "fields": {"order_id": ["id"], "symbol": ["symbol"], "side": ["side"],
                        "quantity": ["quantity"], "status": ["state"],

@@ -59,7 +59,7 @@ class FlatHub:
 def _rh_hub(orders):
     return EnvelopeHub({
         "get_accounts": {"accounts": [{"account_number": "463605220"}]},
-        "get_orders": {"orders": orders},
+        "get_equity_orders": {"orders": orders},
     })
 
 
@@ -113,10 +113,15 @@ async def test_status_is_relayed_verbatim_not_canonicalized():
 # ---- asking for filled orders --------------------------------------------
 
 async def test_a_declared_filled_status_is_sent_in_the_brokers_own_spelling():
+    """Both halves of "its own spelling": the VALUE (`filled`) and the KEY it
+    travels under. Robinhood's filter parameter is `state`, so a map declaring
+    `status` sent a key the broker ignores, which reads as an unfiltered sweep
+    rather than an error."""
     spec = SPECS["robinhood-trading"]
     hub = _rh_hub([])
     await account_rows(hub, spec, "463605220")
-    assert hub.calls[0][2]["status"] == "filled"
+    assert hub.calls[0][2]["state"] == "filled"
+    assert "status" not in hub.calls[0][2]
 
 
 async def test_a_broker_declaring_no_filled_status_is_asked_for_its_default():
