@@ -97,7 +97,7 @@ def has_oauth_tokens(root: Path, connector_id: str) -> bool:
 
 def build_oauth_provider(spec: ConnectorSpec, root: Path,
                          redirect_handler=None, callback_handler=None):
-    """An `httpx.Auth` that attaches (and silently refreshes) OAuth tokens.
+    """An `httpx2.Auth` that attaches (and silently refreshes) OAuth tokens.
 
     With no handlers this is the server-side posture: stored tokens are used and
     refreshed, but a flow that needs a browser fails loudly instead of hanging.
@@ -152,8 +152,14 @@ def no_tokens_message(spec: ConnectorSpec) -> str:
 
 
 def build_http_client(spec: ConnectorSpec, root: Path):
-    """The httpx client the streamable-HTTP transport rides on."""
-    import httpx
+    """The HTTP client the streamable-HTTP transport rides on.
+
+    httpx2, not httpx: the SDK's transport and its `OAuthClientProvider` are
+    both written against httpx2, which mcp 2.x brings as its own distribution.
+    This package's own platform calls (edge/client.py) stay on httpx, so both
+    names are live here and neither is a leftover.
+    """
+    import httpx2
     from mcp.shared._httpx_utils import create_mcp_http_client
 
     auth = None
@@ -164,11 +170,11 @@ def build_http_client(spec: ConnectorSpec, root: Path):
 
     client = create_mcp_http_client(
         headers=resolve_headers(spec) or None,
-        timeout=httpx.Timeout(spec.timeout_s, read=spec.timeout_s),
+        timeout=httpx2.Timeout(spec.timeout_s, read=spec.timeout_s),
         auth=auth,
     )
-    # Servers mounted at /mcp/ answer /mcp with a 307. httpx does not follow
-    # redirects by default and the MCP client surfaces that as a bare
+    # Servers mounted at /mcp/ answer /mcp with a 307. The client does not
+    # follow redirects by default and the MCP client surfaces that as a bare
     # HTTPStatusError, so a URL missing its trailing slash looks like a dead
     # server. 307 preserves method and body, so following is safe for POST.
     client.follow_redirects = True

@@ -95,9 +95,7 @@ class _Edge:
         # Positional-only: `call_connector` takes an argument called `tool`,
         # and this helper must be able to pass it through.
         result = await self.mcp.call_tool(name, args)
-        text = (result[0][0].text if isinstance(result, tuple)
-                else result.content[0].text)
-        return json.loads(text)
+        return json.loads(result.content[0].text)
 
     async def names(self) -> list[str]:
         return [t.name for t in await self.mcp.list_tools()]
@@ -110,7 +108,7 @@ class _Edge:
 @contextlib.asynccontextmanager
 async def _promoted_edge(tmp_path, *, guardrails=SHIPPED_GUARDRAILS):
     """A real edge server with the platform's tools already promoted."""
-    from mcp.shared.memory import create_connected_server_and_client_session
+    from tests.fixtures.inproc import connected_session
 
     state = _state(tmp_path, guardrails)
     client = _dead_platform()
@@ -119,14 +117,7 @@ async def _promoted_edge(tmp_path, *, guardrails=SHIPPED_GUARDRAILS):
     async def connect(spec):
         if down["now"]:
             raise ConnectorError("no route to the platform")
-
-        @contextlib.asynccontextmanager
-        async def _open():
-            async with create_connected_server_and_client_session(
-                    platform_mcp.mcp._mcp_server) as session:
-                yield session
-
-        return _open()
+        return connected_session(platform_mcp.mcp)
 
     hub = ConnectorHub(state.root, connect=connect,
                        approvals=RemoteApprovalQueue(client, state, "ag1"))
@@ -163,15 +154,15 @@ async def test_a_promoted_tool_publishes_the_platforms_own_argument_schema(edge)
     is built from the platform's own inputSchema instead, which is also why the
     agent reads the platform's types rather than a restatement of them."""
     spec = next(t for t in await edge.mcp.list_tools() if t.name == "get_signals")
-    props = spec.inputSchema["properties"]
+    props = spec.input_schema["properties"]
     assert "kwargs" not in props
     assert props["include_suppressed"]["type"] == "boolean"
     assert props["since"]["type"] == "string"
-    assert not spec.inputSchema.get("required")
+    assert not spec.input_schema.get("required")
     # A required argument stays required, so the agent is told before the call.
     write = next(t for t in await edge.mcp.list_tools()
                  if t.name == "set_autoexecute_allowlist")
-    assert write.inputSchema["required"] == ["reason"]
+    assert write.input_schema["required"] == ["reason"]
 
 
 async def test_collisions_resolve_to_the_local_tool(edge):

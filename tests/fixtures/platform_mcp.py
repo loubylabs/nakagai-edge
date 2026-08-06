@@ -15,9 +15,9 @@ test that cares about `calls` clears it first: this module is imported once.
 
 import json
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
-mcp = FastMCP("nakagai-platform-fake")
+mcp = MCPServer("nakagai-platform-fake")
 
 calls: list[tuple[str, dict]] = []
 

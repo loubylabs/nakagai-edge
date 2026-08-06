@@ -7,10 +7,10 @@ one account-scoped read, one write. Runnable as a stdio server so the real
     uv run python tests/fixtures/echo_mcp.py
 """
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 from mcp.types import ToolAnnotations
 
-mcp = FastMCP("echo")
+mcp = MCPServer("echo")
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))

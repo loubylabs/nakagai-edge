@@ -814,7 +814,7 @@ async def test_the_brake_fires_while_the_gated_tool_surface_refuses(tmp_path):
 
     result = await mcp.call_tool(
         "call_connector", {"connector_id": "demo", "tool": "get_equity_positions"})
-    text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+    text = result.content[0].text
     assert "policy stale" in text, "the gate is not engaged, so this proves nothing"
 
     assert await brake.tick({"AAPL": _q(46.10, ts=1.0)}, 1.0) == []

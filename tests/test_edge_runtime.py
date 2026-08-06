@@ -67,7 +67,7 @@ async def test_call_connector_denied_on_stale_policy(tmp_path, monkeypatch):
     monkeypatch.setattr(time, "time", lambda: real() + 1000)  # past 900s TTL
     result = await mcp.call_tool("call_connector",
                                  {"connector_id": "x", "tool": "get_quote"})
-    text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+    text = result.content[0].text
     assert "policy stale" in text
 
 
@@ -82,7 +82,7 @@ async def test_get_approval_denied_on_stale_policy(tmp_path, monkeypatch):
     real = time.time
     monkeypatch.setattr(time, "time", lambda: real() + 1000)  # past 900s TTL
     result = await mcp.call_tool("get_approval", {"approval_id": "anything"})
-    text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+    text = result.content[0].text
     assert "policy stale" in text
 
 
@@ -97,7 +97,7 @@ async def test_status_tool_works_even_stale(tmp_path, monkeypatch):
     real = time.time
     monkeypatch.setattr(time, "time", lambda: real() + 1000)
     result = await mcp.call_tool("get_connector_status", {})
-    text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+    text = result.content[0].text
     doc = json.loads(text)
     assert "connectors" in doc
     assert doc["schema_error"] == ""
@@ -120,7 +120,7 @@ async def test_status_tool_carries_the_schema_error(tmp_path):
     mcp = create_edge_mcp(state, hub, client, audit, _Reporter(),
                           Brake(state, hub, client, audit))
     result = await mcp.call_tool("get_connector_status", {})
-    text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+    text = result.content[0].text
     doc = json.loads(text)
     assert "upgrade the platform" in doc["schema_error"].lower()
     assert str(BUNDLE_SCHEMA) in doc["schema_error"]
@@ -167,7 +167,7 @@ async def test_agent_checkin_forwards_to_the_platform_and_is_not_gated_on_stalen
     result = await mcp.call_tool("agent_checkin", {
         "status": "scanning", "note": "watching NVDA",
         "account_equity": 100_000.0, "day_pnl": -1_500.0})
-    text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+    text = result.content[0].text
     doc = json.loads(text)
 
     assert doc == {"ok": True, "mandate": {"preset": "advisor"}}
@@ -187,7 +187,7 @@ async def test_agent_checkin_platform_error_returns_is_error_json(tmp_path):
                           Brake(state, hub, client, audit))
 
     result = await mcp.call_tool("agent_checkin", {"status": "scanning"})
-    text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+    text = result.content[0].text
     doc = json.loads(text)
 
     assert doc["is_error"] is True
@@ -216,7 +216,7 @@ async def test_write_tool_edge_client_error_returns_is_error_json(tmp_path):
     result = await mcp.call_tool("call_connector",
                                  {"connector_id": "demo", "tool": "place_order",
                                   "args_json": "{}"})
-    text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+    text = result.content[0].text
     doc = json.loads(text)
     assert doc["is_error"] is True
     assert "revoked" in doc["error"]
@@ -267,7 +267,7 @@ async def test_get_open_risk_reports_positions_with_live_prices(tmp_path):
                           Brake(state, hub, client, audit))
 
     result = await mcp.call_tool("get_open_risk", {})
-    text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+    text = result.content[0].text
     out = json.loads(text)
 
     assert out["armed"] is True
@@ -437,7 +437,7 @@ async def test_get_open_risk_keeps_terminal_records_out_of_the_heat(tmp_path):
                           Brake(state, hub, client, audit))
 
     result = await mcp.call_tool("get_open_risk", {})
-    text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+    text = result.content[0].text
     out = json.loads(text)
 
     assert {r["position_id"] for r in out["positions"]} == {"ap_1", "ap_2"}
@@ -462,7 +462,7 @@ async def test_get_open_risk_says_so_when_the_ledger_was_lost(tmp_path):
                           Brake(state, hub, client, audit))
 
     result = await mcp.call_tool("get_open_risk", {})
-    text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+    text = result.content[0].text
     out = json.loads(text)
 
     assert out["positions"] == []
@@ -491,7 +491,7 @@ async def test_get_open_risk_survives_a_dead_quote_feed(tmp_path, monkeypatch):
                           Brake(state, hub, client, audit))
 
     result = await mcp.call_tool("get_open_risk", {})
-    text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+    text = result.content[0].text
     out = json.loads(text)
 
     assert out["positions"][0]["position_id"] == "ap_1"
@@ -518,7 +518,7 @@ async def test_get_open_risk_reports_unguarded_under_a_global_disarm(tmp_path):
                           Brake(state, hub, client, audit))
 
     result = await mcp.call_tool("get_open_risk", {})
-    text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+    text = result.content[0].text
     out = json.loads(text)
 
     assert out["armed"] is False
@@ -543,7 +543,7 @@ async def test_get_open_risk_is_self_consistent_after_a_per_position_disarm(tmp_
                           Brake(state, hub, client, audit))
 
     result = await mcp.call_tool("get_open_risk", {})
-    text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+    text = result.content[0].text
     out = json.loads(text)
 
     assert out["disarmed_positions"] == ["ap_1"]
@@ -676,7 +676,7 @@ async def test_a_live_connectors_schemas_reach_the_platform_and_not_the_agent(
 
     for tool in ("list_connectors", "get_connector_status"):
         result = await mcp.call_tool(tool, {})
-        text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+        text = result.content[0].text
         # The connector itself must be in the answer, or this proves nothing:
         # a stale-policy refusal carries no schemas either.
         assert "robinhood-trading" in text, f"{tool} never answered"
