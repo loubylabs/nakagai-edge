@@ -22,6 +22,7 @@ pytest.importorskip("nakagai_platform")
 from nakagai_platform.api.agent_routes import ConnectorReport
 from nakagai_edge.edge.audit import EdgeAudit
 from nakagai_edge.edge.brake import Brake
+from nakagai_edge.edge.fills import FillsReporter
 from nakagai_edge.edge.client import PlatformClient
 from nakagai_edge.edge.runtime import _loops, build_hub
 from nakagai_edge.edge.state import EdgeState
@@ -116,7 +117,8 @@ async def test_syncer_reports_hub_status_connectors_each_cycle(tmp_path, monkeyp
     audit = EdgeAudit(state)
 
     tasks = await _loops(state, hub, client, audit, _Reporter(),
-                         Brake(state, hub, client, audit))
+                         Brake(state, hub, client, audit),
+                         FillsReporter(state, hub, client))
     await _run_briefly_then_cancel(tasks, lambda: len(seen) >= 1)
 
     assert seen, "the syncer never reported connector status"
@@ -191,7 +193,8 @@ async def test_syncer_survives_report_failure_and_logs_a_warning(
 
     caplog.set_level(logging.WARNING, logger="nakagai.edge")
     tasks = await _loops(state, hub, client, audit, _Reporter(),
-                         Brake(state, hub, client, audit))
+                         Brake(state, hub, client, audit),
+                         FillsReporter(state, hub, client))
     await _run_briefly_then_cancel(tasks, lambda: calls["connectors"] >= 2)
 
     # The loop kept syncing (and would keep serving MCP) despite every report
@@ -228,7 +231,8 @@ async def test_syncer_survives_a_non_json_response_from_report_connectors(
 
     caplog.set_level(logging.WARNING, logger="nakagai.edge")
     tasks = await _loops(state, hub, client, audit, _Reporter(),
-                         Brake(state, hub, client, audit))
+                         Brake(state, hub, client, audit),
+                         FillsReporter(state, hub, client))
     await _run_briefly_then_cancel(tasks, lambda: calls["connectors"] >= 2)
 
     assert calls["connectors"] >= 2, "the loop died after the first bad response"
