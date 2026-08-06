@@ -1,6 +1,6 @@
 [project]
 name = "nakagai-edge"
-version = "0.2.6"
+version = "0.2.7"
 description = "Nakagai edge: the connector runtime that holds your broker credentials"
 readme = "README.md"
 license = "MIT"
@@ -28,7 +28,17 @@ dependencies = [
     # #993), first tagged as v1.10.0. TolerantClientSession overrides both.
     # Below 1.10 neither exists, so the override binds to nothing: no crash,
     # no tolerance, just a broker payload validated by nothing at all.
-    "mcp>=1.10",
+    #
+    # The upper bound is not caution, it is a break that already shipped. mcp
+    # 2.0.0 moved `mcp.server.fastmcp` to `mcp.server.mcpserver`, and
+    # edge/runtime.py imports FastMCP from the old path, so a resolver free to
+    # take 2.0.0 produces an edge that pairs and syncs and then dies starting
+    # its own MCP server. Neither CI caught it: this repo and the platform both
+    # resolve through a lock, and only `uvx`, which resolves fresh at every
+    # invocation, ever saw it. That is what users run. Porting to the 2.x API
+    # is separate work; until it happens this bound is what keeps `uvx
+    # nakagai-edge` working at all.
+    "mcp>=1.10,<2",
     "cryptography>=42",
     "httpx>=0.27",
     "jsonschema>=4.26",

@@ -73,3 +73,36 @@ def test_the_sdk_still_exposes_the_seam_tolerance_overrides():
 
     assert TolerantClientSession._validate_tool_result is not \
         ClientSession._validate_tool_result, "the override went missing"
+
+
+def test_the_mcp_pin_keeps_an_upper_bound():
+    """mcp 2.0.0 moved `mcp.server.fastmcp` to `mcp.server.mcpserver`, and
+    edge/runtime.py imports FastMCP from the old path. An unbounded `mcp>=1.10`
+    let `uvx` resolve 2.0.0, producing an edge that paired and synced and then
+    died starting its own MCP server.
+
+    Neither repo's CI could see it: both resolve through a lock, and only uvx
+    resolves fresh at invocation. So the guard is on the DECLARED constraint,
+    not on the resolved version, because the resolved one here is always the
+    locked, working one.
+    """
+    import tomllib
+    from pathlib import Path
+
+    from packaging.requirements import Requirement
+
+    root = Path(__file__).resolve().parent.parent
+    deps = tomllib.loads((root / "pyproject.toml").read_text())["project"]["dependencies"]
+    mcp = next(Requirement(d) for d in deps if Requirement(d).name == "mcp")
+
+    assert mcp.specifier.contains("1.28.1"), "the working version fell outside the pin"
+    assert not mcp.specifier.contains("2.0.0"), (
+        "mcp 2.0.0 dropped mcp.server.fastmcp, which edge/runtime.py imports. "
+        "Remove this bound only together with a port to the 2.x API.")
+
+
+def test_the_fastmcp_import_path_still_exists():
+    """The other half: the bound above is only worth having while this is the
+    path the code needs. If a port to mcp 2.x lands, this fails first and says
+    so, rather than leaving a stale bound nobody dares touch."""
+    from mcp.server.fastmcp import FastMCP  # noqa: F401
