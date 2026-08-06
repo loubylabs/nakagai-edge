@@ -215,8 +215,8 @@ class BaseApprovalQueue:
         """Record what a human found at the broker for an `outcome_unknown` call.
 
         Nakagai cannot know whether a timed-out `place_*` reached the broker, so
-        it never guesses. A person checks the account (e.g. `get_equity_orders`)
-        and records the answer here. Only then does the record stop warning
+        it never guesses. A person checks the account at the broker and records
+        the answer here. Only then does the record stop warning
         agents off, and only a human's word clears it.
 
         `placed=True` means the order IS live at the broker; `placed=False` means

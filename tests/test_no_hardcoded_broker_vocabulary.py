@@ -42,7 +42,7 @@ FORBIDDEN = {
     "get_portfolio": set(),
     "get_equity_positions": set(),
     "get_quotes": set(),
-    "get_orders": set(),
+    "get_equity_orders": set(),
     "place_equity_order": set(),
     "average_buy_price": set(),
     "last_trade_price": set(),
