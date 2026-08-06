@@ -44,6 +44,33 @@ def test_setup_without_a_code_on_an_unpaired_edge_explains_itself(tmp_path, monk
     assert "pairing code" in (r.stdout + r.stderr)
 
 
+def test_pair_diagnoses_the_platform_before_spending_the_code(tmp_path, monkeypatch,
+                                                              capsys):
+    """`pair --platform` is required and has no default, so it is the likeliest
+    place to mistype a URL. Without preflight the user gets a bare
+    `pairing failed (301)` and no idea what to do about it. This asserts the
+    order too: a pairing code is single use, and a preflight that runs after
+    the POST would burn it against the wrong server."""
+    from nakagai_edge.edge.client import EdgeClientError
+
+    monkeypatch.setenv("NAKAGAI_EDGE_ROOT", str(tmp_path))
+
+    def refuse(url, **kw):
+        raise EdgeClientError(f"{url} is the nakagai API, but it does not "
+                              "serve plain http")
+
+    def must_not_pair(*a, **k):
+        raise AssertionError("the code was spent despite a failed preflight")
+
+    monkeypatch.setattr("nakagai_edge.edge.preflight.check_platform", refuse)
+    monkeypatch.setattr("nakagai_edge.edge.client.pair", must_not_pair)
+
+    assert main(["pair", "CODE1", "--platform", "http://api.nakag.ai"]) == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["ok"] is False
+    assert "does not serve plain http" in out["error"]
+
+
 REFUSED = httpx.Response(200, headers={"etag": "v2"},
                          json={"bundle_version": "v2",         # no schema_version:
                                "connectors": {"connectors": []}})   # today's platform
