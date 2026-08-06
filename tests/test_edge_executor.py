@@ -196,13 +196,11 @@ async def test_edge_enqueue_still_works_with_a_cited_signal_id(tmp_path):
     signature were not updated too, this would raise
     `TypeError: enqueue() got an unexpected keyword argument 'signal_id'` and
     every edge order would die. It must not."""
-    import contextlib
-
     import yaml
-    from mcp.shared.memory import create_connected_server_and_client_session
 
     from nakagai_edge.hub import ConnectorHub
     from tests.fixtures.echo_mcp import mcp as echo_server
+    from tests.fixtures.inproc import connect_to
 
     state, client, queue, _ = _setup(tmp_path)
 
@@ -215,15 +213,7 @@ async def test_edge_enqueue_still_works_with_a_cited_signal_id(tmp_path):
                        "approvals": {"require_for": ["place_*"]}},
     }]}))
 
-    async def connect(spec):
-        @contextlib.asynccontextmanager
-        async def _open():
-            async with create_connected_server_and_client_session(
-                    echo_server._mcp_server) as session:
-                yield session
-        return _open()
-
-    hub = ConnectorHub(state.root, connect=connect, approvals=queue)
+    hub = ConnectorHub(state.root, connect=connect_to(echo_server), approvals=queue)
     out = await hub.call("echo", "place_equity_order",
                          {"symbol": "SPY", "account_number": "1"},
                          signal_id="abc123")
@@ -301,18 +291,16 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
     """
     pytest.importorskip("nakagai_platform")
 
-    import contextlib
-
     import pandas as pd
     import yaml as _yaml
 
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
-    from mcp.server.fastmcp import FastMCP
-    from mcp.shared.memory import create_connected_server_and_client_session
+    from mcp.server.mcpserver import MCPServer
 
     from nakagai_platform.api.app import create_app
     from nakagai_edge.hub import ConnectorHub
+    from tests.fixtures.inproc import connect_to
     from nakagai_edge.signing import generate_keypair, public_key_for
     # The store seam, not scan.signal.append_signals: the platform moved signal
     # writes behind get_signal_store so the file and Postgres backends share one
@@ -460,21 +448,13 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
     # broker that was genuinely reachable and still took no order, rather than
     # at one that did not exist yet.
     placed: list = []
-    broker = FastMCP("broker")
+    broker = MCPServer("broker")
 
     @broker.tool()
     def place_equity_order(symbol: str, side: str, quantity: int,
                            limit_price: float, stop_price: float = 0.0) -> str:
         placed.append((symbol, side, quantity))
         return f"PLACED {side} {quantity} {symbol} @ {limit_price}"
-
-    async def connect(spec):
-        @contextlib.asynccontextmanager
-        async def _open():
-            async with create_connected_server_and_client_session(
-                    broker._mcp_server) as session:
-                yield session
-        return _open()
 
     # The edge holds the broker credentials and executes. apply_bundle synced an
     # empty registry into state.root/config; write the broker entry its hub dials.
@@ -483,7 +463,7 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
         "url": "https://example.test/mcp", "enabled": True,
         "guardrails": {"allow_writes": True, "read_only_tools": ["get_*"],
                        "approvals": {"require_for": ["place_*"], "ttl_s": 900}}}]}))
-    edge_hub = ConnectorHub(state.root, connect=connect, approvals=queue)
+    edge_hub = ConnectorHub(state.root, connect=connect_to(broker), approvals=queue)
 
     # ---- half one: the platform declines to the owner, and nothing executes ----
     rec = queue.enqueue("broker", "place_equity_order", order, ttl_s=900,

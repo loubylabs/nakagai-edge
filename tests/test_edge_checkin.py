@@ -118,7 +118,7 @@ async def test_edge_checkin_lands_where_the_platform_can_read_it(
     result = await mcp.call_tool("agent_checkin", {
         "status": "scanning", "note": "watching NVDA",
         "account_equity": 100_000.0, "day_pnl": -1_500.0})
-    text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+    text = result.content[0].text
     out = json.loads(text)
     assert out["ok"] is True
 
@@ -208,7 +208,7 @@ async def test_edge_agent_can_arm_autopilot_after_checking_in_with_equity(
     mcp = _edge_mcp(tmp_path / "edge", platform_client)
     result = await mcp.call_tool("agent_checkin", {
         "status": "scanning", "account_equity": 50_000.0, "day_pnl": -200.0})
-    text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+    text = result.content[0].text
     assert json.loads(text)["ok"] is True
 
     after = owner.post("/api/mandate/arm", json={"armed": True}, headers=owner_headers)

@@ -27,7 +27,7 @@ class _CallbackCatcher:
 
     def __init__(self, port: int) -> None:
         self.port = port
-        self._result: tuple[str, str | None] | None = None
+        self._result: dict[str, str | None] | None = None
         self._done = threading.Event()
         self._server: HTTPServer | None = None
 
@@ -38,7 +38,15 @@ class _CallbackCatcher:
             def do_GET(self):  # noqa: N802 (stdlib naming)
                 params = parse_qs(urlparse(self.path).query)
                 if "code" in params:
-                    catcher._result = (params["code"][0], params.get("state", [None])[0])
+                    # `iss` is the RFC 9207 authorization-response issuer. The
+                    # SDK validates it against the discovered issuer when the
+                    # provider sends one, so dropping it here would turn a
+                    # provider that does the right thing into a flow that
+                    # cannot check it.
+                    catcher._result = {
+                        "code": params["code"][0],
+                        "state": params.get("state", [None])[0],
+                        "iss": params.get("iss", [None])[0]}
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
                     self.end_headers()
@@ -64,7 +72,7 @@ class _CallbackCatcher:
             self._server.shutdown()
             self._server.server_close()
 
-    async def wait(self, timeout: float = 300.0) -> tuple[str, str | None]:
+    async def wait(self, timeout: float = 300.0) -> dict[str, str | None]:
         loop = asyncio.get_running_loop()
         ok = await loop.run_in_executor(None, self._done.wait, timeout)
         if not ok or self._result is None:
@@ -77,6 +85,7 @@ async def login(root: Path, connector_id: str) -> dict:
     from mcp.client.session import ClientSession
     from mcp.client.streamable_http import streamable_http_client
     from mcp.shared._httpx_utils import create_mcp_http_client
+    from mcp.shared.auth import AuthorizationCodeResult
 
     from nakagai_edge.auth import build_oauth_provider, token_path
     from nakagai_edge.hub import ConnectorHub
@@ -96,14 +105,14 @@ async def login(root: Path, connector_id: str) -> dict:
         print(f"If it doesn't open, visit:\n  {url}\n")
         webbrowser.open(url)
 
-    async def callback_handler() -> tuple[str, str | None]:
-        return await catcher.wait()
+    async def callback_handler() -> AuthorizationCodeResult:
+        return AuthorizationCodeResult(**await catcher.wait())
 
     try:
         provider = build_oauth_provider(spec, root, redirect_handler, callback_handler)
         http_client = create_mcp_http_client(auth=provider)
         # One authenticated round-trip drives the whole flow and proves it worked.
-        async with streamable_http_client(spec.url, http_client=http_client) as (r, w, _):
+        async with streamable_http_client(spec.url, http_client=http_client) as (r, w):
             async with ClientSession(r, w, client_info=client_info()) as session:
                 await session.initialize()
                 tools = await session.list_tools()

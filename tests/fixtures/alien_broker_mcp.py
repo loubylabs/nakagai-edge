@@ -5,9 +5,9 @@ and fails here, something upstream is still hardcoded, which is the exact
 failure this fixture exists to catch.
 """
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
-mcp = FastMCP("alien-broker")
+mcp = MCPServer("alien-broker")
 
 ACCOUNTS = [{"acct": "AL-1", "label": "Alien Main", "kind": "margin"}]
 HOLDINGS = {"AL-1": [{"ticker": "aapl", "qty": "25", "cost": "187.20"},

@@ -1,6 +1,6 @@
 [project]
 name = "nakagai-edge"
-version = "0.2.7"
+version = "0.2.8"
 description = "Nakagai edge: the connector runtime that holds your broker credentials"
 readme = "README.md"
 license = "MIT"
@@ -21,24 +21,27 @@ classifiers = [
     "Topic :: Security",
 ]
 dependencies = [
-    # 1.10 is the floor because it is the first release with client-side
-    # output-schema validation: ClientSession._validate_tool_result and
-    # _tool_output_schemas both arrived in modelcontextprotocol/python-sdk
-    # commit 43bb24f6 ("Add structured output support for tool functions",
-    # #993), first tagged as v1.10.0. TolerantClientSession overrides both.
-    # Below 1.10 neither exists, so the override binds to nothing: no crash,
-    # no tolerance, just a broker payload validated by nothing at all.
+    # 2.0 is the floor because this package is written against the 2.x API and
+    # nothing here still speaks 1.x. edge/runtime.py builds its server as
+    # `mcp.server.mcpserver.MCPServer`, which 1.x does not ship at all, and
+    # hub.py's TolerantClientSession overrides `ClientSession
+    # .validate_tool_result`, which 1.x spells `_validate_tool_result`. An
+    # override that binds to nothing is the quiet half of that: no crash, just
+    # a broker payload validated by nothing. tests/test_package_shape.py
+    # asserts the declared floor here and imports MCPServer, so a floor that
+    # slips back below 2.0 reddens rather than ships.
     #
-    # The upper bound is not caution, it is a break that already shipped. mcp
-    # 2.0.0 moved `mcp.server.fastmcp` to `mcp.server.mcpserver`, and
-    # edge/runtime.py imports FastMCP from the old path, so a resolver free to
-    # take 2.0.0 produces an edge that pairs and syncs and then dies starting
-    # its own MCP server. Neither CI caught it: this repo and the platform both
-    # resolve through a lock, and only `uvx`, which resolves fresh at every
-    # invocation, ever saw it. That is what users run. Porting to the 2.x API
-    # is separate work; until it happens this bound is what keeps `uvx
-    # nakagai-edge` working at all.
-    "mcp>=1.10,<2",
+    # No upper bound. The old `<2` existed because 1.x code was pinned under a
+    # 2.x break; that reason is spent. What a bound could not do anyway is
+    # protect `uvx nakagai-edge`, which resolves fresh at every invocation
+    # while this repo and the platform both resolve through a lock: only a
+    # release cut against the new major ever proves that path.
+    #
+    # httpx is this package's own client (PlatformClient, and every test's
+    # MockTransport). mcp 2.x brings httpx2 as a separate distribution, and
+    # auth.py builds its transport client through the SDK's own
+    # create_mcp_http_client, so both live here on purpose.
+    "mcp>=2",
     "cryptography>=42",
     "httpx>=0.27",
     "jsonschema>=4.26",

@@ -90,7 +90,7 @@ def _edge_mcp(edge_root, platform_client: PlatformClient):
 
 
 def _tool_json(result) -> dict:
-    text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+    text = result.content[0].text
     return json.loads(text)
 
 

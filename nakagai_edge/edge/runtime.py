@@ -1,4 +1,4 @@
-"""The edge shim itself: a FastMCP server on 127.0.0.1 that IS the agent's
+"""The edge shim itself: an MCPServer on 127.0.0.1 that IS the agent's
 whole world. Brokers are dialed with locally-held credentials through the
 unmodified gateway runtime; the platform is reached as data (via a synced
 nakagai-mcp connector) and as authority (approvals, audit, bundle).
@@ -56,7 +56,7 @@ def _given(value) -> bool:
     """Did the caller actually supply this argument?
 
     An MCP tool cannot tell an omitted optional from one passed as its own
-    default, because FastMCP fills both with the same `""` or `None`. So an
+    default, because MCPServer fills both with the same `""` or `None`. So an
     empty string, an empty list and None all read as "not supplied", and the
     caller's own signature (via `_capability_call`'s `required`) is what
     decides whether that is allowed.
@@ -86,10 +86,10 @@ def build_hub(state: EdgeState, client: PlatformClient):
 
 def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAudit,
                     reporter, brake: Brake):
-    from mcp.server.fastmcp import FastMCP
+    from mcp.server.mcpserver import MCPServer
     from pydantic import WithJsonSchema
 
-    mcp = FastMCP("nakagai-edge")
+    mcp = MCPServer("nakagai-edge")
 
     def _gate() -> str | None:
         return None if policy_fresh(state, POLICY_TTL_S) else freshness_error()
@@ -697,7 +697,7 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
     def _forward_signature(schema: dict) -> tuple | None:
         """(signature, defaults) built from the platform's own input schema.
 
-        FastMCP derives a tool's published schema from the function signature,
+        MCPServer derives a tool's published schema from the function signature,
         so a forwarder declared `**kwargs` advertises one REQUIRED string
         argument called "kwargs" and nothing else: every call then fails
         validation, and nothing about the registration says so. Synthesizing
@@ -730,7 +730,7 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
             params.append(inspect.Parameter(
                 arg, inspect.Parameter.KEYWORD_ONLY, default=default,
                 annotation=Annotated[Any, WithJsonSchema(prop)]))
-        # `-> str` like every tool above it, and for the same reason FastMCP
+        # `-> str` like every tool above it, and for the same reason MCPServer
         # cares: the return annotation is what decides whether a result comes
         # back structured. A synthesized signature that omitted it would hand
         # the agent a differently-shaped envelope for a promoted name than for
@@ -740,7 +740,7 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
     def _supplied(kwargs: dict, defaults: dict) -> dict:
         """What the agent actually asked for, with the rest left off.
 
-        FastMCP fills every omitted optional with its default before we see it,
+        MCPServer fills every omitted optional with its default before we see it,
         so forwarding the lot would put keys in the call that
         `call_connector("nakagai-mcp", ...)` never carries, and those args are
         what an approval record shows the owner. Dropping one cannot change
@@ -1021,7 +1021,6 @@ def run(root, port: int = 8330) -> None:
                      {"position_id": pid,
                       "error": "exit in flight when the edge stopped"})
     mcp = create_edge_mcp(state, hub, client, audit, reporter, brake)
-    mcp.settings.host, mcp.settings.port = "127.0.0.1", port
 
     async def main():
         # Before a single client connects, so the first tool list is the whole
@@ -1030,7 +1029,12 @@ def run(root, port: int = 8330) -> None:
         await mcp.promote_platform_tools()
         tasks = await _loops(state, hub, client, audit, reporter, brake, fills)
         try:
-            await mcp.run_streamable_http_async()
+            # The bind address is an argument to the serve call, not a field on
+            # `mcp.settings`: MCPServer.settings carries the construction-time
+            # knobs (log level, auth, lifespan) and nothing about a transport.
+            # Loopback is the whole security posture here, so it is spelled out
+            # rather than left to the default.
+            await mcp.run_streamable_http_async(host="127.0.0.1", port=port)
         finally:
             for t in tasks:
                 t.cancel()

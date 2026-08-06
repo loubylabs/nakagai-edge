@@ -13,7 +13,6 @@ choosing an account the owner never authorized, which is exactly what
 `check_accounts` exists to stop.
 """
 
-import contextlib
 import json
 import time
 
@@ -185,7 +184,7 @@ def _server(state, hub, client=None):
 
 async def _call(mcp, tool, **args):
     result = await mcp.call_tool(tool, args)
-    text = result[0][0].text if isinstance(result, tuple) else result.content[0].text
+    text = result.content[0].text
     return json.loads(text)
 
 
@@ -606,21 +605,11 @@ def _live_hub(state, client):
     that classifies the write, enqueues the approval, and hands back the
     envelope the agent has to poll on.
     """
-    from mcp.shared.memory import create_connected_server_and_client_session
-
     from tests.fixtures.alien_broker_mcp import mcp as alien_server
-
-    async def connect(spec):
-        @contextlib.asynccontextmanager
-        async def _open():
-            async with create_connected_server_and_client_session(
-                    alien_server._mcp_server) as session:
-                yield session
-
-        return _open()
+    from tests.fixtures.inproc import connect_to
 
     queue = RemoteApprovalQueue(client, state, "ag1")
-    return ConnectorHub(state.root, connect=connect, approvals=queue)
+    return ConnectorHub(state.root, connect=connect_to(alien_server), approvals=queue)
 
 
 async def test_place_order_returns_the_approval_envelope_intact(tmp_path):

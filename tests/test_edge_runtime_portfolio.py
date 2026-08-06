@@ -108,7 +108,7 @@ async def test_refresh_portfolio_tool_pokes_the_reporter_and_returns_the_doc(tmp
                           Brake(state, hub, client, audit))
 
     result = await mcp.call_tool("refresh_portfolio", {})
-    body = json.loads(result[0][0].text)
+    body = json.loads(result.content[0].text)
     assert body["connectors"][0]["id"] == "robinhood-trading"
     assert reporter.pushes == 1
 

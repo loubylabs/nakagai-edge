@@ -33,7 +33,7 @@ class _Reporter:
 
 @pytest.fixture
 def edge_mcp(tmp_path):
-    """The real FastMCP instance create_edge_mcp builds.
+    """The real MCPServer instance create_edge_mcp builds.
 
     No shared fixture for this exists: test_edge_runtime.py builds one inline
     and test_edge_channel.py has a local `_edge_mcp` helper that needs the
@@ -87,8 +87,8 @@ def test_access_does_not_use_file_path_arithmetic():
 @pytest.mark.anyio
 async def test_every_skill_is_offered_as_a_prompt(edge_mcp):
     """list_prompts() is the public coroutine on the installed MCP SDK's
-    FastMCP. Asserting through it rather than through _prompt_manager keeps the
-    test on the surface a client actually sees."""
+    MCPServer. Asserting through it rather than through _prompt_manager keeps
+    the test on the surface a client actually sees."""
     offered = {p.name for p in await edge_mcp.list_prompts()}
     assert set(skills.list_skills()) <= offered
 

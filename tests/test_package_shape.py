@@ -29,13 +29,15 @@ def test_the_base_hub_is_the_edges():
 
 
 def test_the_sdk_still_exposes_the_seam_tolerance_overrides():
-    """TolerantClientSession overrides a private SDK method and reads a private
-    SDK attribute. Both are load-bearing, and neither is a public interface.
+    """TolerantClientSession overrides one SDK method and reads one private SDK
+    attribute. Both are load-bearing.
 
     An SDK upgrade that renames either would leave our override dead: the
     payload Robinhood sends today would start raising again. That failure is
     loud rather than silent, so nothing bad reaches the ledger, but a red line
-    here beats an owner discovering it through a blank Positions page.
+    here beats an owner discovering it through a blank Positions page. mcp 2.0
+    is precisely that rename happening once already: `_validate_tool_result`
+    became `validate_tool_result`.
     """
     import inspect
 
@@ -45,9 +47,9 @@ def test_the_sdk_still_exposes_the_seam_tolerance_overrides():
 
     from nakagai_edge.hub import TolerantClientSession
 
-    assert inspect.iscoroutinefunction(ClientSession._validate_tool_result), (
+    assert inspect.iscoroutinefunction(ClientSession.validate_tool_result), (
         "the SDK's output-schema validation is no longer an async method by "
-        "this name; TolerantClientSession._validate_tool_result overrides "
+        "this name; TolerantClientSession.validate_tool_result overrides "
         "nothing and hard failures are back")
 
     # ClientSession.__init__ does no I/O: it only stores its arguments, so a
@@ -71,20 +73,20 @@ def test_the_sdk_still_exposes_the_seam_tolerance_overrides():
         write_stream.close()
         write_reader.close()
 
-    assert TolerantClientSession._validate_tool_result is not \
-        ClientSession._validate_tool_result, "the override went missing"
+    assert TolerantClientSession.validate_tool_result is not \
+        ClientSession.validate_tool_result, "the override went missing"
 
 
-def test_the_mcp_pin_keeps_an_upper_bound():
-    """mcp 2.0.0 moved `mcp.server.fastmcp` to `mcp.server.mcpserver`, and
-    edge/runtime.py imports FastMCP from the old path. An unbounded `mcp>=1.10`
-    let `uvx` resolve 2.0.0, producing an edge that paired and synced and then
-    died starting its own MCP server.
+def test_the_mcp_pin_declares_a_2x_floor():
+    """This package is written against mcp 2.x and only 2.x.
 
-    Neither repo's CI could see it: both resolve through a lock, and only uvx
-    resolves fresh at invocation. So the guard is on the DECLARED constraint,
-    not on the resolved version, because the resolved one here is always the
-    locked, working one.
+    The guard is on the DECLARED constraint, not on the resolved version. Both
+    this repo and the platform resolve through a lock, so the resolved version
+    here is always the one that already works; `uvx nakagai-edge`, which is
+    what a user runs, resolves fresh at every invocation and takes whatever the
+    floor allows. A floor that slipped back to 1.x would therefore ship an edge
+    that pairs and syncs and then dies starting its own MCP server, and this
+    lockfile would never say so.
     """
     import tomllib
     from pathlib import Path
@@ -95,14 +97,17 @@ def test_the_mcp_pin_keeps_an_upper_bound():
     deps = tomllib.loads((root / "pyproject.toml").read_text())["project"]["dependencies"]
     mcp = next(Requirement(d) for d in deps if Requirement(d).name == "mcp")
 
-    assert mcp.specifier.contains("1.28.1"), "the working version fell outside the pin"
-    assert not mcp.specifier.contains("2.0.0"), (
-        "mcp 2.0.0 dropped mcp.server.fastmcp, which edge/runtime.py imports. "
-        "Remove this bound only together with a port to the 2.x API.")
+    assert mcp.specifier.contains("2.0.0"), (
+        "the declared floor excludes mcp 2.0.0, which is the release this "
+        "package is written against")
+    assert not mcp.specifier.contains("1.28.1"), (
+        "the declared floor still admits mcp 1.x, which ships neither "
+        "mcp.server.mcpserver nor ClientSession.validate_tool_result")
 
 
-def test_the_fastmcp_import_path_still_exists():
-    """The other half: the bound above is only worth having while this is the
-    path the code needs. If a port to mcp 2.x lands, this fails first and says
-    so, rather than leaving a stale bound nobody dares touch."""
-    from mcp.server.fastmcp import FastMCP  # noqa: F401
+def test_the_mcpserver_import_path_exists():
+    """The other half: the floor above is only worth having while this is the
+    path the code needs. edge/runtime.py builds its whole tool surface on this
+    class, so a rename inside 2.x fails here first and says which name moved,
+    rather than surfacing as a daemon that will not start."""
+    from mcp.server.mcpserver import MCPServer  # noqa: F401

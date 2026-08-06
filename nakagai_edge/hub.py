@@ -22,7 +22,6 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -63,16 +62,17 @@ def describe_exception(e: BaseException) -> str:
 class TolerantClientSession(ClientSession):
     """A session that refuses a broker's bad data, not its bad bookkeeping.
 
-    The SDK validates every result against the server's own declared
-    outputSchema and raises, with no opt-out (`ClientSession.__init__` takes no
+    The SDK validates every result against the server's own declared output
+    schema and raises, with no opt-out (`ClientSession.__init__` takes no
     flag). Robinhood declares its account objects closed and then returns
     `unsettled_funds`, which took the whole portfolio sweep down over a field
     no capability map mentions.
 
-    `super()._validate_tool_result` wraps three different failures into the
-    same `RuntimeError`: missing `structuredContent`, a `ValidationError` from
-    `jsonschema.validate`, and a `SchemaError` from a schema that will not even
-    compile. All three land in the `except RuntimeError` below and are decided
+    `super().validate_tool_result` wraps three different failures into the
+    same `RuntimeError`: missing structured content, a `ValidationError` from
+    the compiled jsonschema validator, and a `SchemaError` from a schema that
+    will not even compile. All three land in the `except RuntimeError` below
+    and are decided
     by `undeclared_properties`, which re-runs `check_schema` and `iter_errors`
     on the same schema and instance. For the first two, that rerun turns up
     errors that are not `additionalProperties: false` refusals, so the
@@ -100,13 +100,13 @@ class TolerantClientSession(ClientSession):
         self._connector_id = connector_id
         self._tolerated: set[tuple[str, tuple[str, ...]]] = set()
 
-    async def _validate_tool_result(self, name: str, result) -> None:
+    async def validate_tool_result(self, name: str, result) -> None:
         try:
-            await super()._validate_tool_result(name, result)
+            await super().validate_tool_result(name, result)
         except RuntimeError:
             extras = undeclared_properties(
                 self._tool_output_schemas.get(name),
-                getattr(result, "structuredContent", None))
+                getattr(result, "structured_content", None))
             if extras is None:
                 raise
             seen = (name, tuple(extras))
@@ -191,7 +191,7 @@ def serialize_result(result) -> dict:
         else:
             blocks.append(block.model_dump(mode="json") if hasattr(block, "model_dump")
                           else {"type": kind})
-    out: dict = {"is_error": bool(getattr(result, "isError", False))}
+    out: dict = {"is_error": bool(getattr(result, "is_error", False))}
     joined = "\n".join(texts)
     if texts:
         # Downstream servers usually hand back a JSON document as text; parse it
@@ -200,10 +200,11 @@ def serialize_result(result) -> dict:
             out["data"] = json.loads(joined)
         except (json.JSONDecodeError, ValueError):
             out["text"] = joined
-    structured = getattr(result, "structuredContent", None)
+    structured = getattr(result, "structured_content", None)
     if structured is not None:
-        # FastMCP mirrors most results into structuredContent: {"result": text}
-        # for plain tools, or a copy of the JSON already parsed into `data`. The
+        # An MCPServer downstream mirrors most results into structured content:
+        # {"result": text} for plain tools, or a copy of the JSON already
+        # parsed into `data`. The
         # upstream agent pays tokens for every byte; keep it only when it says
         # something the text didn't.
         data = out.get("data")
@@ -265,7 +266,9 @@ class ConnectorHub:
         async def _open():
             from nakagai_edge.identity import client_info
 
-            timeout = timedelta(seconds=spec.timeout_s)
+            # Plain seconds: the SDK takes a float here, and passes it to
+            # anyio.fail_after the same way for every request.
+            timeout = float(spec.timeout_s)
             if spec.transport == "stdio":
                 from mcp.client.stdio import StdioServerParameters, stdio_client
                 params = StdioServerParameters(command=spec.command, args=spec.args,
@@ -282,8 +285,8 @@ class ConnectorHub:
 
                 from nakagai_edge.auth import build_http_client
                 http_client = build_http_client(spec, self.root)
-                async with streamable_http_client(spec.url, http_client=http_client) as (
-                        read, write, _get_session_id):
+                async with streamable_http_client(
+                        spec.url, http_client=http_client) as (read, write):
                     async with TolerantClientSession(read, write,
                                                      read_timeout_seconds=timeout,
                                                      client_info=client_info(),
@@ -300,11 +303,18 @@ class ConnectorHub:
             async with await self._connect(spec) as session:
                 listed = await session.list_tools()
                 conn._session = session
-                conn.tools = [t.model_dump(mode="json") for t in listed.tools]
-                init = getattr(session, "_init_result", None) or getattr(
-                    session, "initialize_result", None)
-                if init is not None and hasattr(init, "serverInfo"):
-                    conn.server_info = init.serverInfo.model_dump(mode="json")
+                # `by_alias`, so these dicts stay in MCP's own wire spelling
+                # (`inputSchema`, `annotations.readOnlyHint`). The SDK's model
+                # fields are snake_case, and a plain dump would hand
+                # `input_schema` to guardrails.py, to the platform's connector
+                # report, and to the capability map the owner approves. Every
+                # reader of `conn.tools` expects the wire names.
+                conn.tools = [t.model_dump(mode="json", by_alias=True)
+                              for t in listed.tools]
+                init = session.initialize_result
+                if init is not None:
+                    conn.server_info = init.server_info.model_dump(
+                        mode="json", by_alias=True)
                 conn.status, conn.last_error = "connected", ""
                 conn.connected_at = time.monotonic()
                 if conn._ready and not conn._ready.done():
@@ -486,7 +496,7 @@ class ConnectorHub:
 
         conn.last_used = time.monotonic()
         result = await conn._session.call_tool(
-            tool, args, read_timeout_seconds=timedelta(seconds=spec.timeout_s))
+            tool, args, read_timeout_seconds=float(spec.timeout_s))
         return {"connector": connector_id, "tool": tool, "is_write": verdict.is_write,
                 **serialize_result(result)}
 
