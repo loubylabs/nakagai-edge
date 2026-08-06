@@ -122,9 +122,16 @@ def test_listener_emits_an_owner_message_through_the_real_stack(tmp_path, platfo
     ChannelListener(client, root, emit=emitted.append, sleep=lambda _s: None,
                     timeout_s=0).run(should_continue=lambda: next(passes, False))
 
-    assert [e["text"] for e in emitted] == ["owner says hi"]
-    assert emitted[0]["from"] == "chris@nakag.ai"
-    assert CursorStore(root).load() == emitted[0]["cursor"]
+    # Read the kind, the way the listener's own contract tells an agent to.
+    # The platform publishes on its own account into the same stream: an edge
+    # running a version the index has moved past gets an `edge_update` event,
+    # which is correct behaviour and carries no `text`. Asserting over
+    # everything that arrived made this test fail for as long as the platform's
+    # lock lagged an edge release, which is a window that exists by design.
+    messages = [e for e in emitted if e["kind"] == "owner_msg"]
+    assert [e["text"] for e in messages] == ["owner says hi"]
+    assert messages[0]["from"] == "chris@nakag.ai"
+    assert CursorStore(root).load() == emitted[-1]["cursor"]
 
 
 async def test_send_message_tool_returns_ok_and_seq(tmp_path, platform):
