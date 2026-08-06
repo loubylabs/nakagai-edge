@@ -31,7 +31,13 @@ COERCIONS = {
     "side": SIDE,
     "quantity": FLOAT, "price": FLOAT, "stop": FLOAT,
     "bid": FLOAT, "ask": FLOAT, "avg_price": FLOAT, "fill_price": FLOAT,
+    "notional": FLOAT,
 }
+# `notional` is FLOAT beside `quantity` and `fill_price`: it is an order's SIZE
+# and a reader does arithmetic on it. That is the opposite call from `equity`
+# and `cash` below, which are display figures relayed exactly as the broker
+# worded them.
+#
 # Everything absent from COERCIONS is VERBATIM: equity, cash, buying_power,
 # market_value, currency, nickname, type, status, order_id, filled_at, account.
 # The edge relays those figures and never does arithmetic on them.
@@ -80,9 +86,23 @@ CAPABILITIES: dict[str, CapabilitySpec] = {
     "get_quote": CapabilitySpec(
         args=("symbols",), required=("symbol", "price"), optional=("bid", "ask"),
         is_list=True, is_write=False),
+    # `quantity` and `notional` are two ways to say how big an order is, and a
+    # broker may answer in either. Robinhood sizes a dollar-based order in
+    # money and leaves the share count null until it fills, so a journal with
+    # only `quantity` records that a trade happened and not how large it was.
+    #
+    # They are separate fields rather than one, deliberately. Falling back
+    # (`quantity: [quantity, dollar_based_amount]`) would populate the field
+    # and put DOLLARS in a share count, which `first()` would do happily and
+    # nothing downstream could detect. This module's own docstring states the
+    # invariant: a wrong map "can never make `quantity` mean notional". Two
+    # words is what makes that true rather than aspirational.
+    #
+    # Neither is required, so an order sized either way still journals.
     "list_orders": CapabilitySpec(
         args=("account", "status"), required=("order_id", "symbol"),
-        optional=("side", "quantity", "status", "fill_price", "filled_at"),
+        optional=("side", "quantity", "notional", "status", "fill_price",
+                  "filled_at"),
         is_list=True, is_write=False),
     # `optional` here is the RESULT of placing an order, not its arguments:
     # `args` above is what goes out, these are what can be read back. The fill

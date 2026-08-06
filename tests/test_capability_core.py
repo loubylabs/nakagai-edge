@@ -88,3 +88,67 @@ def test_write_capabilities_are_marked_as_writes():
     assert CAPABILITIES["place_order"].is_write is True
     assert CAPABILITIES["cancel_order"].is_write is True
     assert CAPABILITIES["get_balance"].is_write is False
+
+
+# ---- sizing an order in money instead of shares ---------------------------
+#
+# Robinhood sizes a dollar-based order in money and leaves the share count null
+# until it fills. Before `notional` existed the journal recorded that such a
+# trade happened and not how large it was, silently: `quantity` is optional, so
+# the row was never dropped and nothing logged.
+
+def _orders_cap(**fields):
+    """A `list_orders` map over the field paths a caller cares about."""
+    base = {"order_id": ["id"], "symbol": ["symbol"]}
+    return Capability(tool="get_equity_orders", items=["data.orders"],
+                      fields={**base, **fields})
+
+
+def test_a_dollar_based_order_reads_its_size_into_notional():
+    from nakagai_edge.capability import read_row
+    cap = _orders_cap(quantity=["quantity"], notional=["dollar_based_amount"])
+    row = read_row("list_orders", cap,
+                   {"id": "ord-1", "symbol": "nvda", "quantity": None,
+                    "dollar_based_amount": "250.00"})
+    assert row == {"order_id": "ord-1", "symbol": "NVDA", "notional": 250.0}
+    # Absent, not zero. A reader must be able to tell "sized in dollars" from
+    # "zero shares", which is the distinction `coerce` returning None protects.
+    assert "quantity" not in row
+
+
+def test_a_share_based_order_reads_quantity_and_no_notional():
+    from nakagai_edge.capability import read_row
+    cap = _orders_cap(quantity=["quantity"], notional=["dollar_based_amount"])
+    row = read_row("list_orders", cap,
+                   {"id": "ord-2", "symbol": "nvda", "quantity": "3"})
+    assert row == {"order_id": "ord-2", "symbol": "NVDA", "quantity": 3.0}
+    assert "notional" not in row
+
+
+def test_notional_is_a_separate_word_and_never_becomes_quantity():
+    """The units guard, and the reason this is two fields rather than a
+    fallback path on one.
+
+    `first()` takes the earliest non-None path, so declaring
+    `quantity: [quantity, dollar_based_amount]` WOULD fill the field, with
+    dollars, in a share count, and nothing downstream could tell. The module
+    docstring states the invariant this protects: a wrong map "can never make
+    `quantity` mean notional". Keeping the words separate is what makes that
+    true rather than aspirational.
+    """
+    assert "notional" in CAPABILITIES["list_orders"].optional
+    assert "quantity" in CAPABILITIES["list_orders"].optional
+    # Neither is required, so an order sized either way still journals.
+    assert CAPABILITIES["list_orders"].required == ("order_id", "symbol")
+
+
+def test_notional_is_numeric_not_a_relayed_display_string():
+    """FLOAT beside `quantity` and `fill_price`, not VERBATIM beside `equity`.
+
+    A size is arithmetic; a balance is a figure the broker worded. Getting this
+    backwards would hand the platform a string where it stores a float.
+    """
+    cap = _orders_cap(notional=["dollar_based_amount"])
+    assert coerce("notional", "250.00", cap) == 250.0
+    assert coerce("notional", "not a number", cap) is None
+    assert coerce("notional", True, cap) is None
