@@ -4,6 +4,13 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The recovery lever. A release rides the push to main, so when GitHub
+  # throttles webhook delivery, as it did during the Actions outage on
+  # 2026-08-06, the push event is never delivered, no run is created, and the
+  # publish does not happen. That state does not heal when Actions recovers,
+  # because there is no run to retry and nothing queued: 0.2.8 sat merged and
+  # unpublished with no way to fire it by hand. This is that way.
+  workflow_dispatch:
 
 # Read-only by default. The one job that needs more says so itself.
 permissions:
@@ -45,7 +52,14 @@ jobs:
     # inside a single workflow. A separate file would have to re-run the suite
     # or chain off workflow_run, and both buy machinery for nothing.
     needs: [test, wheel]
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    # workflow_dispatch is here so a throttled or lost push can be replayed by
+    # hand. It widens WHO can start the job, never WHAT gets published: the ref
+    # is still pinned to main, `needs` still means the tests and the wheel
+    # passed, the `pypi` environment below is still the real fence, and the
+    # version gate still refuses anything already on the index.
+    if: >-
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+      && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     # The environment is the real fence, not the `if` above. An OIDC token is
     # minted only for a job asking for id-token: write, and a fork's pull
