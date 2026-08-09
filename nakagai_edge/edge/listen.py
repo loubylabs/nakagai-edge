@@ -73,7 +73,8 @@ def _named(*fields):
 # same reason every other renderer names its fields: the registry is a security
 # boundary, and a nested list is not exempt from it just because it is nested.
 _DIGEST_ROW = ("symbol", "direction", "shape", "sessions", "confluence_max",
-               "confluence_latest", "timeframes", "latest_bar_ts")
+               "confluence_latest", "timeframes", "replay_provenance",
+               "latest_bar_ts")
 
 # How many rows survive rendering. The platform caps at 20; this is the
 # independent ceiling, because a renderer that trusted the sender's cap would
