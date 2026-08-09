@@ -112,11 +112,11 @@ enters your agent's config.
 
 ### What is on the endpoint
 
-As it ships today: 16 tools the edge serves itself, plus 17 of the platform's
-promoted to first-class names, 33 in all. Six platform tools share a name with
-one the edge already serves (`agent_checkin`, `call_connector`, `get_approval`,
-`get_connector_status`, `list_connector_tools`, `send_message`). The local tool
-wins outright; nothing is ever exposed twice, and nothing is ever prefixed.
+The edge serves its own broker, approval, check-in, and room-aware chat tools,
+then promotes the eligible platform tools to first-class names. Local tools win
+when a name overlaps. Nothing is exposed twice or prefixed. `await_events` is
+never promoted into the edge MCP server. `nakagai-edge listen` is the event
+reader for an edge-connected agent.
 
 A promoted name is the same call typed a shorter way. It travels the same
 guarded door as `call_connector`: the same classification, the same approval
@@ -167,25 +167,57 @@ have tuned is left alone and reported as left alone.
 nakagai-edge listen
 ```
 
-It holds the platform's chat channel open and prints one JSON object per owner
-message on stdout, `{"seq", "text", "from", "at", "cursor"}`. Point your agent at
-those lines and have it answer with the `send_message` tool. While it runs, the
-web app's chat pane reports "Agent connected", because the platform counts an
-agent as present only while a poll is genuinely held.
+It holds the platform's chat channel open and prints one safe, server-routed JSON
+object per eligible event on stdout. Point your agent at those lines and have it
+use the local chat tools. While it runs, the web app's chat pane reports "Agent
+connected", because the platform counts an agent as present only while a poll is
+genuinely held.
+
+Every emitted line retains the event envelope fields `seq`, `kind`, `at`, and
+`cursor`, plus these server-authored routing fields when present: `room_id`,
+`reply_to_seq`, `sender_agent_id`, `dispatch_mode`, `response_required`,
+`claim_required`, `claim_expires_at`, `retry_at`, `recipient_status`,
+`recipient_count`, `source_seq`, and `hop_count`. The edge only renders the safe
+body fields for that event kind. It does not infer room membership, claim
+authority, or whether a reply is required.
+
+The local chat tools are:
+
+- `list_peers()`, which returns the live, same-account peer directory.
+- `claim_message(message_seq)`, which claims or renews an actionable Anyone
+  request.
+- `send_message(text, room_id, idempotency_key, reply_to_seq=0)`, which sends
+  a room-scoped message or linked reply.
+- `request_peer(agent_ids, text, idempotency_key, source_seq=0)`, which creates
+  an owner-visible Desk request for selected peers.
 
 Notes that matter:
 
 * **One listener per edge.** A second one refuses to start. Two would both
-  receive every message and both answer it.
-* **Dedupe on `seq`.** Delivery is at-least-once and `send_message` carries no
-  idempotency key, so a re-delivery you answer twice posts twice.
+  receive the same routed work and could race to claim it.
+* **Dedupe on `seq`, retry with `idempotency_key`.** Delivery is at-least-once.
+  Preserve a stable idempotency key when retrying a claim-linked response or a
+  peer request, so the platform returns the original accepted write instead of
+  publishing another one.
 * **A first-ever run starts from now.** It will not replay your history. After
   that the read position is kept in `cache/channel-cursor.json`, so a gap between
   runs is picked up on the next start. `--replay` (default 20) bounds that to the
   **newest** N messages of the gap, since the recent end is the part still worth
   answering; it says on stderr how many it skipped.
-* Only owner messages are printed. Signals, briefings, and approval events are
-  dropped rather than fed to an agent.
+* **Read the envelope before acting.** `response_required` is server-authored.
+  An addressed `agent_msg` can be context only, while an `agent_request` can
+  require a response. Signals, briefings, approvals, and other hidden events
+  still advance the cursor without becoming stdout lines.
+* **Claim first when required.** If `claim_required` is true, call
+  `claim_message(seq)` before reasoning or using another tool. A `409` is an
+  ordinary coordination outcome. `already_claimed`, `claim_lost`, and
+  `already_responded` return their structured JSON bodies, including `retry_at`
+  when the platform has one. A retry hint can schedule work, but the next
+  `agent_checkin` also returns unresolved, claimable work.
+* **Keep replies linked and room-scoped.** Use the event's `room_id`, its `seq`
+  as `reply_to_seq`, and a stable `idempotency_key` with `send_message`. Use
+  `list_peers` before `request_peer`; peer requests are visible to the owner in
+  Desk and are never a private agent channel.
 * **Chat is never mandate-gated.** The kill switch halts trading authority, not
   speech: a halted agent must still be able to tell you that it is halted.
 

@@ -5,6 +5,16 @@ import subprocess
 import sys
 
 
+def test_edge_release_is_chat_protocol_030():
+    import tomllib
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    project = tomllib.loads((root / "pyproject.toml").read_text())["project"]
+
+    assert project["version"] == "0.3.0"
+
+
 def test_edge_imports_nothing_from_the_platform():
     """A fresh interpreter, not this one: the platform's own tests run in the
     same pytest session and import `nakagai.*` long before this test does, so

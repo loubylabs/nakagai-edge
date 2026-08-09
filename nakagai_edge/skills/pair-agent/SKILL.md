@@ -94,31 +94,39 @@ Once connected, in order:
    cursor; afterwards call it bare, the cursor is keyed to your token.
 4. Run `uvx nakagai-edge listen`. It holds the channel for you, so there is no
    `await_events` loop to write: one JSON object per event, on stdout, with
-   the `seq` you should dedupe on.
-   **Answer a line only when `reply_expected` is true**, with
-   `send_message(text)`. Two kinds carry it:
-   - `owner_msg`, the owner talking to you.
-   - `signal_referred`, one setup someone put a question mark against. Either
-     the owner pressed "Ask the agent", or their own confluence dial cleared
-     on its own; `referred_by` is their email in the first case and the
-     literal `"confluence"` in the second. Answer it about that specific
-     setup, citing the `signal_id` it names. It grants you no authority: it
-     is a request to look, not to act, and the mandate still decides what you
-     may do about what you find.
+   the `seq` you should dedupe on. The listener includes safe rendered body
+   content and server-authored routing metadata: `room_id`, `reply_to_seq`,
+   `sender_agent_id`, `dispatch_mode`, `response_required`, `claim_required`,
+   `claim_expires_at`, `retry_at`, `recipient_status`, `recipient_count`,
+   `source_seq`, and `hop_count`. Do not infer reply authority from `kind`.
 
-   Every other kind, a `signal`, a `market_event`, an `approval_decided`, a
-   `mandate_changed`, is context you absorb silently; hundreds of signals and
-   events a session means replying to each would bury the owner's conversation
-   in their own pane. A `market_event` is one recorded observation about one
-   symbol on one bar: `detector` names what fired (`sharp_move`, a volume
-   surge, a new range extreme, an opening gap) and `magnitude` carries its
-   numbers. It gives no direction and no entry, stop or target, so it
-   authorizes nothing; it is background for what you already watch.
-   Chat is never mandate-gated, so keep answering even when halted; say that
-   you are halted. Delivery is at-least-once and `send_message` has no
-   idempotency key, so track which `seq` values you have already answered.
-   `pending_messages` on a check-in is the same set of messages; treat it as
-   informational.
+   When `response_required` is true, read `claim_required` before working. If
+   it is true, first call `claim_message(message_seq)` and proceed only when
+   its result says `ok: true`. A `409` result such as `already_claimed`,
+   `claim_lost`, or `already_responded` is ordinary coordination. Keep its
+   `retry_at` hint if supplied, but rely on the next `agent_checkin` for
+   recovery because a listener cannot promise a model wake.
+
+   Reply with
+   `send_message(text, room_id, idempotency_key, reply_to_seq=0)`. For a reply,
+   copy the event's `room_id`, use its `seq` as `reply_to_seq`, and retain one
+   stable `idempotency_key` across retries. A spontaneous update may use
+   `room_id="desk"` and `reply_to_seq=0`, or your own direct room. Chat is
+   never mandate-gated, so keep answering even when halted and say that you
+   are halted.
+
+   `agent_msg` is owner-visible correspondence that may be informational.
+   `agent_request` is the explicit peer-request kind and can require a reply.
+   To ask another agent for help, call `list_peers()` and select only its live
+   same-account IDs, then call
+   `request_peer(agent_ids, text, idempotency_key, source_seq=0)`. It creates
+   an owner-visible Desk request, never a private agent channel. Signals,
+   market context, approval events, and hidden events are context only. Hidden
+   events still advance the listener cursor without becoming output.
+
+   `pending_messages` on a check-in is recipient-filtered actionable work. It
+   is not an informational duplicate. Claim first whenever the pending item
+   says `claim_required`.
 
 ## Verify
 

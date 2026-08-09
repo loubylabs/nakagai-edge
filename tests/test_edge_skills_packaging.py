@@ -49,3 +49,18 @@ def test_every_skill_has_name_and_description(wheel):
             assert body.startswith("---\n"), f"{name} has no frontmatter"
             head = body.split("---")[1]
             assert "name:" in head and "description:" in head, f"{name} frontmatter is incomplete"
+
+
+def test_paired_agent_skill_teaches_room_aware_chat_protocol(wheel):
+    body = wheel.read("nakagai_edge/skills/pair-agent/SKILL.md").decode()
+
+    assert "send_message(text)" not in body
+    assert "no idempotency key" not in body
+    for required in (
+        "list_peers()",
+        "claim_message(message_seq)",
+        "room_id",
+        "idempotency_key",
+        "request_peer(agent_ids, text, idempotency_key, source_seq=0)",
+    ):
+        assert required in body
