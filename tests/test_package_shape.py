@@ -5,7 +5,7 @@ import subprocess
 import sys
 
 
-def test_edge_release_is_chat_protocol_030():
+def test_edge_release_version_is_031():
     import tomllib
     from pathlib import Path
 
