@@ -5,14 +5,14 @@ import subprocess
 import sys
 
 
-def test_edge_release_is_chat_protocol_030():
+def test_edge_release_version_is_031():
     import tomllib
     from pathlib import Path
 
     root = Path(__file__).resolve().parent.parent
     project = tomllib.loads((root / "pyproject.toml").read_text())["project"]
 
-    assert project["version"] == "0.3.0"
+    assert project["version"] == "0.3.1"
 
 
 def test_readme_describes_listener_context_and_unbounded_promotion():
