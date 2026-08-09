@@ -171,11 +171,13 @@ have tuned is left alone and reported as left alone.
 nakagai-edge listen
 ```
 
-It holds the platform's chat channel open and prints one JSON object per owner
-message on stdout, `{"seq", "text", "from", "at", "cursor"}`. Point your agent at
-those lines and have it answer with the `send_message` tool. While it runs, the
-web app's chat pane reports "Agent connected", because the platform counts an
-agent as present only while a poll is genuinely held.
+It holds the platform's channel open and prints one field-filtered JSON object
+per delivered event on stdout. Every line carries `seq`, `kind`, `at`, `cursor`,
+and `reply_expected`; an owner message also carries `text` and `from`. Point
+your agent at those lines and have it answer through `send_message` only when
+`reply_expected` is true. While the listener runs, the web app reports the
+agent as connected, because the platform counts an agent as present only while
+a poll is genuinely held.
 
 Notes that matter:
 
@@ -188,8 +190,11 @@ Notes that matter:
   runs is picked up on the next start. `--replay` (default 20) bounds that to the
   **newest** N messages of the gap, since the recent end is the part still worth
   answering; it says on stderr how many it skipped.
-* Only owner messages are printed. Signals, briefings, and approval events are
-  dropped rather than fed to an agent.
+* **Three events ask for a reply:** owner messages, referred signals, and the
+  daily signal digest. Ordinary signals, approval decisions, mandate changes,
+  market events, and edge-version notices are delivered as context with
+  `reply_expected: false`. External-news briefings and unknown future event
+  kinds are dropped; neither can write unchecked prose into agent context.
 * **Chat is never mandate-gated.** The kill switch halts trading authority, not
   speech: a halted agent must still be able to tell you that it is halted.
 
