@@ -100,8 +100,16 @@ def test_listener_emits_an_owner_message_through_the_real_stack(tmp_path, platfo
     # a fresh listener would anchor to now and skip it, which is the point.
     CursorStore(root).save(0)
 
-    web.post("/api/channel/message", json={"text": "owner says hi"},
-             headers={**AUTH, "X-User": "chris@nakag.ai"})
+    response = web.post("/api/channel/message", json={
+                            "room_id": "desk",
+                            "text": "owner says hi",
+                            "client_message_id": "edge-owner-says-hi",
+                            "mode": "anyone",
+                            "agent_ids": [],
+                            "reply_to_seq": 0,
+                        },
+                        headers={**AUTH, "X-User": "chris@nakag.ai"})
+    assert response.status_code == 200
 
     # Two passes, not one: a resumed cursor means the listener is catching up,
     # and a gap is buffered until a poll comes back empty so the trim can keep
