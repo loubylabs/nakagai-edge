@@ -61,6 +61,89 @@ def test_approval_round_trip_paths():
                     ("POST", "/api/agent/audit")]
 
 
+def test_chat_protocol_request_shapes():
+    def handler(request):
+        assert request.headers["x-nakagai-chat-protocol"] == "2"
+        if request.url.path == "/api/agent/messages/41/claim":
+            assert request.method == "POST"
+            assert request.content == b""
+        elif request.url.path == "/api/agent/message":
+            assert request.method == "POST"
+            assert json.loads(request.content) == {
+                "text": "answer",
+                "room_id": "desk",
+                "idempotency_key": "reply-1",
+                "reply_to_seq": 41,
+            }
+        elif request.url.path == "/api/agent/requests":
+            assert request.method == "POST"
+            assert json.loads(request.content) == {
+                "agent_ids": ["a2", "a3"],
+                "text": "please review",
+                "idempotency_key": "peer-1",
+                "source_seq": 40,
+            }
+        elif request.url.path == "/api/agent/peers":
+            assert request.method == "GET"
+            assert request.content == b""
+        else:
+            raise AssertionError(request.url.path)
+        return httpx.Response(200, json={"ok": True})
+
+    client = PlatformClient("https://api.test", "nk_agent_t",
+                            transport=_transport(handler))
+    client.claim_message(41)
+    client.send_message("answer", "desk", "reply-1", reply_to_seq=41)
+    client.request_peer(["a2", "a3"], "please review", "peer-1", source_seq=40)
+    client.list_peers()
+
+
+def test_chat_protocol_header_only_covers_chat_routes():
+    def handler(request):
+        chat_protocol = request.headers.get("x-nakagai-chat-protocol")
+        if request.url.path == "/api/agent/bundle":
+            assert chat_protocol is None
+            return httpx.Response(200, json={"bundle_version": "v1"})
+        assert request.url.path in {"/api/agent/checkin", "/api/agent/events"}
+        assert chat_protocol == "2"
+        return httpx.Response(200, json={"ok": True, "events": []})
+
+    client = PlatformClient("https://api.test", "nk_agent_t",
+                            transport=_transport(handler))
+    client.get_bundle()
+    client.agent_checkin("idle")
+    client.await_events(timeout_s=0)
+
+
+def test_chat_conflict_body_is_returned_intact():
+    conflict = {
+        "ok": False,
+        "error": "already_claimed",
+        "claimant": {"agent_id": "a1", "name": "Claude"},
+        "claim_expires_at": "2026-08-08T22:05:00+00:00",
+        "retry_at": "2026-08-08T22:05:00+00:00",
+    }
+
+    def handler(request):
+        assert request.url.path == "/api/agent/messages/41/claim"
+        return httpx.Response(409, json=conflict)
+
+    client = PlatformClient("https://api.test", "nk_agent_t",
+                            transport=_transport(handler))
+    assert client.claim_message(41) == conflict
+
+
+def test_chat_protocol_upgrade_error_preserves_server_detail():
+    def handler(request):
+        return httpx.Response(426, json={
+            "detail": "edge_upgrade_required: minimum edge version 0.3.0"})
+
+    client = PlatformClient("https://api.test", "nk_agent_t",
+                            transport=_transport(handler))
+    with pytest.raises(EdgeClientError, match="edge_upgrade_required.*0.3.0"):
+        client.list_peers()
+
+
 def test_state_agent_json_round_trip(tmp_path):
     s = EdgeState(tmp_path)
     assert s.agent() is None
