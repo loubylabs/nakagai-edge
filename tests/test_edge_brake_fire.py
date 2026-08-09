@@ -821,8 +821,8 @@ async def test_a_quote_discarded_every_tick_counts_as_a_famine(tmp_path):
 async def test_the_brake_fires_while_the_gated_tool_surface_refuses(tmp_path):
     """The brake's exemption, pinned against the gate that now covers more.
 
-    Promoting the platform's tools put every one of them behind `_gate()`, so
-    policy staleness now refuses nearly everything an agent can reach. brake.py
+    Every promoted eligible platform tool is behind `_gate()`, so policy
+    staleness now refuses nearly everything an agent can reach. brake.py
     documents its own exit path as "Deliberately NOT gated on policy freshness
     or on the kill switch", because a stop supervisor that switches off with
     everything else is not a safety device, and nothing pinned the two facts
