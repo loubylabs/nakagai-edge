@@ -40,7 +40,12 @@ AUDIT_SHIP_INTERVAL_S = 30
 # The platform, as the edge dials it. sync.py rewrites this one registry entry
 # to point at the real platform with the agent's own bearer token.
 PLATFORM_CONNECTOR = "nakagai-mcp"
-NEVER_PROMOTE = {"await_events"}
+# Correspondence has one local edge surface. It does not go through either
+# platform-tool promotion or raw connector calls, because `nakagai-edge listen`
+# is the only event reader and the linked tools carry the wire contract.
+RESERVED_PLATFORM_TOOLS = {
+    "await_events", "list_peers", "claim_message", "send_message", "request_peer",
+}
 
 
 STALE_POLICY = {"is_error": True, "error":
@@ -304,6 +309,13 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
             args = json.loads(args_json or "{}")
         except json.JSONDecodeError as e:
             return json.dumps({"is_error": True, "error": f"bad args_json: {e}"})
+        if connector_id == PLATFORM_CONNECTOR and tool in RESERVED_PLATFORM_TOOLS:
+            audit.record("denial", connector_id, tool,
+                         {"reason": "reserved local edge correspondence tool"})
+            return json.dumps({
+                "is_error": True,
+                "error": f"platform tool {tool!r} is reserved for local edge correspondence",
+            })
         return json.dumps(await _guarded(connector_id, tool, args), default=str)
 
     @mcp.tool()
@@ -825,7 +837,7 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
             return
         for descriptor in listing.get("tools") or []:
             name = descriptor.get("name")
-            if not name or name in local or name in NEVER_PROMOTE:
+            if not name or name in local or name in RESERVED_PLATFORM_TOOLS:
                 continue
             _register_forwarder(name, descriptor)
 

@@ -174,7 +174,23 @@ async def test_collisions_resolve_to_the_local_tool(edge):
     assert not [n for n in names
                 if n.startswith("platform_") or n.startswith("nakagai_")]
     await edge.call("list_peers")
-    assert platform_mcp.calls == [], "send_message went upstream; the local one must win"
+    assert platform_mcp.calls == [], "list_peers went upstream; the local one must win"
+
+
+@pytest.mark.parametrize("name, args", [
+    ("await_events", {}),
+    ("list_peers", {}),
+    ("claim_message", {"message_seq": 41}),
+    ("send_message", {"text": "answer", "room_id": "desk", "idempotency_key": "reply-1"}),
+    ("request_peer", {"agent_ids": ["a2"], "text": "check", "idempotency_key": "ask-1"}),
+], ids=["event-reader", "peers", "claim", "message", "request"])
+async def test_reserved_chat_tools_never_reach_the_platform_connector(edge, name, args):
+    doc = await edge.call("call_connector", connector_id=PLATFORM, tool=name,
+                          args_json=json.dumps(args))
+
+    assert doc["is_error"] is True
+    assert "reserved" in doc["error"]
+    assert platform_mcp.calls == []
 
 
 async def test_a_promoted_call_reaches_the_platform_with_what_was_asked(edge):

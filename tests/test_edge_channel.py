@@ -176,6 +176,8 @@ async def test_send_message_tool_reports_transport_failure_as_json(
     """The try/except in the wrapper, not the underlying method: a broken
     platform must come back as {"is_error": true, ...}, never as a raised
     exception through call_tool."""
+    _, _, token = platform
+
     def handler_500(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, content=b"platform is down")
 
