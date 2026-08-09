@@ -729,9 +729,9 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
 
     # ---- the platform's own tools, under names an agent can find ---------
     #
-    # The platform is already a connector, so its tools were always reachable,
-    # but only as `call_connector("nakagai-mcp", ...)`, which is a capability
-    # nobody discovers. Each one gets a first-class name here.
+    # Eligible platform tools are reachable through `call_connector`, which is
+    # a capability nobody discovers. Each eligible tool gets a first-class name
+    # here. Reserved correspondence tools remain local to the edge.
     #
     # Generated, not hand-written: there is a single upstream with no dialect
     # to reconcile, its docstrings are already written dense for agents, and a
@@ -749,8 +749,9 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         restatement of them that could disagree.
 
         None for a schema this cannot express (an argument name that is not a
-        Python identifier). Such a tool is left unpromoted rather than promoted
-        with an argument silently missing; `call_connector` still reaches it.
+        Python identifier). Such an eligible tool is left unpromoted rather than
+        promoted with an argument silently missing; `call_connector` still
+        reaches it.
         """
         props = (schema or {}).get("properties")
         if not isinstance(props, dict):
@@ -833,7 +834,8 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         except Exception as e:  # noqa: BLE001 (never fail startup over this)
             logging.getLogger("nakagai.edge").warning(
                 "platform tools not promoted (%s); call_connector(%r, ...) "
-                "still reaches every one of them", e, PLATFORM_CONNECTOR)
+                "still reaches eligible non-reserved tools", e,
+                PLATFORM_CONNECTOR)
             return
         for descriptor in listing.get("tools") or []:
             name = descriptor.get("name")
