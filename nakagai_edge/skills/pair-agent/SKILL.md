@@ -93,12 +93,13 @@ Once connected, in order:
 3. `get_signals(since="today")` on the very first call to bootstrap your
    cursor; afterwards call it bare, the cursor is keyed to your token.
 4. Run `uvx nakagai-edge listen`. It holds the channel for you, so there is no
-   `await_events` loop to write: one JSON object per event, on stdout, with
-   the `seq` you should dedupe on. The listener includes safe rendered body
-   content and server-authored routing metadata: `room_id`, `reply_to_seq`,
-   `sender_agent_id`, `dispatch_mode`, `response_required`, `claim_required`,
-   `claim_expires_at`, `retry_at`, `recipient_status`, `recipient_count`,
-   `source_seq`, and `hop_count`. Do not infer reply authority from `kind`.
+   `await_events` loop to write: one JSON object per eligible event, on stdout,
+   with the `seq` you should dedupe on. Every emitted object includes `seq`, `kind`, `at`, and `cursor`, followed by server-authored routing metadata:
+   `room_id`, `reply_to_seq`, `sender_agent_id`, `dispatch_mode`,
+   `response_required`, `claim_required`, `claim_expires_at`, `retry_at`,
+   `recipient_status`, `recipient_count`, `source_seq`, and `hop_count`. The
+   listener includes safe rendered body content only. Do not infer reply
+   authority from `kind`.
 
    When `response_required` is true, read `claim_required` before working. If
    it is true, first call `claim_message(message_seq)` and proceed only when

@@ -56,10 +56,23 @@ def test_paired_agent_skill_teaches_room_aware_chat_protocol(wheel):
 
     assert "send_message(text)" not in body
     assert "no idempotency key" not in body
+    assert "one JSON object per eligible event, on stdout" in body
     for required in (
         "list_peers()",
         "claim_message(message_seq)",
+        "`seq`, `kind`, `at`, and `cursor`",
         "room_id",
+        "reply_to_seq",
+        "sender_agent_id",
+        "dispatch_mode",
+        "response_required",
+        "claim_required",
+        "claim_expires_at",
+        "retry_at",
+        "recipient_status",
+        "recipient_count",
+        "source_seq",
+        "hop_count",
         "idempotency_key",
         "request_peer(agent_ids, text, idempotency_key, source_seq=0)",
     ):
