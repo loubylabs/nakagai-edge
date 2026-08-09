@@ -57,17 +57,6 @@ def _bridged(app, token):
                           transport=httpx.MockTransport(handler))
 
 
-def test_platform_client_channel_round_trip(platform):
-    app, web, token = platform
-    client = _bridged(app, token)
-    web.post("/api/channel/message", json={"text": "you there?"},
-             headers={**AUTH, "X-User": "chris@nakag.ai"})
-    got = client.await_events(after=0, timeout_s=0)
-    assert got["events"][0]["body"]["text"] == "you there?"
-    sent = client.send_message("here")
-    assert sent["ok"] and sent["seq"] > got["cursor"]
-
-
 class _Reporter:
     """Stub for PortfolioReporter: these tests exercise the live channel
     tools, not the portfolio path, so a no-op stand-in keeps their intent
@@ -134,15 +123,52 @@ def test_listener_emits_an_owner_message_through_the_real_stack(tmp_path, platfo
     assert CursorStore(root).load() == emitted[-1]["cursor"]
 
 
-async def test_send_message_tool_returns_ok_and_seq(tmp_path, platform):
-    app, web, token = platform
-    client = _bridged(app, token)
+async def test_claim_loss_returns_the_platform_json_and_no_other_call(tmp_path):
+    calls = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append((req.method, req.url.path))
+        return httpx.Response(409, json={
+            "ok": False, "error": "claim_lost", "retry_at": "2026-08-08T22:05:00+00:00"})
+
+    client = PlatformClient("https://platform.test", "token",
+                            transport=httpx.MockTransport(handler))
     mcp = _edge_mcp(tmp_path / "edge", client)
 
-    result = await mcp.call_tool("send_message", {"text": "edge agent here"})
-    out = _tool_json(result)
-    assert out == {"ok": True, "seq": out["seq"]}
-    assert isinstance(out["seq"], int)
+    result = await mcp.call_tool("claim_message", {"message_seq": 41})
+    assert _tool_json(result) == {
+        "ok": False, "error": "claim_lost", "retry_at": "2026-08-08T22:05:00+00:00"}
+    assert calls == [("POST", "/api/agent/messages/41/claim")]
+
+
+async def test_linked_chat_tools_send_only_their_direct_platform_requests(tmp_path):
+    calls = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        calls.append((req.method, req.url.path, json.loads(req.content)))
+        return httpx.Response(200, json={"ok": True})
+
+    client = PlatformClient("https://platform.test", "token",
+                            transport=httpx.MockTransport(handler))
+    mcp = _edge_mcp(tmp_path / "edge", client)
+
+    sent = await mcp.call_tool("send_message", {
+        "text": "answer", "room_id": "desk", "idempotency_key": "reply-1",
+        "reply_to_seq": 41})
+    requested = await mcp.call_tool("request_peer", {
+        "agent_ids": ["a2"], "text": "please check", "idempotency_key": "ask-1",
+        "source_seq": 41})
+
+    assert _tool_json(sent) == {"ok": True}
+    assert _tool_json(requested) == {"ok": True}
+    assert calls == [
+        ("POST", "/api/agent/message", {
+            "text": "answer", "room_id": "desk", "idempotency_key": "reply-1",
+            "reply_to_seq": 41}),
+        ("POST", "/api/agent/requests", {
+            "agent_ids": ["a2"], "text": "please check", "idempotency_key": "ask-1",
+            "source_seq": 41}),
+    ]
 
 
 async def test_send_message_tool_reports_transport_failure_as_json(
@@ -150,7 +176,7 @@ async def test_send_message_tool_reports_transport_failure_as_json(
     """The try/except in the wrapper, not the underlying method: a broken
     platform must come back as {"is_error": true, ...}, never as a raised
     exception through call_tool."""
-    app, web, token = platform
+    _, _, token = platform
 
     def handler_500(request: httpx.Request) -> httpx.Response:
         return httpx.Response(500, content=b"platform is down")
@@ -159,6 +185,7 @@ async def test_send_message_tool_reports_transport_failure_as_json(
                             transport=httpx.MockTransport(handler_500))
     mcp = _edge_mcp(tmp_path / "edge", broken)
 
-    result = await mcp.call_tool("send_message", {"text": "hello?"})
+    result = await mcp.call_tool("send_message", {
+        "text": "hello?", "room_id": "desk", "idempotency_key": "reply-1"})
     out = _tool_json(result)
     assert out["is_error"] is True

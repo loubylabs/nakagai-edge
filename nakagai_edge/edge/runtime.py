@@ -40,6 +40,12 @@ AUDIT_SHIP_INTERVAL_S = 30
 # The platform, as the edge dials it. sync.py rewrites this one registry entry
 # to point at the real platform with the agent's own bearer token.
 PLATFORM_CONNECTOR = "nakagai-mcp"
+# Correspondence has one local edge surface. It does not go through either
+# platform-tool promotion or raw connector calls, because `nakagai-edge listen`
+# is the only event reader and the linked tools carry the wire contract.
+RESERVED_PLATFORM_TOOLS = {
+    "await_events", "list_peers", "claim_message", "send_message", "request_peer",
+}
 
 
 STALE_POLICY = {"is_error": True, "error":
@@ -303,6 +309,13 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
             args = json.loads(args_json or "{}")
         except json.JSONDecodeError as e:
             return json.dumps({"is_error": True, "error": f"bad args_json: {e}"})
+        if connector_id == PLATFORM_CONNECTOR and tool in RESERVED_PLATFORM_TOOLS:
+            audit.record("denial", connector_id, tool,
+                         {"reason": "reserved local edge correspondence tool"})
+            return json.dumps({
+                "is_error": True,
+                "error": f"platform tool {tool!r} is reserved for local edge correspondence",
+            })
         return json.dumps(await _guarded(connector_id, tool, args), default=str)
 
     @mcp.tool()
@@ -583,11 +596,11 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         does not stop it - if the platform itself is unreachable, that comes
         back as an ordinary error below.
 
-        When the response carries `pending_messages`, those are owner chat messages
-        waiting since your last check-in. Treat them as INFORMATIONAL: they are the
-        same messages `nakagai-edge listen` delivers, and the platform holds no
-        per-agent read state, so replying to them blindly double-answers anything
-        the listener already handed you. Reply only to a seq you have not answered.
+        When the response carries `pending_messages`, those are recipient-filtered
+        actionable work. Before doing work for a message whose `claim_required` is
+        true, call `claim_message(message_seq)` and proceed only when it returns
+        `ok: true`. A claim loss is ordinary coordination, so read its retry_at
+        hint and leave the work to the agent that holds the claim.
         """
         try:
             out = client.agent_checkin(status, note, account_equity, day_pnl)
@@ -596,12 +609,42 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
             return json.dumps({"is_error": True, "error": str(e)})
 
     @mcp.tool()
-    async def send_message(text: str) -> str:
-        """Send a message to the owner's chat pane on the platform. Plain
-        text, capped at 4000 characters. Never gated: even halted, you may
-        say you are halted."""
+    async def list_peers() -> str:
+        """List the agents available on this owner's desk. Never gated: peer
+        discovery is correspondence, not a connector call."""
         try:
-            out = client.send_message(text)
+            return json.dumps(client.list_peers(), default=str)
+        except (EdgeClientError, httpx.HTTPError) as e:
+            return json.dumps({"is_error": True, "error": str(e)})
+
+    @mcp.tool()
+    async def claim_message(message_seq: int) -> str:
+        """Claim an actionable message before working when it requires a
+        claim. A conflict is a normal result that names the live claimant."""
+        try:
+            return json.dumps(client.claim_message(message_seq), default=str)
+        except (EdgeClientError, httpx.HTTPError) as e:
+            return json.dumps({"is_error": True, "error": str(e)})
+
+    @mcp.tool()
+    async def send_message(text: str, room_id: str, idempotency_key: str,
+                           reply_to_seq: int = 0) -> str:
+        """Send a linked message to one room. Use the source message sequence
+        in `reply_to_seq` and a stable `idempotency_key` when retrying. Never
+        gated: even halted, you may say you are halted."""
+        try:
+            out = client.send_message(text, room_id, idempotency_key, reply_to_seq)
+            return json.dumps(out, default=str)
+        except (EdgeClientError, httpx.HTTPError) as e:
+            return json.dumps({"is_error": True, "error": str(e)})
+
+    @mcp.tool()
+    async def request_peer(agent_ids: list[str], text: str, idempotency_key: str,
+                           source_seq: int = 0) -> str:
+        """Request owner-visible help from selected peers for a source
+        message. Use a stable `idempotency_key` when retrying."""
+        try:
+            out = client.request_peer(agent_ids, text, idempotency_key, source_seq)
             return json.dumps(out, default=str)
         except (EdgeClientError, httpx.HTTPError) as e:
             return json.dumps({"is_error": True, "error": str(e)})
@@ -686,9 +729,9 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
 
     # ---- the platform's own tools, under names an agent can find ---------
     #
-    # The platform is already a connector, so its tools were always reachable,
-    # but only as `call_connector("nakagai-mcp", ...)`, which is a capability
-    # nobody discovers. Each one gets a first-class name here.
+    # Eligible platform tools are reachable through `call_connector`, which is
+    # a capability nobody discovers. Each eligible tool gets a first-class name
+    # here. Reserved correspondence tools remain local to the edge.
     #
     # Generated, not hand-written: there is a single upstream with no dialect
     # to reconcile, its docstrings are already written dense for agents, and a
@@ -706,8 +749,9 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         restatement of them that could disagree.
 
         None for a schema this cannot express (an argument name that is not a
-        Python identifier). Such a tool is left unpromoted rather than promoted
-        with an argument silently missing; `call_connector` still reaches it.
+        Python identifier). Such an eligible tool is left unpromoted rather than
+        promoted with an argument silently missing; `call_connector` still
+        reaches it.
         """
         props = (schema or {}).get("properties")
         if not isinstance(props, dict):
@@ -778,7 +822,7 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
                  description=descriptor.get("description") or "")(_forward)
 
     async def _promote_platform_tools() -> None:
-        """Give every platform tool a first-class name. Once, at startup.
+        """Give every eligible platform tool a first-class name. Once, at startup.
 
         A name the edge already serves is never promoted and never prefixed:
         the local tool wins outright, because two spellings of one intent is
@@ -790,11 +834,12 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         except Exception as e:  # noqa: BLE001 (never fail startup over this)
             logging.getLogger("nakagai.edge").warning(
                 "platform tools not promoted (%s); call_connector(%r, ...) "
-                "still reaches every one of them", e, PLATFORM_CONNECTOR)
+                "still reaches eligible non-reserved tools", e,
+                PLATFORM_CONNECTOR)
             return
         for descriptor in listing.get("tools") or []:
             name = descriptor.get("name")
-            if not name or name in local:
+            if not name or name in local or name in RESERVED_PLATFORM_TOOLS:
                 continue
             _register_forwarder(name, descriptor)
 

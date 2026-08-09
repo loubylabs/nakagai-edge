@@ -10,6 +10,10 @@ import httpx
 from nakagai_edge.identity import package_version
 
 
+CHAT_PROTOCOL_VERSION = "2"
+CHAT_PROTOCOL_HEADER = "X-Nakagai-Chat-Protocol"
+
+
 class EdgeClientError(Exception):
     """The platform refused or could not be reached.
 
@@ -101,6 +105,14 @@ class PlatformClient:
                                   resp.status_code)
         return resp.json()
 
+    def _chat_headers(self) -> dict[str, str]:
+        return {CHAT_PROTOCOL_HEADER: CHAT_PROTOCOL_VERSION}
+
+    def _chat_result(self, resp: httpx.Response) -> dict:
+        if resp.status_code in {200, 409}:
+            return resp.json()
+        return self._check(resp)
+
     def get_bundle(self, etag: str = "") -> tuple[str, dict | None]:
         headers = {"If-None-Match": etag} if etag else {}
         resp = self._client.get("/api/agent/bundle", headers=headers)
@@ -145,21 +157,44 @@ class PlatformClient:
         # does (nakagai.mandate.record_checkin). This is the edge's only
         # route to the autopilot daily-loss breaker's equity figure - the
         # platform holds no broker credentials to read it itself.
-        return self._check(self._client.post("/api/agent/checkin", json={
-            "status": status, "note": note, "account_equity": account_equity,
-            "day_pnl": day_pnl}))
+        return self._chat_result(self._client.post(
+            "/api/agent/checkin", headers=self._chat_headers(), json={
+                "status": status, "note": note, "account_equity": account_equity,
+                "day_pnl": day_pnl}))
 
     def await_events(self, after: int = 0, timeout_s: float = 50) -> dict:
         # The one PlatformClient call whose response is SUPPOSED to take up
         # to the hold cap: give httpx a read timeout past it, or every quiet
         # hold would surface as a transport error.
-        return self._check(self._client.get(
+        return self._chat_result(self._client.get(
             "/api/agent/events", params={"after": after, "timeout_s": timeout_s},
+            headers=self._chat_headers(),
             timeout=httpx.Timeout(15.0, read=float(timeout_s) + 10.0)))
 
-    def send_message(self, text: str) -> dict:
-        return self._check(self._client.post("/api/agent/message",
-                                             json={"text": text}))
+    def list_peers(self) -> dict:
+        return self._chat_result(self._client.get(
+            "/api/agent/peers", headers=self._chat_headers()))
+
+    def claim_message(self, message_seq: int) -> dict:
+        return self._chat_result(self._client.post(
+            f"/api/agent/messages/{message_seq}/claim",
+            headers=self._chat_headers()))
+
+    def send_message(self, text: str, room_id: str, idempotency_key: str,
+                     reply_to_seq: int = 0) -> dict:
+        return self._chat_result(self._client.post(
+            "/api/agent/message", headers=self._chat_headers(), json={
+                "text": text, "room_id": room_id,
+                "idempotency_key": idempotency_key,
+                "reply_to_seq": reply_to_seq}))
+
+    def request_peer(self, agent_ids: list[str], text: str,
+                     idempotency_key: str, source_seq: int = 0) -> dict:
+        return self._chat_result(self._client.post(
+            "/api/agent/requests", headers=self._chat_headers(), json={
+                "agent_ids": agent_ids, "text": text,
+                "idempotency_key": idempotency_key,
+                "source_seq": source_seq}))
 
     def report_connectors(self, connectors: list[dict]) -> dict:
         # What this edge can currently reach, so the owner sees it in the web UI

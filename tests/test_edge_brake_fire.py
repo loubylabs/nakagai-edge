@@ -8,8 +8,11 @@ is the safe direction.
 """
 
 import asyncio
+import hashlib
+import json
 import threading
 
+import httpx
 import pytest
 
 pytest.importorskip("cryptography")
@@ -19,6 +22,7 @@ from nakagai_edge.config import ConnectorSpec, load_specs
 from nakagai_edge.edge import brake as brake_module
 from nakagai_edge.edge.audit import EdgeAudit
 from nakagai_edge.edge.brake import Brake
+from nakagai_edge.edge.client import PlatformClient
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.supervision import load, record
 from nakagai_edge.edge.sync import BUNDLE_SCHEMA, apply_bundle
@@ -209,7 +213,7 @@ class FakeClient:
         self.messages = []
         self.executions = []
 
-    def send_message(self, text):
+    def send_message(self, text, room_id, idempotency_key, reply_to_seq=0):
         self.messages.append(text)
         return {"ok": True}
 
@@ -246,9 +250,9 @@ class ThreadRecordingClient(FakeClient):
         super().__init__()
         self.threads = []
 
-    def send_message(self, text):
+    def send_message(self, text, room_id, idempotency_key, reply_to_seq=0):
         self.threads.append(threading.get_ident())
-        return super().send_message(text)
+        return super().send_message(text, room_id, idempotency_key, reply_to_seq)
 
     def report_execution(self, approval_id, **kw):
         self.threads.append(threading.get_ident())
@@ -266,6 +270,36 @@ def _brake(tmp_path, hub, *, stale=False, client=None):
         state.meta_path.write_text('{"etag": "v1", "fetched_at": 1.0}')
     client = FakeClient() if client is None else client
     return state, client, Brake(state, hub, client, EdgeAudit(state))
+
+
+async def test_brake_alert_reaches_the_chat_protocol_endpoint(tmp_path):
+    calls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json={"ok": True})
+
+    client = PlatformClient("https://platform.test", "nk_agent_t",
+                            transport=httpx.MockTransport(handler))
+    state, _, brake = _brake(tmp_path, MalformedPositionsHub(), client=client)
+    record(state, _rec())
+
+    await brake.fire(load(state)["ap_1"], now=1000.0)
+
+    assert len(calls) == 1
+    request = calls[0]
+    assert request.method == "POST"
+    assert request.url.path == "/api/agent/message"
+    assert request.headers["x-nakagai-chat-protocol"] == "2"
+    assert json.loads(request.content) == {
+        "text": ("The brake could not confirm AAPL with the broker and did "
+                 "NOT fire. That position is unguarded until a pass can read it."),
+        "room_id": "desk",
+        "idempotency_key": "brake-" + hashlib.sha256(
+            b"refusal:ap_1:the broker would not confirm the position; "
+            b"not firing blind:armed:1000.0").hexdigest(),
+        "reply_to_seq": 0,
+    }
 
 
 async def test_a_breach_places_a_market_exit(tmp_path):
@@ -787,8 +821,8 @@ async def test_a_quote_discarded_every_tick_counts_as_a_famine(tmp_path):
 async def test_the_brake_fires_while_the_gated_tool_surface_refuses(tmp_path):
     """The brake's exemption, pinned against the gate that now covers more.
 
-    Promoting the platform's tools put every one of them behind `_gate()`, so
-    policy staleness now refuses nearly everything an agent can reach. brake.py
+    Every promoted eligible platform tool is behind `_gate()`, so policy
+    staleness now refuses nearly everything an agent can reach. brake.py
     documents its own exit path as "Deliberately NOT gated on policy freshness
     or on the kill switch", because a stop supervisor that switches off with
     everything else is not a safety device, and nothing pinned the two facts

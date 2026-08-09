@@ -1,13 +1,15 @@
 """Installing the packaged skills onto disk, without eating an owner's edit."""
 
+from nakagai_edge.edge import skills
 from nakagai_edge.edge.install import install_skills
 
 
 def test_install_writes_every_skill(tmp_path):
     dest, manifest = tmp_path / "skills", tmp_path / "manifest.json"
     report = install_skills(dest, manifest=manifest)
-    assert (dest / "halt" / "SKILL.md").is_file()
-    assert "halt" in report.written
+    expected = skills.list_skills()
+    assert report.written == expected
+    assert all((dest / name / "SKILL.md").is_file() for name in expected)
 
 
 def test_reinstall_is_idempotent(tmp_path):

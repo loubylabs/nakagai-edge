@@ -54,10 +54,17 @@ def edge_mcp(tmp_path):
                            Brake(state, hub, client, audit))
 
 
-def test_list_skills_returns_all_six():
-    assert set(skills.list_skills()) >= {
-        "connect-edge", "pair-agent", "verify-edge",
-        "daily-brief", "halt", "check-the-evidence"}
+def test_list_skills_returns_the_canonical_eight():
+    assert skills.list_skills() == [
+        "check-the-evidence",
+        "connect-edge",
+        "daily-brief",
+        "halt",
+        "nakagai-chat",
+        "pair-agent",
+        "verify",
+        "verify-edge",
+    ]
 
 
 def test_read_skill_returns_the_body():

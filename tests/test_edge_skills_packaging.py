@@ -62,3 +62,41 @@ def test_every_skill_has_name_and_description(wheel):
             assert body.startswith("---\n"), f"{name} has no frontmatter"
             head = body.split("---")[1]
             assert "name:" in head and "description:" in head, f"{name} frontmatter is incomplete"
+
+
+def test_paired_agent_skill_teaches_room_aware_chat_protocol(wheel):
+    body = wheel.read("nakagai_edge/skills/pair-agent/SKILL.md").decode()
+
+    assert "send_message(text)" not in body
+    assert "no idempotency key" not in body
+    assert "one JSON object per eligible event, on stdout" in body
+    for required in (
+        "list_peers()",
+        "claim_message(message_seq)",
+        "`seq`, `kind`, `at`, and `cursor`",
+        "room_id",
+        "reply_to_seq",
+        "sender_agent_id",
+        "dispatch_mode",
+        "response_required",
+        "claim_required",
+        "claim_expires_at",
+        "retry_at",
+        "recipient_status",
+        "recipient_count",
+        "source_seq",
+        "hop_count",
+        "idempotency_key",
+        "request_peer(agent_ids, text, idempotency_key, source_seq=0)",
+    ):
+        assert required in body
+
+
+def test_live_chat_skill_teaches_the_same_room_aware_protocol(wheel):
+    body = wheel.read("nakagai_edge/skills/nakagai-chat/SKILL.md").decode()
+
+    assert "prints owner messages as JSON" not in body
+    assert "response_required" in body
+    assert "claim_required" in body
+    assert "claim_message(message_seq)" in body
+    assert "send_message(text, room_id, idempotency_key, reply_to_seq=0)" in body

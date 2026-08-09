@@ -5,6 +5,28 @@ import subprocess
 import sys
 
 
+def test_edge_release_is_chat_protocol_030():
+    import tomllib
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    project = tomllib.loads((root / "pyproject.toml").read_text())["project"]
+
+    assert project["version"] == "0.3.0"
+
+
+def test_readme_describes_listener_context_and_unbounded_promotion():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parent.parent
+    readme = (root / "README.md").read_text()
+    normalized = " ".join(readme.split())
+
+    assert "Signals and approvals are emitted as non-actionable context" in normalized
+    assert "Hidden or unregistered events advance the cursor without becoming stdout lines" in normalized
+    assert "seventeen" not in readme
+
+
 def test_edge_imports_nothing_from_the_platform():
     """A fresh interpreter, not this one: the platform's own tests run in the
     same pytest session and import `nakagai.*` long before this test does, so

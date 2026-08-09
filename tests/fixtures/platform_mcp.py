@@ -1,12 +1,12 @@
 """A stand-in for the platform's own MCP server, as the edge dials it.
 
-It advertises the same twenty-three tools `nakagai_platform/mcp_server.py`
+It advertises the same twenty-six tools `nakagai_platform/mcp_server.py`
 serves, with their real signatures, because promotion is DERIVED from those
 schemas: a fixture that simplified them would prove the promotion works on a
-shape the platform never sends. Six of the names collide with the edge's own
+shape the platform never sends. Nine of the names collide with the edge's own
 tools on purpose (agent_checkin, call_connector, get_approval,
-get_connector_status, list_connector_tools, send_message); that collision is
-the point of half the tests.
+get_connector_status, list_connector_tools, list_peers, claim_message,
+send_message, request_peer); that collision is the point of half the tests.
 
 Every tool answers with the arguments it received and records them in `calls`,
 so a test can assert what actually arrived rather than that something did. A
@@ -48,9 +48,29 @@ async def await_events(timeout_s: float = 50, cursor: int = 0) -> str:
 
 
 @mcp.tool()
-def send_message(text: str) -> str:
+def list_peers() -> str:
+    """The peers on this owner's desk."""
+    return _echo("list_peers", {})
+
+
+@mcp.tool()
+def claim_message(message_seq: int) -> str:
+    """Claim one actionable message."""
+    return _echo("claim_message", locals())
+
+
+@mcp.tool()
+def send_message(text: str, room_id: str, idempotency_key: str,
+                 reply_to_seq: int = 0) -> str:
     """Say something to the owner. Collides with the edge's own send_message."""
     return _echo("send_message", locals())
+
+
+@mcp.tool()
+def request_peer(agent_ids: list[str], text: str, idempotency_key: str,
+                 source_seq: int = 0) -> str:
+    """Ask selected peers for owner-visible help."""
+    return _echo("request_peer", locals())
 
 
 @mcp.tool()

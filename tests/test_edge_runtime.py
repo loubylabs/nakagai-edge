@@ -194,6 +194,48 @@ async def test_agent_checkin_platform_error_returns_is_error_json(tmp_path):
     assert "revoked" in doc["error"]
 
 
+async def test_local_chat_tools_are_available_while_policy_is_stale(
+        tmp_path, monkeypatch):
+    """Chat is direct platform correspondence, never a connector call."""
+    seen = []
+
+    def handler(req):
+        seen.append((req.method, req.url.path, json.loads(req.content or b"{}")))
+        return httpx.Response(200, json={"ok": True, "seq": 17})
+
+    state = _state(tmp_path)
+    client = PlatformClient("https://api.test", "t", transport=httpx.MockTransport(handler))
+    hub = build_hub(state, client)
+    audit = EdgeAudit(state)
+    mcp = create_edge_mcp(state, hub, client, audit, _Reporter(),
+                          Brake(state, hub, client, audit))
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: real() + 1000)
+
+    result = await mcp.call_tool("list_peers", {})
+    assert json.loads(result.content[0].text) == {"ok": True, "seq": 17}
+    assert seen == [("GET", "/api/agent/peers", {})]
+
+
+async def test_chat_tool_schemas_are_linked_and_await_events_is_absent(tmp_path):
+    state = _state(tmp_path)
+    client = PlatformClient("https://api.test", "t",
+                            transport=httpx.MockTransport(lambda r: httpx.Response(200, json={})))
+    hub = build_hub(state, client)
+    audit = EdgeAudit(state)
+    mcp = create_edge_mcp(state, hub, client, audit, _Reporter(),
+                          Brake(state, hub, client, audit))
+
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+    assert {"list_peers", "claim_message", "send_message", "request_peer"} <= tools.keys()
+    assert "await_events" not in tools
+    assert tools["send_message"].input_schema["required"] == [
+        "text", "room_id", "idempotency_key"]
+    assert "reply_to_seq" not in tools["send_message"].input_schema["required"]
+    assert tools["request_peer"].input_schema["required"] == [
+        "agent_ids", "text", "idempotency_key"]
+
+
 async def test_write_tool_edge_client_error_returns_is_error_json(tmp_path):
     """A write reaching RemoteApprovalQueue.enqueue while the platform is
     down/429/404 raises EdgeClientError from PlatformClient._check. That must
