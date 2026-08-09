@@ -75,6 +75,14 @@ def test_description_comes_from_frontmatter():
     assert "stop" in skills.skill_description("halt").lower()
 
 
+def test_pair_agent_covers_direct_and_edge_onboarding():
+    body = skills.read_skill("pair-agent")
+    assert "codex mcp add" in body
+    assert "uv tool install nakagai-edge" in body
+    assert "Do not copy a direct-mode token" in body
+    assert "list_connector_tools" in body
+
+
 def test_access_does_not_use_file_path_arithmetic():
     """importlib.resources works from a zipimport; __file__ math does not. We
     assert on the mechanism because the failure only shows up in a packaging
