@@ -1,12 +1,12 @@
 """A stand-in for the platform's own MCP server, as the edge dials it.
 
-It advertises the same twenty-three tools `nakagai_platform/mcp_server.py`
+It advertises the same twenty-six tools `nakagai_platform/mcp_server.py`
 serves, with their real signatures, because promotion is DERIVED from those
 schemas: a fixture that simplified them would prove the promotion works on a
-shape the platform never sends. Six of the names collide with the edge's own
+shape the platform never sends. Nine of the names collide with the edge's own
 tools on purpose (agent_checkin, call_connector, get_approval,
-get_connector_status, list_connector_tools, send_message); that collision is
-the point of half the tests.
+get_connector_status, list_connector_tools, list_peers, claim_message,
+send_message, request_peer); that collision is the point of half the tests.
 
 Every tool answers with the arguments it received and records them in `calls`,
 so a test can assert what actually arrived rather than that something did. A
