@@ -130,7 +130,7 @@ life of that process and the log says so;
 `call_connector("nakagai-mcp", ...)` still reaches every one of them, and a
 restart picks them up. If the platform goes down after startup, the tools stay
 listed and a call comes back with an error naming the `nakagai-mcp` connector,
-because a name that fails legibly beats seventeen that silently vanish.
+because a name that fails legibly beats a set of tools that silently vanish.
 
 ## Skills
 
@@ -206,8 +206,9 @@ Notes that matter:
   answering; it says on stderr how many it skipped.
 * **Read the envelope before acting.** `response_required` is server-authored.
   An addressed `agent_msg` can be context only, while an `agent_request` can
-  require a response. Signals, briefings, approvals, and other hidden events
-  still advance the cursor without becoming stdout lines.
+  require a response. Signals and approvals are emitted as non-actionable
+  context when their registered renderer admits them. Hidden or unregistered
+  events advance the cursor without becoming stdout lines.
 * **Claim first when required.** If `claim_required` is true, call
   `claim_message(seq)` before reasoning or using another tool. A `409` is an
   ordinary coordination outcome. `already_claimed`, `claim_lost`, and
