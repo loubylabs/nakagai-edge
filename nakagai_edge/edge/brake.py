@@ -16,6 +16,7 @@ price may be believed lives here where it can be tested exhaustively.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import math
@@ -212,6 +213,12 @@ def _sent_qty(args: dict, keys: list[str]) -> float | None:
         return None
 
 
+def _notification_key(*parts: object) -> str:
+    """A stable idempotency key for one brake notification event."""
+    event = ":".join(str(part) for part in parts)
+    return "brake-" + hashlib.sha256(event.encode()).hexdigest()
+
+
 class Brake:
     """Places the exit a supervised position's warrant authorizes.
 
@@ -271,7 +278,7 @@ class Brake:
                 continue
             quote = quotes.get(rec["symbol"])
             if quote is None:
-                await self._note_blind_tick(rec, "no quote came back for it")
+                await self._note_blind_tick(rec, "no quote came back for it", now)
                 continue
             why_not = usable(quote, self._prior.get(pid), now)
             if why_not:
@@ -279,7 +286,7 @@ class Brake:
                 # brake nor reset a run already underway.
                 log.warning("brake discarded a quote for %s: %s",
                             rec["symbol"], why_not)
-                await self._note_blind_tick(rec, why_not)
+                await self._note_blind_tick(rec, why_not, now)
                 continue
             self._dry.pop(pid, None)          # sighted again
             price = quote["price"]
@@ -294,7 +301,7 @@ class Brake:
                     fired.append(pid)
         return fired
 
-    async def _note_blind_tick(self, rec: dict, why: str) -> None:
+    async def _note_blind_tick(self, rec: dict, why: str, now: float) -> None:
         """Count a tick that produced no usable observation, and say so once.
 
         A quote read the edge's own guardrails deny (the connector's quote tool
@@ -321,7 +328,8 @@ class Brake:
             f"The brake has had no usable price for {rec['symbol']} in "
             f"{blind_s}s ({dry} passes): {why}. Nothing is watching that stop "
             f"until quotes resume. If it persists, check that the quote tool "
-            f"on {rec['connector_id']} is classified as a READ.")
+            f"on {rec['connector_id']} is classified as a READ.",
+            _notification_key("famine", pid, why, now))
 
     async def _held_now(self, rec: dict) -> float | None:
         """What the broker says is held THIS INSTANT, or None if it will not say.
@@ -380,14 +388,15 @@ class Brake:
             return float(held)
         return 0.0
 
-    async def _notify(self, text: str) -> None:
+    async def _notify(self, text: str, idempotency_key: str) -> None:
         # PlatformClient is synchronous on purpose (see client.py) and every
         # other async caller wraps it. Called straight from a coroutine, a dark
         # platform stalls this loop AND the four other background loops AND the
         # MCP server for the client's whole timeout, which is exactly the
         # scenario the brake exists to survive.
         try:
-            await asyncio.to_thread(self.client.send_message, text)
+            await asyncio.to_thread(self.client.send_message, text, "desk",
+                                    idempotency_key, 0)
         except Exception:  # noqa: BLE001 (never let a message failure matter)
             pass
 
@@ -417,7 +426,8 @@ class Brake:
         if told is not None and told[1] == state and now - told[0] < NOTIFY_BACKOFF_S:
             return
         self._told[(pid, reason)] = (now, state)
-        await self._notify(text)
+        await self._notify(
+            text, _notification_key("refusal", pid, reason, state, now))
 
     async def _refuse(self, rec: dict, why_not: str, owner_text: str,
                       now: float) -> str:
@@ -573,7 +583,8 @@ class Brake:
                 mark(self.state, pid, "outcome_unknown", error=str(e))
                 await self._notify(
                     f"The brake tried to exit {rec['symbol']} and the outcome is "
-                    f"UNKNOWN: {e}. Check the broker directly; it will not retry.")
+                    f"UNKNOWN: {e}. Check the broker directly; it will not retry.",
+                    _notification_key("outcome_unknown", pid))
                 await self._report(pid, ok=False, error=str(e),
                                    outcome_unknown=True)
             return str(e)
@@ -585,5 +596,6 @@ class Brake:
         await self._report(pid, ok=True, result=result)
         await self._notify(
             f"The brake exited {rec['symbol']}: {qty:g} at the market, "
-            f"its stop of {rec['stop']:g} was touched.")
+            f"its stop of {rec['stop']:g} was touched.",
+            _notification_key("fired", pid))
         return ""
