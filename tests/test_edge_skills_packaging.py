@@ -10,7 +10,8 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[1]
 EXPECTED = {"connect-edge", "pair-agent", "verify-edge",
-            "daily-brief", "halt", "check-the-evidence"}
+            "daily-brief", "halt", "check-the-evidence",
+            "nakagai-chat", "verify"}
 
 
 @pytest.fixture(scope="module")

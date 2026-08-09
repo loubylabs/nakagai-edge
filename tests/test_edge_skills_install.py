@@ -35,7 +35,7 @@ def test_a_users_edit_is_never_overwritten(tmp_path):
 
 def test_an_unreadable_target_does_not_abort_the_install(tmp_path):
     """`connect` is the onboarding path, so one odd file must not take the other
-    five skills down with it. Unreadable is treated as the owner's, same as an
+    other skills down with it. Unreadable is treated as the owner's, same as an
     edit: we cannot prove we wrote it, so we do not touch it."""
     dest, manifest = tmp_path / "skills", tmp_path / "manifest.json"
     install_skills(dest, manifest=manifest)
