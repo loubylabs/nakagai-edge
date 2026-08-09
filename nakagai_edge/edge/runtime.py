@@ -822,7 +822,7 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
                  description=descriptor.get("description") or "")(_forward)
 
     async def _promote_platform_tools() -> None:
-        """Give every platform tool a first-class name. Once, at startup.
+        """Give every eligible platform tool a first-class name. Once, at startup.
 
         A name the edge already serves is never promoted and never prefixed:
         the local tool wins outright, because two spellings of one intent is
