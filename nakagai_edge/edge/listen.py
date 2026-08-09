@@ -3,15 +3,14 @@
 The agent is turn-based and cannot be pushed to, so something local has to hold
 the line and turn an arriving event into a wake-up. That is this module.
 
-Two classes of line come out, and the difference is the whole contract. An
-owner message is addressed to the agent and carries `reply_expected: true`, and
-so does a referred signal, the one piece of context someone has attached a
-question to. Everything else, a plain signal, a market event, an approval
-decision, a mandate change, is context the agent absorbs silently: the scanner
-writes hundreds of signals and events a session and answering each one would
-bury the owner's conversation in their own pane. A market event names what
-fired in `detector` and nothing about direction or size of trade, because it
-authorizes nothing.
+Two classes of line come out, and the difference is the whole contract. The
+platform marks reply authority with the server-authored `response_required`
+field after routing each event. Everything else, a plain signal, a market
+event, an approval decision, a mandate change, is context the agent absorbs
+silently: the scanner writes hundreds of signals and events a session and
+answering each one would bury the owner's conversation in their own pane. A
+market event names what fired in `detector` and nothing about direction or size
+of trade, because it authorizes nothing.
 RENDERERS below decides what is delivered at all, and is a security boundary.
 
 Four design points carry most of the weight:
@@ -127,7 +126,7 @@ RENDERERS = {
     # volume surge, a new range extreme, an opening gap. `detector` names which
     # of those fired. It gives no direction and no geometry, no entry, stop,
     # target or RR, so it authorizes nothing. It is context, and it is
-    # deliberately absent from REPLY_EXPECTED.
+    # deliberately not assumed actionable by the edge.
     #
     # `magnitude` is admitted where `briefing` is not, and the difference is
     # authorship rather than shape. It holds numbers computed off OHLCV bars by
@@ -161,22 +160,20 @@ RENDERERS = {
     # arriving over the channel and landing in an agent's context is exactly
     # what this registry exists to keep out. `nakagai-edge status` knows.
     "edge_update": _named("agent", "running", "server", "latest"),
+    # Correspondence is safe only after the platform has routed it to this
+    # agent. The body still carries only the verified sender's name and text.
+    "agent_msg": _named("text", "agent"),
+    "agent_request": _named("text", "agent", "agent_id"),
 }
 
-# The kinds the agent owes an answer to. Everything else is context it absorbs:
-# the scanner writes hundreds of signals a session, and replying to each would
-# bury the owner's own conversation in their pane.
-#
-# `signal_referred` is the ONE piece of context that asks for an answer, and
-# that is the point of it rather than an exception to the rule: a signal is
-# context, and a referred signal is a question. Being in this set also puts it
-# on the chat side of _flush's split trim, so a gap full of signals cannot
-# evict it.
-#
-# `signal_digest` is the second, and it is the one event in the system that can
-# afford to ask: once per account per trading day, pre-open. A digest nobody
-# answers is a digest nobody reads.
-REPLY_EXPECTED = frozenset({"owner_msg", "signal_referred", "signal_digest"})
+# Server-authored routing metadata. The platform computes each field after it
+# routes the event, so the edge copies it and never infers room or reply
+# authority from the kind or body.
+EVENT_META = (
+    "room_id", "reply_to_seq", "sender_agent_id", "dispatch_mode",
+    "response_required", "claim_required", "claim_expires_at", "retry_at",
+    "recipient_status", "recipient_count", "source_seq", "hop_count",
+)
 
 # A malformed response is a data error, not a transport one: httpx.HTTPError
 # and EdgeClientError do not cover a 200 carrying a Cloudflare interstitial
@@ -398,8 +395,8 @@ class ChannelListener:
     def _envelope(event: dict, cursor: int) -> dict | None:
         """Render one event, or None for a kind that must not be delivered.
 
-        The render is spread FIRST so the envelope's own fields always win. A
-        body naming `reply_expected` would otherwise decide for itself that the
+        The render is spread FIRST so the server envelope always wins. A body
+        naming `response_required` would otherwise decide for itself that the
         agent owes it an answer, and one naming `kind` would relabel its line in
         a stream the agent sorts by kind. No renderer names either today; the
         ordering is what keeps that a fact about the registry rather than a
@@ -410,10 +407,13 @@ class ChannelListener:
         if render is None:
             return None
         kind = event["kind"]
+        meta = {field: event.get(field, False)
+                if field == "response_required" else event.get(field)
+                for field in EVENT_META}
         return {**render(event.get("body") or {}),
                 "seq": event.get("seq"), "kind": kind,
                 "at": event.get("created_at"), "cursor": cursor,
-                "reply_expected": kind in REPLY_EXPECTED}
+                **meta}
 
     def _flush(self, pending: list[dict], *, capped: bool, requests: int) -> None:
         """Deliver the end of a gap: the NEWEST `replay`, never the oldest.
@@ -426,8 +426,8 @@ class ChannelListener:
         scanning evict the question the owner typed just before the restart,
         which is the silent loss this module exists to remove.
         """
-        chat = [i for i, m in enumerate(pending) if m["reply_expected"]]
-        context = [i for i, m in enumerate(pending) if not m["reply_expected"]]
+        chat = [i for i, m in enumerate(pending) if m["response_required"]]
+        context = [i for i, m in enumerate(pending) if not m["response_required"]]
         keep_ix = (set(chat[-self.replay:]) | set(context[-self.replay:])
                    if self.replay else set())
         keep = [m for i, m in enumerate(pending) if i in keep_ix]
