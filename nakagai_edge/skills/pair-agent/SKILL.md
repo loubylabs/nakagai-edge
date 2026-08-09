@@ -1,12 +1,14 @@
 ---
 name: pair-agent
-description: Pair a new agent with the hosted Nakagai platform (app.nakag.ai / api.nakag.ai), directly or through an edge, and run the first-session protocol. Use when a new user asks to connect an agent, mint or exchange a pairing token, or set up Claude Code against the hosted app.
+description: Pair and onboard a new MCP agent with the hosted Nakagai platform (app.nakag.ai / api.nakag.ai), either directly or through nakagai-edge. Use when asked to install the edge package, configure Codex, Claude Code, or another MCP client with an nk_agent token, exchange an edge pairing code, verify the connection, or run the first-session protocol.
 ---
 
 # Pair an agent with the hosted Nakagai platform
 
-You are the agent being paired. Pairing gets you an `nk_agent_...` bearer
-token and points your MCP client at the right endpoint. Two topologies:
+You are the agent being paired. Complete the chosen path through verification;
+do not stop after writing client configuration. Pairing gets you an
+`nk_agent_...` bearer token and points your MCP client at the right endpoint.
+Two topologies:
 
 - **Direct**: you dial the platform's own MCP at `https://api.nakag.ai/mcp/`.
   Right for signals, research, strategies, backtests. No broker access.
@@ -47,9 +49,55 @@ call.
 
 ## Step 2a: direct connection (token in hand)
 
+First verify the token without printing it. A `200` proves that the hosted
+agent surface accepts it:
+
+```bash
+read -s NAKAGAI_AGENT_TOKEN
+export NAKAGAI_AGENT_TOKEN
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  -H "Authorization: Bearer $NAKAGAI_AGENT_TOKEN" \
+  https://api.nakag.ai/api/agent/bundle
+```
+
+Configure the client the owner actually named. Do not configure every client
+found on the machine.
+
+Codex stores remote MCP configuration globally. Keep the token in the
+environment rather than writing it into `~/.codex/config.toml`:
+
+```bash
+codex mcp add nakagai --url https://api.nakag.ai/mcp/ \
+  --bearer-token-env-var NAKAGAI_AGENT_TOKEN
+codex mcp list
+```
+
+The environment variable must be present in the process that launches Codex.
+After adding the server, start a new Codex session; editing the configuration
+cannot add tools to the already-running session.
+
+Claude Code can store the header in its user-scoped MCP configuration:
+
 ```bash
 claude mcp add --transport http nakagai-platform https://api.nakag.ai/mcp/ \
-  --header "Authorization: Bearer nk_agent_..."
+  --header "Authorization: Bearer $NAKAGAI_AGENT_TOKEN"
+```
+
+For another MCP client, adapt this client-neutral block. Use its secret or
+environment-variable facility if it has one; never commit the expanded token:
+
+```json
+{
+  "mcpServers": {
+    "nakagai": {
+      "type": "http",
+      "url": "https://api.nakag.ai/mcp/",
+      "headers": {
+        "Authorization": "Bearer ${NAKAGAI_AGENT_TOKEN}"
+      }
+    }
+  }
+}
 ```
 
 Two rules that prevent the two classic failures:
@@ -64,9 +112,42 @@ Two rules that prevent the two classic failures:
 
 ## Step 2b: edge connection (pairing code in hand)
 
-Normally the edge CLI does the exchange (`uvx nakagai-edge setup <code>
---platform https://api.nakag.ai`; see the `connect-edge` skill). The
-underlying contract, for any client that must do it by hand:
+Install the published CLI as a user-level tool, then let `setup` perform the
+whole supported sequence: exchange the code, save both the token and real
+`agent_id` with private permissions, sync connector policy, register detected
+clients, and serve the local MCP endpoint.
+
+```bash
+uv tool install nakagai-edge
+nakagai-edge --version
+nakagai-edge setup <code> --platform https://api.nakag.ai
+```
+
+Use `uv tool upgrade nakagai-edge` when it is already installed. `uvx
+nakagai-edge@latest setup ...` is the no-install equivalent.
+
+Do not copy a direct-mode token into `~/.nakagai/edge/agent.json`. The edge
+also needs the matching `agent_id` for signed approvals and warrants; a blank,
+guessed, or mismatched id leaves read-only calls looking healthy while the
+approval path fails. Have the owner mint an **Edge mode** code and use `setup`
+or `pair`.
+
+If setup is intentionally driven in pieces:
+
+```bash
+nakagai-edge pair <code> --platform https://api.nakag.ai
+nakagai-edge sync
+nakagai-edge connect
+nakagai-edge restart
+nakagai-edge status
+```
+
+The local endpoint is `http://127.0.0.1:8330/mcp/`. `connect` only registers
+clients it recognizes; for any other client, use the configuration block it
+prints. Do not replace an explicitly requested direct hosted connection with
+the local edge unless the owner chose edge topology.
+
+The underlying pairing exchange, for a client that must implement it, is:
 
 ```
 POST https://api.nakag.ai/api/agents/pair
@@ -122,10 +203,18 @@ Once connected, in order:
 
 ## Verify
 
-Ask for the platform tool list (direct: list tools on the connection; edge:
-`list_connector_tools("nakagai-mcp")`). A populated list with `get_mandate`
-present means paired and connected. Then run step 3 and confirm the check-in
-lands on the owner's activity feed.
+For a direct client, confirm its MCP server list says `nakagai` is enabled,
+start a fresh client session, and list tools. A populated list containing
+`get_mandate` proves the direct connection.
+
+For an edge, require all of these:
+
+1. `nakagai-edge status` reports paired, fresh policy, and a running daemon.
+2. The local MCP client's `get_connector_status` reports `nakagai-mcp`.
+3. `list_connector_tools("nakagai-mcp")` returns a populated tool list with
+   `get_mandate` and no auth error.
+
+Then run step 3 and confirm the check-in lands on the owner's activity feed.
 
 ## Troubleshooting
 
