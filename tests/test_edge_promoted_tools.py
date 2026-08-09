@@ -34,10 +34,11 @@ pytestmark = pytest.mark.anyio
 
 PLATFORM = "nakagai-mcp"
 
-# The six names the edge already serves itself. Local always wins: never
+# Names the edge already serves itself. Local always wins: never
 # prefixed, never both. Verified against nakagai_platform/mcp_server.py.
 COLLIDE = {"agent_checkin", "call_connector", "get_approval",
-           "get_connector_status", "list_connector_tools", "send_message"}
+           "get_connector_status", "list_connector_tools", "list_peers",
+           "claim_message", "send_message", "request_peer"}
 
 # The shipped registry entry, guardrails included: this is what
 # config/connectors.yaml in the platform repo actually sends down the bundle,
@@ -140,11 +141,12 @@ async def edge(tmp_path):
 
 async def test_platform_tools_are_promoted(edge):
     names = set(await edge.names())
-    assert {"get_signals", "get_runs", "await_events", "run_backtest"} <= names
-    # Seventeen: the platform's twenty-three minus the six the edge already
-    # serves. A number, so that a promotion that quietly dropped half of them
-    # is a failure rather than a smaller success.
-    assert len(names) == 16 + 17, sorted(names)
+    assert {"get_signals", "get_runs", "run_backtest"} <= names
+    assert "await_events" not in names
+    # Sixteen: the platform's twenty-six minus the nine local collisions and
+    # the event reader. A number, so that a promotion that quietly dropped
+    # half of them is a failure rather than a smaller success.
+    assert len(names) == 19 + 16, sorted(names)
 
 
 async def test_a_promoted_tool_publishes_the_platforms_own_argument_schema(edge):
@@ -171,7 +173,7 @@ async def test_collisions_resolve_to_the_local_tool(edge):
         assert names.count(name) == 1, f"{name} is defined twice"
     assert not [n for n in names
                 if n.startswith("platform_") or n.startswith("nakagai_")]
-    await edge.call("send_message", text="hi")
+    await edge.call("list_peers")
     assert platform_mcp.calls == [], "send_message went upstream; the local one must win"
 
 

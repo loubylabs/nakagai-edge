@@ -48,9 +48,29 @@ async def await_events(timeout_s: float = 50, cursor: int = 0) -> str:
 
 
 @mcp.tool()
-def send_message(text: str) -> str:
+def list_peers() -> str:
+    """The peers on this owner's desk."""
+    return _echo("list_peers", {})
+
+
+@mcp.tool()
+def claim_message(message_seq: int) -> str:
+    """Claim one actionable message."""
+    return _echo("claim_message", locals())
+
+
+@mcp.tool()
+def send_message(text: str, room_id: str, idempotency_key: str,
+                 reply_to_seq: int = 0) -> str:
     """Say something to the owner. Collides with the edge's own send_message."""
     return _echo("send_message", locals())
+
+
+@mcp.tool()
+def request_peer(agent_ids: list[str], text: str, idempotency_key: str,
+                 source_seq: int = 0) -> str:
+    """Ask selected peers for owner-visible help."""
+    return _echo("request_peer", locals())
 
 
 @mcp.tool()
