@@ -54,10 +54,17 @@ def edge_mcp(tmp_path):
                            Brake(state, hub, client, audit))
 
 
-def test_list_skills_returns_all_six():
-    assert set(skills.list_skills()) >= {
-        "connect-edge", "pair-agent", "verify-edge",
-        "daily-brief", "halt", "check-the-evidence"}
+def test_list_skills_returns_the_canonical_eight():
+    assert skills.list_skills() == [
+        "check-the-evidence",
+        "connect-edge",
+        "daily-brief",
+        "halt",
+        "nakagai-chat",
+        "pair-agent",
+        "verify",
+        "verify-edge",
+    ]
 
 
 def test_read_skill_returns_the_body():
@@ -73,6 +80,14 @@ def test_read_skill_raises_for_unknown():
 
 def test_description_comes_from_frontmatter():
     assert "stop" in skills.skill_description("halt").lower()
+
+
+def test_pair_agent_covers_direct_and_edge_onboarding():
+    body = skills.read_skill("pair-agent")
+    assert "codex mcp add" in body
+    assert "uv tool install nakagai-edge" in body
+    assert "Do not copy a direct-mode token" in body
+    assert "list_connector_tools" in body
 
 
 def test_access_does_not_use_file_path_arithmetic():

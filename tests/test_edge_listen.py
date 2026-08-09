@@ -668,12 +668,14 @@ def test_signal_digest_renders_named_fields_through_the_nesting():
                          "direction": "LONG", "sessions": 4,
                          "confluence_max": 5, "confluence_latest": 5,
                          "timeframes": ["15m", "1h"],
+                         "replay_provenance": "mixed",
                          "latest_bar_ts": "2026-08-03T14:30:00+00:00",
                          "injected": "drop me"}]}
     out = RENDERERS["signal_digest"](body)
     assert out["total"] == 3
     assert "secret" not in out
     assert out["symbols"][0]["symbol"] == "NVDA"
+    assert out["symbols"][0]["replay_provenance"] == "mixed"
     assert "injected" not in out["symbols"][0]
 
 

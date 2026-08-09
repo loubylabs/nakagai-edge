@@ -80,7 +80,7 @@ uvx nakagai-edge connect
 The one client recognized today is Claude Code, detected by `claude` being on
 your PATH. It gets an MCP entry added with
 `claude mcp add --scope user nakagai --transport http <url>`, at user scope
-because a project-scoped entry needs a per-project approval, and the six skills
+because a project-scoped entry needs a per-project approval, and the eight skills
 below are copied into `~/.claude/skills/`. A client that is not detected is not
 an obstacle: the snippet below is the whole contract.
 
@@ -134,7 +134,7 @@ because a name that fails legibly beats a set of tools that silently vanish.
 
 ## Skills
 
-Six skills ship inside the wheel:
+Eight skills ship inside the wheel:
 
 - **`connect-edge`**: connect a local edge to a hosted platform, and diagnose
   the known failure modes.
@@ -148,6 +148,10 @@ Six skills ship inside the wheel:
   stopped.
 - **`check-the-evidence`**: pull a play's proving record before endorsing it,
   and say so plainly when there is none.
+- **`nakagai-chat`**: hold the owner's live chat channel open and answer
+  messages as they arrive.
+- **`verify`**: launch an isolated local platform and verify web, API, and MCP
+  changes end to end.
 
 A client that reads skills as files gets them installed by `connect` (Claude
 Code: `~/.claude/skills/`). Any MCP client can read exactly the same text off
