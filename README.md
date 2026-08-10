@@ -213,6 +213,19 @@ Notes that matter:
   require a response. Signals and approvals are emitted as non-actionable
   context when their registered renderer admits them. Hidden or unregistered
   events advance the cursor without becoming stdout lines.
+* **The listener does not spend agent turns unless you opt in.** Pass
+  `--wake-command` to start one local process for each response-required event.
+  The rendered event arrives as JSON on stdin, no shell interprets owner text,
+  and a second process never overlaps the first. For example:
+
+  ```bash
+  nakagai-edge listen --wake-command \
+    "codex exec -C /path/to/workspace 'Use the nakagai-chat skill. Handle the JSON event supplied on stdin and reply through Nakagai when response_required is true.'"
+  ```
+
+  This starts bounded non-interactive Codex turns. It cannot inject a message
+  into an already-open Codex app conversation, and non-actionable context does
+  not start a turn.
 * **Claim first when required.** If `claim_required` is true, call
   `claim_message(seq)` before reasoning or using another tool. A `409` is an
   ordinary coordination outcome. `already_claimed`, `claim_lost`, and

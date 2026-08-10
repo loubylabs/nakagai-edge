@@ -462,9 +462,12 @@ def _cmd_listen(args) -> int:
     what makes the owner's chat pane read "Agent connected" honestly.
     """
     import json as _json
+    import shlex as _shlex
 
-    from nakagai_edge.edge.listen import ChannelListener, ListenLock, ListenLocked
+    from nakagai_edge.edge.listen import (ChannelListener, ListenLock, ListenLocked,
+                                          _stderr_note)
     from nakagai_edge.edge.state import EdgeState, default_root
+    from nakagai_edge.edge.wake import WakeRunner
 
     state = EdgeState(default_root())
     client = _edge_client(state)
@@ -479,14 +482,25 @@ def _cmd_listen(args) -> int:
         except ListenLocked as e:
             print(_json.dumps({"ok": False, "error": str(e)}))
             return 1
+        wake = None
         try:
+            wake = (WakeRunner(_shlex.split(args.wake_command), note=_stderr_note)
+                    if args.wake_command else None)
+
+            def emit(msg):
+                print(_json.dumps(msg), flush=True)
+                if wake is not None:
+                    wake.emit(msg)
+
             return ChannelListener(
                 client, state.root,
-                emit=lambda msg: print(_json.dumps(msg), flush=True),
+                emit=emit,
                 replay=args.replay).run()
         except KeyboardInterrupt:
             return 0
         finally:
+            if wake is not None:
+                wake.close()
             lock.release()
     finally:
         # Its own block: a failed release must not skip closing the pool.
@@ -591,6 +605,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="how many of the NEWEST messages to hand back from a gap since the "
              "last run (default 20, 0 to skip the gap entirely); a first-ever "
              "run starts from now and replays nothing")
+    p_listen.add_argument(
+        "--wake-command", default="",
+        help="opt-in command for each response-required event; receives the "
+             "rendered event as JSON on stdin and never overlaps another run")
     p_listen.set_defaults(func=_cmd_listen)
 
     p_brake = sub.add_parser(
