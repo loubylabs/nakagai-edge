@@ -10,7 +10,9 @@ from nakagai_edge.approvals import (
     APPROVED,
     DENIED,
     ERROR,
+    EXPIRED,
     EXECUTED,
+    GRANTED,
     PENDING,
     ApprovalError,
     ApprovalQueue,
@@ -160,6 +162,43 @@ def test_file_clear_history_stamps_only_eligible_rows_for_one_account(tmp_path) 
     assert queue._items[a.id].cleared_at > 0
     assert queue._items[b.id].cleared_at == 0
     assert queue._items[b.id].status == DENIED
+
+
+def test_file_clear_history_preserves_every_in_flight_state(tmp_path) -> None:
+    queue = ApprovalQueue(tmp_path / "approvals.jsonl")
+    records = {
+        "pending": enqueue(queue, "account-a"),
+        "approved": enqueue(queue, "account-a"),
+        "granted": enqueue(queue, "account-a"),
+        "denied": enqueue(queue, "account-a"),
+        "expired": enqueue(queue, "account-a"),
+        "executed": enqueue(queue, "account-a"),
+        "known_error": enqueue(queue, "account-a"),
+        "unknown_error": enqueue(queue, "account-a"),
+    }
+    statuses = {
+        "pending": PENDING,
+        "approved": APPROVED,
+        "granted": GRANTED,
+        "denied": DENIED,
+        "expired": EXPIRED,
+        "executed": EXECUTED,
+        "known_error": ERROR,
+        "unknown_error": ERROR,
+    }
+    for name, record in records.items():
+        record.status = statuses[name]
+    records["unknown_error"].outcome_unknown = True
+
+    foreign = enqueue(queue, "account-b")
+    foreign.status = DENIED
+
+    assert queue.clear_history("account-a") == 4
+    for name in ("denied", "expired", "executed", "known_error"):
+        assert records[name].cleared_at > 0
+    for name in ("pending", "approved", "granted", "unknown_error"):
+        assert records[name].cleared_at == 0
+    assert foreign.cleared_at == 0
 
 
 def test_file_pending_capacity_is_per_account(tmp_path) -> None:

@@ -198,11 +198,11 @@ class BaseApprovalQueue:
         raise NotImplementedError
 
     def clear_history(self, account_key: str) -> int:
-        """Stamp `cleared_at` on every decided, reconciled record that lacks one,
-        hiding it from the owner's History view. Returns how many were stamped.
+        """Stamp `cleared_at` on denied, expired, executed, and known-outcome
+        error records that lack one. Returns how many were stamped.
 
-        Never touches pending records, and never touches `outcome_unknown` ones:
-        an unreconciled record is the only thing telling agents not to resubmit
+        Never touches pending, approved, granted, or `outcome_unknown` records.
+        An unreconciled record is the only thing telling agents not to resubmit
         an order that may be live at the broker, so it stays visible until a
         human resolves it. A hide, not a delete: `list()` keeps returning
         cleared records because budgets and reconciliation scans read it."""
@@ -479,7 +479,7 @@ class ApprovalQueue(BaseApprovalQueue):
                      if a.account_key == account_key]
             newly = [a for a in owned if self._expire_locked(a)]
             cleared = [a for a in owned
-                       if a.status != PENDING and not a.outcome_unknown
+                       if a.status in TERMINAL and not a.outcome_unknown
                        and not a.cleared_at]
             for a in cleared:
                 a.cleared_at = now
