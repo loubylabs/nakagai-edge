@@ -364,7 +364,10 @@ class Brake:
             cap = spec.capability("list_positions")
             tool, args = resolve("list_positions", cap,
                                  {"account": rec["account"]})
-            out = await self.hub.call(rec["connector_id"], tool, args)
+            out = await self.hub.call(
+                rec["connector_id"], tool, args,
+                account_key=self.hub.account_key,
+            )
         except Exception as e:  # noqa: BLE001
             log.warning("brake could not re-read %s before firing: %s",
                         rec["symbol"], e)
@@ -564,7 +567,8 @@ class Brake:
             return f"position {pid} was already claimed by another pass"
         try:
             result = await self.hub.call(rec["connector_id"], warrant["tool"],
-                                         args, approved=True)
+                                         args, account_key=self.hub.account_key,
+                                         approved=True)
         except Exception as e:  # noqa: BLE001 (the record must reflect reality)
             denied = type(e).__name__ == "GuardrailDenied"
             self.audit.record("error", rec["connector_id"], "brake",

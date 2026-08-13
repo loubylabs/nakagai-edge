@@ -122,6 +122,7 @@ async def _promoted_edge(tmp_path, *, guardrails=SHIPPED_GUARDRAILS):
 
     hub = ConnectorHub(state.root, connect=connect,
                        approvals=RemoteApprovalQueue(client, state, "ag1"))
+    hub.account_key = "ag1"
     audit = EdgeAudit(state)
     mcp = create_edge_mcp(state, hub, client, audit, _Reporter(),
                           Brake(state, hub, client, audit))

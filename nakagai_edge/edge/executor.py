@@ -229,7 +229,8 @@ async def poll_once(hub, state: EdgeState, client: PlatformClient,
 
         try:
             result = await hub.call(intent["connector_id"], intent["tool"],
-                                    intent["args"], approved=True)
+                                    intent["args"], account_key=hub.account_key,
+                                    approved=True)
         except Exception as e:  # noqa: BLE001 (the report must reflect reality)
             # Anything past the guardrails may have reached the broker.
             unknown = type(e).__name__ != "GuardrailDenied"

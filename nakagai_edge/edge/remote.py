@@ -11,7 +11,7 @@ import time
 
 from nakagai_edge.edge.client import PlatformClient
 from nakagai_edge.edge.state import EdgeState
-from nakagai_edge.approvals import Approval
+from nakagai_edge.approvals import Approval, _require_account_key
 from nakagai_edge.signing import args_hash
 
 
@@ -35,9 +35,10 @@ def drop_intent(state: EdgeState, approval_id: str) -> None:
     _write_intents(state, doc)
 
 
-def _to_approval(payload: dict) -> Approval:
+def _to_approval(account_key: str, payload: dict) -> Approval:
     fields = {k: payload[k] for k in Approval._FIELDS if k in payload}
     fields.setdefault("id", payload.get("approval_id", ""))
+    fields["account_key"] = account_key
     return Approval(**fields)
 
 
@@ -47,8 +48,8 @@ class RemoteApprovalQueue:
         self.state = state
         self.agent_id = agent_id
 
-    def enqueue(self, connector_id: str, tool: str, args: dict, *, ttl_s: int,
-                requested_by: str = "", workspace: str = "default",
+    def enqueue(self, account_key: str, connector_id: str, tool: str, args: dict, *,
+                ttl_s: int, requested_by: str = "",
                 signal_id: str = "", signal: dict | None = None,
                 notional: float = 0.0) -> Approval:
         # Forward `signal_id` to the platform: it is what the platform resolves
@@ -62,21 +63,24 @@ class RemoteApprovalQueue:
         # (see nakagai_edge/edge/executor.py); the platform decides, the edge never
         # does. `signal_id` is also carried onto the local record below so it is
         # honest about what the agent claimed.
+        _require_account_key(account_key)
         out = self.client.enqueue_approval(connector_id, tool, args, signal_id)
         doc = intents(self.state)
         doc[out["approval_id"]] = {
             "connector_id": connector_id, "tool": tool, "args": args,
             "args_hash": args_hash(args), "created_at": time.time()}
         _write_intents(self.state, doc)
-        return Approval(id=out["approval_id"], connector_id=connector_id,
+        return Approval(id=out["approval_id"], account_key=account_key,
+                        connector_id=connector_id,
                         tool=tool, args=args, status=out["status"],
                         agent_id=self.agent_id, requested_by=requested_by,
                         created_at=time.time(), expires_at=out["expires_at"],
                         signal_id=signal_id)
 
-    def get(self, approval_id: str, workspace: str | None = None) -> Approval | None:
+    def get(self, account_key: str, approval_id: str) -> Approval | None:
         from nakagai_edge.edge.client import EdgeClientError
+        _require_account_key(account_key)
         try:
-            return _to_approval(self.client.get_approval(approval_id))
+            return _to_approval(account_key, self.client.get_approval(approval_id))
         except EdgeClientError:
             return None

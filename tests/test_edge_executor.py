@@ -46,6 +46,7 @@ def _artifact(approval_id, *, args=ARGS, agent_id="ag1", expires_in=900):
 class FakeHub:
     def __init__(self):
         self.calls = []
+        self.account_key = "ag1"
 
     async def call(self, connector_id, tool, args, **kw):
         self.calls.append((connector_id, tool, args, kw))
@@ -86,14 +87,14 @@ def _setup(tmp_path, grant_status="granted", artifact=None,
 
 async def test_enqueue_records_local_intent(tmp_path):
     state, client, queue, _ = _setup(tmp_path)
-    rec = queue.enqueue("demo", "place_order", ARGS, ttl_s=900)
+    rec = queue.enqueue("ag1", "demo", "place_order", ARGS, ttl_s=900)
     assert rec.id == "a1" and rec.status == "pending"
     assert intents(state)["a1"]["tool"] == "place_order"
 
 
 async def test_granted_artifact_executes_and_reports(tmp_path):
     state, client, queue, reports = _setup(tmp_path, artifact=_artifact("a1"))
-    queue.enqueue("demo", "place_order", ARGS, ttl_s=900)
+    queue.enqueue("ag1", "demo", "place_order", ARGS, ttl_s=900)
     hub = FakeHub()
     n = await poll_once(hub, state, client, EdgeAudit(state))
     assert n == 1
@@ -105,7 +106,7 @@ async def test_granted_artifact_executes_and_reports(tmp_path):
 async def test_tampered_args_hash_never_executes(tmp_path):
     bad = _artifact("a1", args={"account_number": "463605220", "qty": 100})
     state, client, queue, reports = _setup(tmp_path, artifact=bad)
-    queue.enqueue("demo", "place_order", ARGS, ttl_s=900)
+    queue.enqueue("ag1", "demo", "place_order", ARGS, ttl_s=900)
     hub = FakeHub()
     await poll_once(hub, state, client, EdgeAudit(state))
     assert hub.calls == []
@@ -115,7 +116,7 @@ async def test_tampered_args_hash_never_executes(tmp_path):
 async def test_expired_artifact_never_executes(tmp_path):
     stale = _artifact("a1", expires_in=-10)
     state, client, queue, reports = _setup(tmp_path, artifact=stale)
-    queue.enqueue("demo", "place_order", ARGS, ttl_s=900)
+    queue.enqueue("ag1", "demo", "place_order", ARGS, ttl_s=900)
     hub = FakeHub()
     await poll_once(hub, state, client, EdgeAudit(state))
     assert hub.calls == [] and reports[0]["ok"] is False
@@ -125,7 +126,7 @@ async def test_granted_intent_deferred_on_stale_policy(tmp_path, monkeypatch):
     # expires_in is generous so the artifact itself outlives the TTL patch below;
     # this test targets the policy-freshness gate, not artifact expiry.
     state, client, queue, reports = _setup(tmp_path, artifact=_artifact("a1", expires_in=5000))
-    queue.enqueue("demo", "place_order", ARGS, ttl_s=900)
+    queue.enqueue("ag1", "demo", "place_order", ARGS, ttl_s=900)
     hub = FakeHub()
     real = time.time
     monkeypatch.setattr(time, "time", lambda: real() + 1000)  # past 900s policy TTL
@@ -138,7 +139,7 @@ async def test_granted_intent_deferred_on_stale_policy(tmp_path, monkeypatch):
 
 async def test_denied_intent_is_dropped(tmp_path):
     state, client, queue, reports = _setup(tmp_path, grant_status="denied")
-    queue.enqueue("demo", "place_order", ARGS, ttl_s=900)
+    queue.enqueue("ag1", "demo", "place_order", ARGS, ttl_s=900)
     await poll_once(FakeHub(), state, client, EdgeAudit(state))
     assert intents(state) == {} and reports == []
 
@@ -160,7 +161,7 @@ def test_scrub_recurses_into_lists(tmp_path):
 
 async def test_success_report_survives_audit_failure(tmp_path):
     state, client, queue, reports = _setup(tmp_path, artifact=_artifact("a1"))
-    queue.enqueue("demo", "place_order", ARGS, ttl_s=900)
+    queue.enqueue("ag1", "demo", "place_order", ARGS, ttl_s=900)
     hub = FakeHub()
     audit = EdgeAudit(state)
 
@@ -176,7 +177,7 @@ async def test_success_report_survives_audit_failure(tmp_path):
 
 async def test_intent_dropped_when_bookkeeping_raises(tmp_path):
     state, client, queue, reports = _setup(tmp_path, artifact=_artifact("a1"))
-    queue.enqueue("demo", "place_order", ARGS, ttl_s=900)
+    queue.enqueue("ag1", "demo", "place_order", ARGS, ttl_s=900)
     hub = FakeHub()
     audit = EdgeAudit(state)
 
@@ -216,6 +217,7 @@ async def test_edge_enqueue_still_works_with_a_cited_signal_id(tmp_path):
     hub = ConnectorHub(state.root, connect=connect_to(echo_server), approvals=queue)
     out = await hub.call("echo", "place_equity_order",
                          {"symbol": "SPY", "account_number": "1"},
+                         account_key="ag1",
                          signal_id="abc123")
     assert out["approval_required"] is True and out["approval_id"] == "a1"
     await hub.aclose()
@@ -226,7 +228,7 @@ def test_remote_enqueue_carries_signal_id_onto_the_returned_record(tmp_path):
     recomputes signal/notional from it) but never sends its own signal/notional,
     and the local record it hands back is honest about what the agent claimed."""
     state, client, queue, _ = _setup(tmp_path)
-    rec = queue.enqueue("demo", "place_order", ARGS, ttl_s=900,
+    rec = queue.enqueue("ag1", "demo", "place_order", ARGS, ttl_s=900,
                         signal_id="abc123", signal={"strategy": "ict"},
                         notional=1184.0)
     assert rec.id == "a1" and rec.signal_id == "abc123"
@@ -253,7 +255,7 @@ def test_signal_id_travels_from_edge_to_platform(tmp_path):
     client = PlatformClient("https://api.test", "nk_agent_t",
                             transport=httpx.MockTransport(handler))
     queue = RemoteApprovalQueue(client, state, "ag1")
-    queue.enqueue("demo", "place_order", ARGS, ttl_s=900, signal_id="abc123",
+    queue.enqueue("ag1", "demo", "place_order", ARGS, ttl_s=900, signal_id="abc123",
                   signal={"strategy": "ict"}, notional=1184.0)
     assert posted["signal_id"] == "abc123"
     assert "signal" not in posted and "notional" not in posted
@@ -464,9 +466,10 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
         "guardrails": {"allow_writes": True, "read_only_tools": ["get_*"],
                        "approvals": {"require_for": ["place_*"], "ttl_s": 900}}}]}))
     edge_hub = ConnectorHub(state.root, connect=connect_to(broker), approvals=queue)
+    edge_hub.account_key = agent_id
 
     # ---- half one: the platform declines to the owner, and nothing executes ----
-    rec = queue.enqueue("broker", "place_equity_order", order, ttl_s=900,
+    rec = queue.enqueue(agent_id, "broker", "place_equity_order", order, ttl_s=900,
                         signal_id=signal_id)
     assert rec.status == "pending"      # declined to a human tap, not auto-granted
 
@@ -511,7 +514,7 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
 async def test_nonjson_execution_response_cannot_rearm_intent(tmp_path):
     state, client, queue, reports = _setup(tmp_path, artifact=_artifact("a1"),
                                            broken_execution=True)
-    queue.enqueue("demo", "place_order", ARGS, ttl_s=900)
+    queue.enqueue("ag1", "demo", "place_order", ARGS, ttl_s=900)
     hub = FakeHub()
     audit = EdgeAudit(state)
     await poll_once(hub, state, client, audit)     # must not raise

@@ -122,7 +122,9 @@ async def listed_accounts(hub, spec) -> list[dict]:
     """
     cap = spec.capability("list_accounts")
     tool, args = resolve("list_accounts", cap, {})
-    payload = (await hub.call(spec.id, tool, args)).get("data")
+    payload = (await hub.call(
+        spec.id, tool, args, account_key=hub.account_key
+    )).get("data")
     rows = first(payload, cap.items) if cap.items else payload
     if not isinstance(rows, list):
         return []
@@ -153,7 +155,9 @@ async def _figures(hub, spec, account: str) -> dict:
     """
     cap = spec.capability("get_balance")
     tool, args = resolve("get_balance", cap, {"account": account})
-    payload = (await hub.call(spec.id, tool, args)).get("data")
+    payload = (await hub.call(
+        spec.id, tool, args, account_key=hub.account_key
+    )).get("data")
     figures = first(payload, cap.items) if cap.items else payload
     return figures if isinstance(figures, dict) else {}
 
@@ -180,7 +184,9 @@ async def _positions(hub, spec, account: str) -> list:
     """
     cap = spec.capability("list_positions")
     tool, args = resolve("list_positions", cap, {"account": account})
-    payload = (await hub.call(spec.id, tool, args)).get("data")
+    payload = (await hub.call(
+        spec.id, tool, args, account_key=hub.account_key
+    )).get("data")
     rows = first(payload, cap.items) if cap.items else payload
     if not isinstance(rows, list):
         return []

@@ -32,9 +32,10 @@ class EnvelopeHub:
     nested inside it, exactly as the real connector answers."""
 
     def __init__(self, responses):
+        self.account_key = "ag1"
         self.responses, self.calls = responses, []
 
-    async def call(self, connector_id, tool, args):
+    async def call(self, connector_id, tool, args, **kw):
         self.calls.append((connector_id, tool, dict(args)))
         out = self.responses[tool]
         if isinstance(out, Exception):
@@ -46,9 +47,10 @@ class FlatHub:
     """The same contract with no envelope, for the alien broker."""
 
     def __init__(self, responses):
+        self.account_key = "ag1"
         self.responses, self.calls = responses, []
 
-    async def call(self, connector_id, tool, args):
+    async def call(self, connector_id, tool, args, **kw):
         self.calls.append((connector_id, tool, dict(args)))
         out = self.responses[tool]
         if isinstance(out, Exception):

@@ -67,10 +67,11 @@ class FakeHub:
     responses prove the map is actually being followed."""
 
     def __init__(self, responses):
+        self.account_key = "ag1"
         self.responses = responses
         self.calls = []
 
-    async def call(self, connector_id, tool, args):
+    async def call(self, connector_id, tool, args, **kw):
         self.calls.append((connector_id, tool, dict(args)))
         key = (tool, str(args.get("account_number", "")))
         out = self.responses[key]
@@ -88,9 +89,10 @@ class FlatHub:
     Robinhood-shaped payload is missing the node its map names."""
 
     def __init__(self, responses):
+        self.account_key = "ag1"
         self.responses, self.calls = responses, []
 
-    async def call(self, connector_id, tool, args):
+    async def call(self, connector_id, tool, args, **kw):
         self.calls.append((connector_id, tool, dict(args)))
         return {"data": self.responses[tool]}
 
