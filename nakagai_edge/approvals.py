@@ -48,9 +48,9 @@ PENDING, APPROVED, GRANTED, DENIED, EXPIRED, EXECUTED, ERROR = (
 
 TERMINAL = {DENIED, EXPIRED, EXECUTED, ERROR}
 
-# A runaway agent must not be able to fill the disk or memory with pending
-# approvals. Enqueue past this and the request is refused outright.
-MAX_PENDING = 100
+# A runaway agent must not be able to fill one account's disk or memory with
+# pending approvals. Enqueue past this and that account's request is refused.
+APPROVAL_MAX_PENDING_PER_ACCOUNT = 100
 
 # The budget a worker gives the autopilot decision lock: how long it will wait for a
 # pooled connection, and how long a statement inside the lock transaction may run.
@@ -70,15 +70,21 @@ class DecisionLockError(ApprovalError):
     the record pending for a human); it must never auto-execute without it."""
 
 
+def _require_account_key(account_key: str) -> str:
+    if not isinstance(account_key, str) or not account_key.strip():
+        raise ValueError("account_key must be a nonempty string")
+    return account_key
+
+
 @dataclass
 class Approval:
     id: str
+    account_key: str
     connector_id: str
     tool: str
     args: dict
     status: str = PENDING
     requested_by: str = ""
-    workspace: str = "default"
     created_at: float = 0.0
     expires_at: float = 0.0
     decided_at: float = 0.0
@@ -114,8 +120,8 @@ class Approval:
     # which autoapprove.py and mandate.py read for budgets and reconciliation.
     cleared_at: float = 0.0
 
-    _FIELDS = ("id", "connector_id", "tool", "args", "status", "requested_by",
-               "workspace", "created_at", "expires_at", "decided_at", "decided_by",
+    _FIELDS = ("id", "account_key", "connector_id", "tool", "args", "status",
+               "requested_by", "created_at", "expires_at", "decided_at", "decided_by",
                "reason", "result", "error", "outcome_unknown", "agent_id", "artifact",
                "signal_id", "signal", "notional", "rationale", "cleared_at")
 
@@ -143,7 +149,7 @@ class BaseApprovalQueue:
     `enqueue`, `get`, `list`, `deny`, `_claim` (the CAS), `_finish`, `_resolve`."""
 
     @contextlib.contextmanager
-    def decision_lock(self, workspace: str, timeout_s: float = LOCK_TIMEOUT_S):
+    def decision_lock(self, account_key: str, timeout_s: float = LOCK_TIMEOUT_S):
         """Serialize autopilot's read → check → claim for one workspace, in principle.
         See `PgApprovalQueue.decision_lock` for the caveat that matters in the
         deployment that actually overrides this: with the wiring `api/app.py`
@@ -166,28 +172,32 @@ class BaseApprovalQueue:
 
         Raises `DecisionLockError` if the lock cannot be taken. The caller declines.
         """
+        _require_account_key(account_key)
         yield
 
-    def _claim(self, approval_id: str, decided_by: str, reason: str) -> Approval:
+    def _claim(self, account_key: str, approval_id: str, decided_by: str,
+               reason: str) -> Approval:
         """Atomically move pending → approved. Raise if it is not claimable."""
         raise NotImplementedError
 
-    def _finish(self, a: Approval, status: str, *, result=None, error: str = "",
+    def _finish(self, account_key: str, a: Approval, status: str, *, result=None,
+                error: str = "",
                 outcome_unknown: bool = False) -> Approval:
         """Record the terminal state of an approved record."""
         raise NotImplementedError
 
-    def _resolve(self, a: Approval, note: str) -> Approval:
+    def _resolve(self, account_key: str, a: Approval, note: str) -> Approval:
         """Clear `outcome_unknown` and append the human's finding to `error`."""
         raise NotImplementedError
 
-    def set_rationale(self, approval_id: str, payload: dict) -> bool:
+    def set_rationale(self, account_key: str, approval_id: str,
+                      payload: dict) -> bool:
         """Attach the copilot read. Advisory only, so unlike every decision
         method this never raises for a missing row: the generator runs in a
         fire-and-forget thread with nobody to catch."""
         raise NotImplementedError
 
-    def clear_history(self) -> int:
+    def clear_history(self, account_key: str) -> int:
         """Stamp `cleared_at` on every decided, reconciled record that lacks one,
         hiding it from the owner's History view. Returns how many were stamped.
 
@@ -198,7 +208,7 @@ class BaseApprovalQueue:
         cleared records because budgets and reconciliation scans read it."""
         raise NotImplementedError
 
-    def recent_for_symbol(self, symbol: str, *, exclude_id: str = "",
+    def recent_for_symbol(self, account_key: str, symbol: str, *, exclude_id: str = "",
                           limit: int = 5) -> list[dict]:
         """Recent approvals citing a signal for `symbol`, newest first. Feeds
         the copilot read only ("third NVDA proposal today, last two denied"),
@@ -210,7 +220,8 @@ class BaseApprovalQueue:
         `list()` before multi-tenant is safe to open."""
         raise NotImplementedError
 
-    def resolve(self, approval_id: str, *, placed: bool, note: str = "",
+    def resolve(self, account_key: str, approval_id: str, *, placed: bool,
+                note: str = "",
                 resolved_by: str = "") -> Approval:
         """Record what a human found at the broker for an `outcome_unknown` call.
 
@@ -222,7 +233,7 @@ class BaseApprovalQueue:
         `placed=True` means the order IS live at the broker; `placed=False` means
         it is not, so the action may be requested again.
         """
-        a = self.get(approval_id)
+        a = self.get(account_key, approval_id)
         if a is None:
             raise ApprovalError(f"no approval {approval_id!r}")
         if not a.outcome_unknown:
@@ -232,10 +243,10 @@ class BaseApprovalQueue:
         verdict = "REACHED the broker" if placed else "did NOT reach the broker"
         who = f" by {resolved_by}" if resolved_by else ""
         stamp = f"reconciled{who}: the call {verdict}."
-        return self._resolve(a, f"{stamp} {note}".strip())
+        return self._resolve(account_key, a, f"{stamp} {note}".strip())
 
-    async def approve(self, approval_id: str, execute, *, decided_by: str = "",
-                      reason: str = "") -> Approval:
+    async def approve(self, account_key: str, approval_id: str, execute, *,
+                      decided_by: str = "", reason: str = "") -> Approval:
         """Approve and execute, once.
 
         `execute(connector_id, tool, args) -> dict` runs the real downstream call
@@ -243,7 +254,7 @@ class BaseApprovalQueue:
         Everything after `_claim` is on the far side of the compare-and-set, so a
         second concurrent approve raises instead of placing a second order.
         """
-        a = self._claim(approval_id, decided_by, reason)
+        a = self._claim(account_key, approval_id, decided_by, reason)
         try:
             # Deep copy: a shallow dict() still shares nested order payloads, and
             # what executes must be exactly what the human read on screen.
@@ -254,10 +265,11 @@ class BaseApprovalQueue:
             # A guardrail refusal happened *before* anything left Nakagai.
             # Anything else may have reached the broker.
             unknown = type(e).__name__ != "GuardrailDenied"
-            return self._finish(a, ERROR, error=f"{type(e).__name__}: {e}",
+            return self._finish(account_key, a, ERROR,
+                                error=f"{type(e).__name__}: {e}",
                                 outcome_unknown=unknown)
         try:
-            return self._finish(a, EXECUTED, result=result)
+            return self._finish(account_key, a, EXECUTED, result=result)
         except Exception as e:  # noqa: BLE001 - the order already FILLED
             # The write left Nakagai and the broker took it. A failure to RECORD
             # that is not a failure to EXECUTE, and reporting it as one is the
@@ -295,21 +307,32 @@ class BaseApprovalQueue:
             a.status, a.result = EXECUTED, result
             return a
 
-    async def grant(self, approval_id: str, build_artifact, *,
+    async def grant(self, account_key: str, approval_id: str, build_artifact, *,
                     decided_by: str = "", reason: str = "") -> Approval:
         """Approve an EDGE-origin request: claim it (same CAS as approve), then
         record the signed artifact instead of executing. The platform holds no
         broker credentials, so execution happens at the edge, which reports
         back via record_execution()."""
-        a = self._claim(approval_id, decided_by, reason)
-        return self._grant(a, build_artifact(a))
+        a = self._claim(account_key, approval_id, decided_by, reason)
+        return self._grant(account_key, a, build_artifact(a))
 
-    def _grant(self, a: Approval, artifact: dict) -> Approval:
+    def _grant(self, account_key: str, a: Approval, artifact: dict) -> Approval:
         raise NotImplementedError
 
-    def record_execution(self, approval_id: str, agent_id: str, *, ok: bool,
+    def record_execution(self, account_key: str, approval_id: str, agent_id: str, *,
+                         ok: bool,
                          result=None, error: str = "",
                          outcome_unknown: bool = False) -> Approval:
+        raise NotImplementedError
+
+    def expire(self, account_key: str) -> list[Approval]:
+        raise NotImplementedError
+
+    def reconcile_stale(self, account_key: str) -> list[Approval]:
+        raise NotImplementedError
+
+    def _why_unclaimable(self, account_key: str,
+                         approval_id: str) -> ApprovalError:
         raise NotImplementedError
 
 
@@ -333,25 +356,12 @@ class ApprovalQueue(BaseApprovalQueue):
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue  # torn final line from a kill mid-append
-            if not isinstance(rec, dict) or "id" not in rec:
+            if (not isinstance(rec, dict) or "id" not in rec
+                    or not isinstance(rec.get("account_key"), str)
+                    or not rec["account_key"].strip()):
                 continue
             self._items[rec["id"]] = Approval(
                 **{k: rec[k] for k in Approval._FIELDS if k in rec})
-
-        # A record left `approved` means we died between the human's click and
-        # the downstream call. We cannot know whether the broker saw it. Do NOT
-        # execute it now. Surface it for a human to reconcile.
-        #
-        # GRANTED rows are deliberately NOT swept: the edge holds the signed
-        # artifact and reports the outcome via record_execution(). Only
-        # `approved` (platform-executes, died mid-call) is outcome-unknown.
-        for a in self._items.values():
-            if a.status == APPROVED:
-                a.status, a.error = ERROR, (
-                    "the server restarted after approval but before the call "
-                    "completed; check the broker before retrying")
-                a.outcome_unknown = True
-                self._journal(a)
 
     def _journal(self, a: Approval) -> None:
         if self._path is not None:
@@ -365,18 +375,21 @@ class ApprovalQueue(BaseApprovalQueue):
 
     # ---- enqueue -------------------------------------------------------
 
-    def enqueue(self, connector_id: str, tool: str, args: dict, *, ttl_s: int,
-                requested_by: str = "", workspace: str = "default", agent_id: str = "",
+    def enqueue(self, account_key: str, connector_id: str, tool: str, args: dict, *,
+                ttl_s: int, requested_by: str = "", agent_id: str = "",
                 signal_id: str = "", signal: dict | None = None,
                 notional: float = 0.0) -> Approval:
+        _require_account_key(account_key)
         now = time.time()
         with self._lock:
             pending = sum(1 for a in self._items.values()
-                          if a.status == PENDING and not a.is_expired(now))
-            if pending >= MAX_PENDING:
+                          if a.account_key == account_key and a.status == PENDING
+                          and not a.is_expired(now))
+            if pending >= APPROVAL_MAX_PENDING_PER_ACCOUNT:
                 raise ApprovalError(
                     f"{pending} approvals already await a human decision "
-                    f"(limit {MAX_PENDING}); resolve those before requesting more")
+                    f"(limit {APPROVAL_MAX_PENDING_PER_ACCOUNT}); resolve those "
+                    f"before requesting more")
             # Full 128 bits, not a short id: `get_approval(id)` is not scoped to
             # the requesting agent. The MCP tool never checks the caller's
             # identity (nakagai/identity.py) against agent_id below, so the id
@@ -388,9 +401,10 @@ class ApprovalQueue(BaseApprovalQueue):
             # Deep copy on the way in: a shallow dict() leaves nested payloads
             # (e.g. {"order": {...}}) aliased to the caller's dict, which would
             # let the requester change the order after a human read it.
-            a = Approval(id=uuid.uuid4().hex, connector_id=connector_id, tool=tool,
+            a = Approval(id=uuid.uuid4().hex, account_key=account_key,
+                         connector_id=connector_id, tool=tool,
                          args=copy.deepcopy(args), requested_by=requested_by,
-                         workspace=workspace, created_at=now, expires_at=now + ttl_s,
+                         created_at=now, expires_at=now + ttl_s,
                          agent_id=agent_id, signal_id=signal_id,
                          signal=copy.deepcopy(signal), notional=notional)
             self._items[a.id] = a
@@ -399,25 +413,26 @@ class ApprovalQueue(BaseApprovalQueue):
 
     # ---- read ----------------------------------------------------------
 
-    def get(self, approval_id: str, workspace: str | None = None) -> Approval | None:
+    def get(self, account_key: str, approval_id: str) -> Approval | None:
+        _require_account_key(account_key)
         with self._lock:
             a = self._items.get(approval_id)
-            if a is None or (workspace is not None and a.workspace != workspace):
+            if a is None or a.account_key != account_key:
                 return None
             expired = self._expire_locked(a)
         if expired:
             self._journal(a)
         return a
 
-    def list(self, status: str = "", workspace: str | None = None,
+    def list(self, account_key: str, *, status: str = "",
              limit: int = 100) -> list[dict]:
+        _require_account_key(account_key)
         with self._lock:
-            items = list(self._items.values())
+            items = [a for a in self._items.values()
+                     if a.account_key == account_key]
             newly = [a for a in items if self._expire_locked(a)]
         for a in newly:
             self._journal(a)
-        if workspace is not None:
-            items = [a for a in items if a.workspace == workspace]
         if status:
             items = [a for a in items if a.status == status]
         items.sort(key=lambda a: a.created_at)
@@ -431,13 +446,39 @@ class ApprovalQueue(BaseApprovalQueue):
             return True
         return False
 
-    def clear_history(self) -> int:
+    def expire(self, account_key: str) -> list[Approval]:
+        _require_account_key(account_key)
+        with self._lock:
+            newly = [a for a in self._items.values()
+                     if a.account_key == account_key and self._expire_locked(a)]
+        for a in newly:
+            self._journal(a)
+        return newly
+
+    def reconcile_stale(self, account_key: str) -> list[Approval]:
+        _require_account_key(account_key)
+        with self._lock:
+            stale = [a for a in self._items.values()
+                     if a.account_key == account_key and a.status == APPROVED]
+            for a in stale:
+                a.status, a.error = ERROR, (
+                    "the server restarted after approval but before the call "
+                    "completed; check the broker before retrying")
+                a.outcome_unknown = True
+        for a in stale:
+            self._journal(a)
+        return stale
+
+    def clear_history(self, account_key: str) -> int:
+        _require_account_key(account_key)
         now = time.time()
         with self._lock:
             # Sweep expiry first so a record that lapsed since the last read
             # counts as history, matching what the owner sees on the page.
-            newly = [a for a in self._items.values() if self._expire_locked(a)]
-            cleared = [a for a in self._items.values()
+            owned = [a for a in self._items.values()
+                     if a.account_key == account_key]
+            newly = [a for a in owned if self._expire_locked(a)]
+            cleared = [a for a in owned
                        if a.status != PENDING and not a.outcome_unknown
                        and not a.cleared_at]
             for a in cleared:
@@ -448,12 +489,28 @@ class ApprovalQueue(BaseApprovalQueue):
 
     # ---- decide --------------------------------------------------------
 
-    def _claim(self, approval_id: str, decided_by: str, reason: str) -> Approval:
-        """Compare-and-set pending -> approved. The single point where a
-        concurrent second approve loses."""
+    def _why_unclaimable(self, account_key: str,
+                         approval_id: str) -> ApprovalError:
+        _require_account_key(account_key)
         with self._lock:
             a = self._items.get(approval_id)
-            if a is None:
+            if a is None or a.account_key != account_key:
+                return ApprovalError(f"no approval {approval_id!r}")
+            if a.status == EXPIRED:
+                return ApprovalError(
+                    f"approval {approval_id!r} expired before a human decided")
+            return ApprovalError(
+                f"approval {approval_id!r} is already {a.status!r}; "
+                f"it cannot be decided twice")
+
+    def _claim(self, account_key: str, approval_id: str, decided_by: str,
+               reason: str) -> Approval:
+        """Compare-and-set pending -> approved. The single point where a
+        concurrent second approve loses."""
+        _require_account_key(account_key)
+        with self._lock:
+            a = self._items.get(approval_id)
+            if a is None or a.account_key != account_key:
                 raise ApprovalError(f"no approval {approval_id!r}")
             if self._expire_locked(a):
                 raise ApprovalError(f"approval {approval_id!r} expired at "
@@ -467,10 +524,12 @@ class ApprovalQueue(BaseApprovalQueue):
         self._journal(a)
         return a
 
-    def deny(self, approval_id: str, decided_by: str = "", reason: str = "") -> Approval:
+    def deny(self, account_key: str, approval_id: str, *, decided_by: str = "",
+             reason: str = "") -> Approval:
+        _require_account_key(account_key)
         with self._lock:
             a = self._items.get(approval_id)
-            if a is None:
+            if a is None or a.account_key != account_key:
                 raise ApprovalError(f"no approval {approval_id!r}")
             self._expire_locked(a)
             if a.status != PENDING:
@@ -480,35 +539,56 @@ class ApprovalQueue(BaseApprovalQueue):
         self._journal(a)
         return a
 
-    def _finish(self, a: Approval, status: str, *, result=None, error: str = "",
+    def _finish(self, account_key: str, a: Approval, status: str, *, result=None,
+                error: str = "",
                 outcome_unknown: bool = False) -> Approval:
+        _require_account_key(account_key)
         with self._lock:
-            a.status, a.result, a.error = status, result, error
-            a.outcome_unknown = outcome_unknown
+            live = self._items.get(a.id)
+            if live is None or live.account_key != account_key:
+                raise ApprovalError(f"no approval {a.id!r}")
+            live.status, live.result, live.error = status, result, error
+            live.outcome_unknown = outcome_unknown
+            a = live
         self._journal(a)
         return a
 
-    def _resolve(self, a: Approval, note: str) -> Approval:
+    def _resolve(self, account_key: str, a: Approval, note: str) -> Approval:
+        _require_account_key(account_key)
         with self._lock:
-            live = self._items.get(a.id, a)
+            live = self._items.get(a.id)
+            if live is None or live.account_key != account_key:
+                raise ApprovalError(f"no approval {a.id!r}")
+            if not live.outcome_unknown:
+                raise ApprovalError(
+                    f"approval {a.id!r} is no longer awaiting reconciliation")
             live.outcome_unknown = False
             live.error = f"{live.error}; {note}".strip(" ;")
             a = live
         self._journal(a)
         return a
 
-    def _grant(self, a: Approval, artifact: dict) -> Approval:
+    def _grant(self, account_key: str, a: Approval, artifact: dict) -> Approval:
+        _require_account_key(account_key)
         with self._lock:
-            a.status, a.artifact = GRANTED, artifact
+            live = self._items.get(a.id)
+            if live is None or live.account_key != account_key:
+                raise ApprovalError(f"no approval {a.id!r}")
+            if live.status != APPROVED:
+                raise ApprovalError(f"approval {a.id!r} could not be granted")
+            live.status, live.artifact = GRANTED, artifact
+            a = live
         self._journal(a)
         return a
 
-    def record_execution(self, approval_id: str, agent_id: str, *, ok: bool,
+    def record_execution(self, account_key: str, approval_id: str, agent_id: str, *,
+                         ok: bool,
                          result=None, error: str = "",
                          outcome_unknown: bool = False) -> Approval:
+        _require_account_key(account_key)
         with self._lock:
             a = self._items.get(approval_id)
-            if a is None:
+            if a is None or a.account_key != account_key:
                 raise ApprovalError(f"no approval {approval_id!r}")
             if a.status != GRANTED:
                 raise ApprovalError(
@@ -522,22 +602,25 @@ class ApprovalQueue(BaseApprovalQueue):
         self._journal(a)
         return a
 
-    def set_rationale(self, approval_id: str, payload: dict) -> bool:
+    def set_rationale(self, account_key: str, approval_id: str,
+                      payload: dict) -> bool:
+        _require_account_key(account_key)
         with self._lock:
             a = self._items.get(approval_id)
-            if a is None:
+            if a is None or a.account_key != account_key:
                 return False
             a.rationale = copy.deepcopy(payload)
         self._journal(a)
         return True
 
-    def recent_for_symbol(self, symbol: str, *, exclude_id: str = "",
+    def recent_for_symbol(self, account_key: str, symbol: str, *, exclude_id: str = "",
                           limit: int = 5) -> list[dict]:
+        _require_account_key(account_key)
         if not symbol:
             return []
         with self._lock:
             items = [a for a in self._items.values()
-                     if a.id != exclude_id
+                     if a.account_key == account_key and a.id != exclude_id
                      and (a.signal or {}).get("symbol") == symbol]
         items.sort(key=lambda a: a.created_at, reverse=True)
         return [{"status": a.status, "decided_by": a.decided_by,
@@ -735,10 +818,11 @@ class PgApprovalQueue(BaseApprovalQueue):
         with self.db.pool.connection() as c:
             pending = c.execute(
                 "select count(*) from approvals where status = 'pending'").fetchone()[0]
-            if pending >= MAX_PENDING:
+            if pending >= APPROVAL_MAX_PENDING_PER_ACCOUNT:
                 raise ApprovalError(
                     f"{pending} approvals already await a human decision "
-                    f"(limit {MAX_PENDING}); resolve those before requesting more")
+                    f"(limit {APPROVAL_MAX_PENDING_PER_ACCOUNT}); resolve those "
+                    f"before requesting more")
             row = c.execute(
                 f"insert into approvals (id, workspace_id, connector_id, tool, args,"
                 f" status, requested_by, expires_at, agent_id,"
