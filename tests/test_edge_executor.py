@@ -475,7 +475,7 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
 
     from nakagai_platform.gateway import get_hub
 
-    undecided = get_hub(plat).approvals.get(rec.id)
+    undecided = get_hub(plat).approvals.get(str(mandate_ctx.wid), rec.id)
     assert undecided.status == "pending"
     assert undecided.artifact is None   # nothing was signed, so nothing is executable
     assert undecided.decided_by == ""
@@ -505,7 +505,7 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
     # the platform's own record: decided by the owner, then executed by the edge.
     # assert_owner_action returns the X-User it validated, lowercased, and that
     # is what hub.decide() stamps on the record as decided_by.
-    plat_rec = get_hub(plat).approvals.get(rec.id)
+    plat_rec = get_hub(plat).approvals.get(str(mandate_ctx.wid), rec.id)
     assert plat_rec.decided_by == "chris@x.com"
     assert plat_rec.status == "executed"
     await edge_hub.aclose()
