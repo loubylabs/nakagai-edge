@@ -108,7 +108,8 @@ def _history_inputs(
     before: tuple[float, str | None] | None,
 ) -> tuple[tuple[str, ...], int, tuple[float, str | None] | None]:
     if (not isinstance(statuses, tuple) or not statuses
-            or any(status not in APPROVAL_STATUSES for status in statuses)):
+            or any(not isinstance(status, str) or status not in APPROVAL_STATUSES
+                   for status in statuses)):
         raise ValueError("statuses must be a nonempty tuple of approval statuses")
     limit = _require_page_limit(limit)
     if before is not None:

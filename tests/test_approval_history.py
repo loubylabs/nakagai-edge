@@ -188,6 +188,14 @@ def test_history_invalid_input_fails_closed(tmp_path, kwargs: dict, message: str
         queue.history("account-a", **kwargs)
 
 
+@pytest.mark.parametrize("member", [[], {}])
+def test_history_unhashable_status_members_fail_closed(tmp_path, member) -> None:
+    queue = ApprovalQueue(tmp_path / "approvals.jsonl")
+
+    with pytest.raises(ValueError, match="statuses"):
+        queue.history("account-a", statuses=(member,))
+
+
 def test_history_rejects_old_unkeyed_call(tmp_path) -> None:
     queue = ApprovalQueue(tmp_path / "approvals.jsonl")
 
