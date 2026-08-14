@@ -5,9 +5,16 @@ the only place a broker credential is ever written to disk. Your agent talks to
 exactly one MCP endpoint, the edge, and never sees a token. The platform never
 sees one either.
 
-Version 0.4.0 requires an explicit `account_key` on every local approval queue
+Version 0.4.1 requires an explicit `account_key` on every local approval queue
 operation. A paired edge uses its stable `agent_id` for that key. The key stays
 local; the hosted platform resolves account authority from the bearer token.
+
+The queue exposes two bounded owner reads. `history(account_key, statuses=...,
+limit=..., before=...)` returns uncleared records in terminal-occurrence order.
+`attention(account_key, limit=..., after=...)` returns pending and
+outcome-unknown records with an exact account-scoped total and oldest time.
+Both file and PostgreSQL modes apply the account predicate before ordering,
+cursoring, and limiting. Neither read derives tenant authority from stored data.
 
 ## Why an edge exists
 
