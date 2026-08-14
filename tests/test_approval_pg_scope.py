@@ -21,6 +21,8 @@ PG_RECORD_METHODS = (
     "enqueue",
     "get",
     "list",
+    "history",
+    "attention",
     "clear_history",
     "recent_for_symbol",
     "set_rationale",

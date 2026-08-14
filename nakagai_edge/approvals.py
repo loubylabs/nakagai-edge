@@ -34,6 +34,7 @@ import contextlib
 import copy
 import json
 import logging
+import math
 import threading
 import time
 import uuid
@@ -47,6 +48,9 @@ PENDING, APPROVED, GRANTED, DENIED, EXPIRED, EXECUTED, ERROR = (
     "pending", "approved", "granted", "denied", "expired", "executed", "error")
 
 TERMINAL = {DENIED, EXPIRED, EXECUTED, ERROR}
+APPROVAL_STATUSES = frozenset(
+    {PENDING, APPROVED, GRANTED, DENIED, EXPIRED, EXECUTED, ERROR}
+)
 
 # A runaway agent must not be able to fill one account's disk or memory with
 # pending approvals. Enqueue past this and that account's request is refused.
@@ -74,6 +78,76 @@ def _require_account_key(account_key: str) -> str:
     if not isinstance(account_key, str) or not account_key.strip():
         raise ValueError("account_key must be a nonempty string")
     return account_key
+
+
+def _require_page_limit(limit: int) -> int:
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+        raise ValueError("limit must be an integer from 1 through 1000")
+    return limit
+
+
+def _require_cursor_time(value: float) -> float:
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        raise ValueError("cursor time must be finite and nonnegative")
+    value = float(value)
+    if not math.isfinite(value) or value < 0:
+        raise ValueError("cursor time must be finite and nonnegative")
+    return value
+
+
+def _require_cursor_id(value: str | None, *, optional: bool) -> str | None:
+    if value is None and optional:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("cursor id must be a nonempty string")
+    return value
+
+
+def _history_inputs(
+    statuses: tuple[str, ...], limit: int,
+    before: tuple[float, str | None] | None,
+) -> tuple[tuple[str, ...], int, tuple[float, str | None] | None]:
+    if (not isinstance(statuses, tuple) or not statuses
+            or any(status not in APPROVAL_STATUSES for status in statuses)):
+        raise ValueError("statuses must be a nonempty tuple of approval statuses")
+    limit = _require_page_limit(limit)
+    if before is not None:
+        if not isinstance(before, tuple) or len(before) != 2:
+            raise ValueError("before must be a two-part cursor")
+        before = (
+            _require_cursor_time(before[0]),
+            _require_cursor_id(before[1], optional=True),
+        )
+    return statuses, limit, before
+
+
+def _attention_inputs(
+    limit: int, after: tuple[int, float, str] | None,
+) -> tuple[int, tuple[int, float, str] | None]:
+    limit = _require_page_limit(limit)
+    if after is not None:
+        if not isinstance(after, tuple) or len(after) != 3:
+            raise ValueError("after must be a three-part cursor")
+        group, occurred_at, approval_id = after
+        if isinstance(group, bool) or not isinstance(group, int) or group not in (0, 1):
+            raise ValueError("cursor group must be zero or one")
+        after = (
+            group,
+            _require_cursor_time(occurred_at),
+            _require_cursor_id(approval_id, optional=False),
+        )
+    return limit, after
+
+
+def _terminal_occurrence(approval: Approval) -> float:
+    value = approval.expires_at if approval.status == EXPIRED else approval.decided_at
+    return float(value or 0.0)
+
+
+def _attention_key(approval: Approval) -> tuple[int, float, str]:
+    if approval.status == ERROR and approval.outcome_unknown:
+        return (0, float(approval.decided_at or approval.created_at), approval.id)
+    return (1, float(approval.created_at), approval.id)
 
 
 @dataclass
@@ -203,6 +277,27 @@ class BaseApprovalQueue:
         an order that may be live at the broker, so it stays visible until a
         human resolves it. A hide, not a delete: `list()` keeps returning
         cleared records because budgets and reconciliation scans read it."""
+        raise NotImplementedError
+
+    def history(
+        self,
+        account_key: str,
+        *,
+        statuses: tuple[str, ...],
+        limit: int = 100,
+        before: tuple[float, str | None] | None = None,
+    ) -> list[dict]:
+        """Return one account's uncleared approval history page."""
+        raise NotImplementedError
+
+    def attention(
+        self,
+        account_key: str,
+        *,
+        limit: int = 100,
+        after: tuple[int, float, str] | None = None,
+    ) -> dict:
+        """Return one account's action-owed page and exact summary."""
         raise NotImplementedError
 
     def recent_for_symbol(self, account_key: str, symbol: str, *, exclude_id: str = "",
@@ -432,6 +527,77 @@ class ApprovalQueue(BaseApprovalQueue):
             items = [a for a in items if a.status == status]
         items.sort(key=lambda a: a.created_at)
         return [a.to_dict() for a in items[-limit:]]
+
+    def history(
+        self,
+        account_key: str,
+        *,
+        statuses: tuple[str, ...],
+        limit: int = 100,
+        before: tuple[float, str | None] | None = None,
+    ) -> list[dict]:
+        _require_account_key(account_key)
+        statuses, limit, before = _history_inputs(statuses, limit, before)
+        with self._lock:
+            owned = [
+                approval for approval in self._items.values()
+                if approval.account_key == account_key
+            ]
+            newly = [approval for approval in owned if self._expire_locked(approval)]
+            rows = []
+            for approval in owned:
+                occurred_at = _terminal_occurrence(approval)
+                if (approval.status not in statuses or approval.cleared_at
+                        or not math.isfinite(occurred_at) or occurred_at <= 0):
+                    continue
+                key = (occurred_at, approval.id)
+                if before is not None:
+                    cursor_time, cursor_id = before
+                    if cursor_id is None:
+                        if occurred_at >= cursor_time:
+                            continue
+                    elif key >= (cursor_time, cursor_id):
+                        continue
+                rows.append((key, approval.to_dict()))
+        for approval in newly:
+            self._journal(approval)
+        rows.sort(key=lambda row: row[0], reverse=True)
+        return [row for _, row in rows[:limit]]
+
+    def attention(
+        self,
+        account_key: str,
+        *,
+        limit: int = 100,
+        after: tuple[int, float, str] | None = None,
+    ) -> dict:
+        _require_account_key(account_key)
+        limit, after = _attention_inputs(limit, after)
+        with self._lock:
+            owned = [
+                approval for approval in self._items.values()
+                if approval.account_key == account_key
+            ]
+            newly = [approval for approval in owned if self._expire_locked(approval)]
+            eligible = [
+                approval for approval in owned
+                if not approval.cleared_at and (
+                    approval.status == PENDING
+                    or (approval.status == ERROR and approval.outcome_unknown)
+                )
+            ]
+            keyed = [(_attention_key(approval), approval.to_dict()) for approval in eligible]
+        for approval in newly:
+            self._journal(approval)
+        keyed.sort(key=lambda row: row[0])
+        oldest_at = min((key[1] for key, _ in keyed), default=None)
+        if after is not None:
+            keyed = [row for row in keyed if row[0] > after]
+        return {
+            "records": [row for _, row in keyed[:limit]],
+            "total": len(eligible),
+            "oldest_at": oldest_at,
+        }
 
     def _expire_locked(self, a: Approval) -> bool:
         """Caller holds the lock. Returns True if this call expired the record."""
@@ -787,6 +953,98 @@ class PgApprovalQueue(BaseApprovalQueue):
         with self.db.pool.connection() as connection:
             rows = connection.execute(sql, (*params, limit)).fetchall()
         return [self._row(row).to_dict() for row in reversed(rows)]
+
+    def history(
+        self,
+        account_key: str,
+        *,
+        statuses: tuple[str, ...],
+        limit: int = 100,
+        before: tuple[float, str | None] | None = None,
+    ) -> list[dict]:
+        _require_account_key(account_key)
+        statuses, limit, before = _history_inputs(statuses, limit, before)
+        self.expire(account_key)
+        occurrence = "case when status = 'expired' then expires_at else decided_at end"
+        placeholders = ", ".join("%s" for _ in statuses)
+        sql = (
+            f"{self._select()} where workspace_id = %s"
+            f" and status in ({placeholders})"
+            " and cleared_at is null"
+            f" and {occurrence} is not null"
+        )
+        params: tuple = (account_key, *statuses)
+        if before is not None:
+            cursor_time, cursor_id = before
+            if cursor_id is None:
+                sql += f" and {occurrence} < to_timestamp(%s)"
+                params += (cursor_time,)
+            else:
+                sql += f" and ({occurrence}, id) < (to_timestamp(%s), %s)"
+                params += (cursor_time, cursor_id)
+        sql += f" order by {occurrence} desc, id desc limit %s"
+        params += (limit,)
+        with self.db.pool.connection() as connection:
+            rows = connection.execute(sql, params).fetchall()
+        return [self._row(row).to_dict() for row in rows]
+
+    def attention(
+        self,
+        account_key: str,
+        *,
+        limit: int = 100,
+        after: tuple[int, float, str] | None = None,
+    ) -> dict:
+        _require_account_key(account_key)
+        limit, after = _attention_inputs(limit, after)
+        self.expire(account_key)
+        group = "case when status = 'error' then 0 else 1 end"
+        owed_at = (
+            "case when status = 'error' then coalesce(decided_at, created_at)"
+            " else created_at end"
+        )
+        page_columns = ", ".join(f"page.{column}" for column in self.DB_COLUMNS)
+        cursor = ""
+        params: tuple = (account_key,)
+        if after is not None:
+            cursor = (
+                " where (attention_group, owed_at, id)"
+                " > (%s, to_timestamp(%s), %s)"
+            )
+            params += after
+        sql = (
+            "with eligible as ("
+            f" select {self._columns()}, {group} as attention_group,"
+            f" {owed_at} as owed_at from approvals"
+            " where workspace_id = %s and cleared_at is null"
+            " and (status = 'pending' or (status = 'error' and outcome_unknown))"
+            "), summary as ("
+            " select count(*) as total, min(owed_at) as oldest_at from eligible"
+            ")"
+            f" select {page_columns}, summary.total,"
+            " extract(epoch from summary.oldest_at)"
+            " from summary left join lateral ("
+            f" select * from eligible{cursor}"
+            " order by attention_group, owed_at, id limit %s"
+            ") page on true"
+            " order by page.attention_group, page.owed_at, page.id"
+        )
+        params += (limit,)
+        with self.db.pool.connection() as connection:
+            rows = connection.execute(sql, params).fetchall()
+        if not rows:
+            return {"records": [], "total": 0, "oldest_at": None}
+        width = len(self.COLUMNS)
+        total, oldest_at = rows[0][width:width + 2]
+        records = [
+            self._row(row[:width]).to_dict()
+            for row in rows if row[0] is not None
+        ]
+        return {
+            "records": records,
+            "total": int(total),
+            "oldest_at": float(oldest_at) if oldest_at is not None else None,
+        }
 
     def _why_unclaimable(self, account_key: str,
                          approval_id: str) -> ApprovalError:

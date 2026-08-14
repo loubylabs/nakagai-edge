@@ -5,10 +5,10 @@ with no rationale is not, because a wrong guess is then invisible."""
 from nakagai_edge.edge.install_shape import detect
 
 
-def test_installed_distribution_is_release_040():
+def test_installed_distribution_is_release_041():
     from importlib.metadata import version
 
-    assert version("nakagai-edge") == "0.4.0"
+    assert version("nakagai-edge") == "0.4.1"
 
 
 def test_uvx_ephemeral_cache_is_one_command_with_no_follow_up():
