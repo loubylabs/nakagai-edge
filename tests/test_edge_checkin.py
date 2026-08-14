@@ -10,6 +10,7 @@ their edge agent and then arm, exactly like a direct MCP agent can.
 """
 
 import json
+import uuid
 
 import httpx
 import pytest
@@ -91,13 +92,28 @@ def platform_app(platform_root, monkeypatch):
     return create_app(platform_root, with_mcp=False)
 
 
-def _enroll(app, *, name="edge-shim") -> str:
+def _history(root, user: str):
+    from nakagai_platform.activity_history import ActivityHistory
+    from nakagai_platform.api.db import Database
+    from nakagai_platform.api.tenancy import resolve_workspace_for_email
+
+    database = Database.from_env()
+    return ActivityHistory(root, database,
+                           resolve_workspace_for_email(database, user))
+
+
+def _enroll(app, *, name="edge-shim", user=APPROVER["X-User"]) -> str:
     """Mint an agent token the way the web proxy would: approver-guarded
     POST /api/agents in mode=direct, so this test does not also have to drive
     the pairing-code exchange just to get a usable token."""
+    from nakagai_platform.api.db import Database
+
+    Database.from_env().workspace_id(user.split("@", 1)[0], user)
     r = TestClient(app).post(
         "/api/agents", json={"name": name, "mode": "direct"},
-        headers={"Authorization": "Bearer api-secret", **APPROVER})
+        headers={"Authorization": "Bearer api-secret",
+                 "X-User": user,
+                 "X-Approver-Token": APPROVER["X-Approver-Token"]})
     assert r.status_code == 200
     return r.json()["token"]
 
@@ -111,7 +127,8 @@ async def test_edge_checkin_lands_where_the_platform_can_read_it(
     agent (the defect this branch closes)."""
     from nakagai_platform import mandate as m
 
-    token = _enroll(platform_app)
+    owner = f"equity-owner-{uuid.uuid4().hex}@example.com"
+    token = _enroll(platform_app, user=owner)
     platform_client = _bridged_platform_client(platform_app, token)
     mcp = _edge_mcp(tmp_path / "edge", platform_client)
 
@@ -122,16 +139,16 @@ async def test_edge_checkin_lands_where_the_platform_can_read_it(
     out = json.loads(text)
     assert out["ok"] is True
 
-    report = m.latest_equity_report(platform_root)
+    history = _history(platform_root, owner)
+    report = m.latest_equity_report(history)
     assert report is not None
     assert report["account_equity"] == 100_000.0
     assert report["day_pnl"] == -1_500.0
 
     # And it landed under the edge agent's own name/id, not a synthetic one.
-    line = json.loads(
-        (platform_root / "results" / "agent-activity.jsonl").read_text().splitlines()[-1])
-    assert line["agent"] == "edge-shim"
-    assert line["kind"] == "checkin"
+    event = history.read(limit=1, category="agents")[0]
+    assert event.actor_label == "edge-shim"
+    assert event.kind == "checkin"
 
 
 async def test_edge_checkin_discards_half_an_equity_report(
@@ -140,14 +157,16 @@ async def test_edge_checkin_discards_half_an_equity_report(
     baseline and would read as a flat day."""
     from nakagai_platform import mandate as m
 
-    token = _enroll(platform_app)
+    owner = f"half-report-owner-{uuid.uuid4().hex}@example.com"
+    token = _enroll(platform_app, user=owner)
     platform_client = _bridged_platform_client(platform_app, token)
     mcp = _edge_mcp(tmp_path / "edge", platform_client)
 
     await mcp.call_tool("agent_checkin", {
         "status": "scanning", "account_equity": 100_000.0})   # no day_pnl
 
-    assert m.latest_equity_report(platform_root) is None
+    assert m.latest_equity_report(
+        _history(platform_root, owner)) is None
 
 
 async def test_edge_agent_can_arm_autopilot_after_checking_in_with_equity(
@@ -171,7 +190,7 @@ async def test_edge_agent_can_arm_autopilot_after_checking_in_with_equity(
     # for a harness, and exactly the anonymous write the platform closed.
     # The equity report is unaffected either way, since latest_equity_report()
     # is scoped to the root rather than to a workspace.
-    owner_email = "edge-owner@example.com"
+    owner_email = f"edge-owner-{uuid.uuid4().hex}@example.com"
     owner_headers = {"Authorization": "Bearer api-secret", "X-User": owner_email}
 
     # Seed the mandate the way /api/mandate/arm itself resolves it: the same
@@ -203,7 +222,7 @@ async def test_edge_agent_can_arm_autopilot_after_checking_in_with_equity(
     assert before.status_code == 422
     assert store.load()["autopilot_state"]["armed"] is False
 
-    token = _enroll(platform_app, name="edge-shim")
+    token = _enroll(platform_app, name="edge-shim", user=owner_email)
     platform_client = _bridged_platform_client(platform_app, token)
     mcp = _edge_mcp(tmp_path / "edge", platform_client)
     result = await mcp.call_tool("agent_checkin", {

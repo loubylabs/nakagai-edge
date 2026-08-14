@@ -1,6 +1,6 @@
 [project]
 name = "nakagai-edge"
-version = "0.4.1"
+version = "0.4.2"
 description = "Nakagai edge: the connector runtime that holds your broker credentials"
 readme = "README.md"
 license = "MIT"
