@@ -73,6 +73,7 @@ def anyio_backend():
 
 class FakeHub:
     def __init__(self, held=100.0, fail=None):
+        self.account_key = "ag1"
         self.calls = []
         self.held = held
         self.fail = fail
@@ -167,6 +168,7 @@ class MappedHub:
     """
 
     def __init__(self, payloads: dict):
+        self.account_key = "ag1"
         self.calls = []
         self.payloads = payloads
 

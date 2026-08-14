@@ -427,7 +427,7 @@ class ConnectorHub:
         return None, False
 
     async def call(self, connector_id: str, tool: str, args: dict, *,
-                   requested_by: str = "", workspace: str = "default",
+                   account_key: str, requested_by: str = "",
                    approved: bool = False, signal_id: str = "") -> dict:
         """Proxy one downstream tool call, after the guardrails clear it.
 
@@ -464,9 +464,9 @@ class ConnectorHub:
                     f"{verdict.reason}; no approval queue is configured. "
                     f"Remove this tool from approvals.require_for to allow it")
             signal, notional = self.provenance(spec, args, signal_id)
-            record = queue.enqueue(connector_id, tool, args,
+            record = queue.enqueue(account_key, connector_id, tool, args,
                                    ttl_s=spec.guardrails.approvals.ttl_s,
-                                   requested_by=requested_by, workspace=workspace,
+                                   requested_by=requested_by,
                                    signal_id=signal_id, signal=signal,
                                    notional=notional)
 
@@ -529,5 +529,4 @@ class ConnectorHub:
             else:
                 out.append(Connection(spec=spec).to_dict(with_tools=with_tools))
         return {"connectors": out}
-
 

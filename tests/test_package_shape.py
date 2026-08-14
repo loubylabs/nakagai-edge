@@ -5,14 +5,22 @@ import subprocess
 import sys
 
 
-def test_edge_release_version_is_031():
+def test_edge_release_version_is_040():
     import tomllib
     from pathlib import Path
 
     root = Path(__file__).resolve().parent.parent
     project = tomllib.loads((root / "pyproject.toml").read_text())["project"]
 
-    assert project["version"] == "0.3.2"
+    assert project["version"] == "0.4.0"
+
+    lock = (root / "uv.lock").read_text()
+    ci = (root / ".github" / "workflows" / "ci.yml").read_text()
+    readme = (root / "README.md").read_text()
+    assert 'name = "nakagai-edge"\nversion = "0.4.0"' in lock
+    assert "version('nakagai-edge') == '0.4.0'" in ci
+    assert "0.4.0" in readme
+    assert "account_key" in readme
 
 
 def test_readme_describes_listener_context_and_unbounded_promotion():

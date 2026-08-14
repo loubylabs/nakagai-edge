@@ -48,9 +48,9 @@ PENDING, APPROVED, GRANTED, DENIED, EXPIRED, EXECUTED, ERROR = (
 
 TERMINAL = {DENIED, EXPIRED, EXECUTED, ERROR}
 
-# A runaway agent must not be able to fill the disk or memory with pending
-# approvals. Enqueue past this and the request is refused outright.
-MAX_PENDING = 100
+# A runaway agent must not be able to fill one account's disk or memory with
+# pending approvals. Enqueue past this and that account's request is refused.
+APPROVAL_MAX_PENDING_PER_ACCOUNT = 100
 
 # The budget a worker gives the autopilot decision lock: how long it will wait for a
 # pooled connection, and how long a statement inside the lock transaction may run.
@@ -70,15 +70,21 @@ class DecisionLockError(ApprovalError):
     the record pending for a human); it must never auto-execute without it."""
 
 
+def _require_account_key(account_key: str) -> str:
+    if not isinstance(account_key, str) or not account_key.strip():
+        raise ValueError("account_key must be a nonempty string")
+    return account_key
+
+
 @dataclass
 class Approval:
     id: str
+    account_key: str
     connector_id: str
     tool: str
     args: dict
     status: str = PENDING
     requested_by: str = ""
-    workspace: str = "default"
     created_at: float = 0.0
     expires_at: float = 0.0
     decided_at: float = 0.0
@@ -114,8 +120,8 @@ class Approval:
     # which autoapprove.py and mandate.py read for budgets and reconciliation.
     cleared_at: float = 0.0
 
-    _FIELDS = ("id", "connector_id", "tool", "args", "status", "requested_by",
-               "workspace", "created_at", "expires_at", "decided_at", "decided_by",
+    _FIELDS = ("id", "account_key", "connector_id", "tool", "args", "status",
+               "requested_by", "created_at", "expires_at", "decided_at", "decided_by",
                "reason", "result", "error", "outcome_unknown", "agent_id", "artifact",
                "signal_id", "signal", "notional", "rationale", "cleared_at")
 
@@ -143,11 +149,8 @@ class BaseApprovalQueue:
     `enqueue`, `get`, `list`, `deny`, `_claim` (the CAS), `_finish`, `_resolve`."""
 
     @contextlib.contextmanager
-    def decision_lock(self, workspace: str, timeout_s: float = LOCK_TIMEOUT_S):
-        """Serialize autopilot's read → check → claim for one workspace, in principle.
-        See `PgApprovalQueue.decision_lock` for the caveat that matters in the
-        deployment that actually overrides this: with the wiring `api/app.py`
-        uses, "one workspace" does not describe production.
+    def decision_lock(self, account_key: str, timeout_s: float = LOCK_TIMEOUT_S):
+        """Serialize autopilot's read → check → claim for one account.
 
         The CAS below makes sure an approval is decided at most ONCE. It does not
         make the mandate's *budget* safe: `autoapprove.py` reads the day's usage
@@ -166,51 +169,54 @@ class BaseApprovalQueue:
 
         Raises `DecisionLockError` if the lock cannot be taken. The caller declines.
         """
+        _require_account_key(account_key)
         yield
 
-    def _claim(self, approval_id: str, decided_by: str, reason: str) -> Approval:
+    def _claim(self, account_key: str, approval_id: str, decided_by: str,
+               reason: str) -> Approval:
         """Atomically move pending → approved. Raise if it is not claimable."""
         raise NotImplementedError
 
-    def _finish(self, a: Approval, status: str, *, result=None, error: str = "",
+    def _finish(self, account_key: str, a: Approval, status: str, *, result=None,
+                error: str = "",
                 outcome_unknown: bool = False) -> Approval:
         """Record the terminal state of an approved record."""
         raise NotImplementedError
 
-    def _resolve(self, a: Approval, note: str) -> Approval:
+    def _resolve(self, account_key: str, a: Approval, note: str) -> Approval:
         """Clear `outcome_unknown` and append the human's finding to `error`."""
         raise NotImplementedError
 
-    def set_rationale(self, approval_id: str, payload: dict) -> bool:
+    def set_rationale(self, account_key: str, approval_id: str,
+                      payload: dict) -> bool:
         """Attach the copilot read. Advisory only, so unlike every decision
         method this never raises for a missing row: the generator runs in a
         fire-and-forget thread with nobody to catch."""
         raise NotImplementedError
 
-    def clear_history(self) -> int:
-        """Stamp `cleared_at` on every decided, reconciled record that lacks one,
-        hiding it from the owner's History view. Returns how many were stamped.
+    def clear_history(self, account_key: str) -> int:
+        """Stamp `cleared_at` on denied, expired, executed, and known-outcome
+        error records that lack one. Returns how many were stamped.
 
-        Never touches pending records, and never touches `outcome_unknown` ones:
-        an unreconciled record is the only thing telling agents not to resubmit
+        Never touches pending, approved, granted, or `outcome_unknown` records.
+        An unreconciled record is the only thing telling agents not to resubmit
         an order that may be live at the broker, so it stays visible until a
         human resolves it. A hide, not a delete: `list()` keeps returning
         cleared records because budgets and reconciliation scans read it."""
         raise NotImplementedError
 
-    def recent_for_symbol(self, symbol: str, *, exclude_id: str = "",
+    def recent_for_symbol(self, account_key: str, symbol: str, *, exclude_id: str = "",
                           limit: int = 5) -> list[dict]:
         """Recent approvals citing a signal for `symbol`, newest first. Feeds
         the copilot read only ("third NVDA proposal today, last two denied"),
         so the shape is a compact display dict, not an Approval.
 
-        Like `PgApprovalQueue.list()`, this reads with no workspace filter:
-        safe under today's single-tenant wiring, but it is not per-tenant
-        isolation, and it must be scoped in the same pass that scopes
-        `list()` before multi-tenant is safe to open."""
+        Every backend scopes this history inside the supplied account before
+        observing a record."""
         raise NotImplementedError
 
-    def resolve(self, approval_id: str, *, placed: bool, note: str = "",
+    def resolve(self, account_key: str, approval_id: str, *, placed: bool,
+                note: str = "",
                 resolved_by: str = "") -> Approval:
         """Record what a human found at the broker for an `outcome_unknown` call.
 
@@ -222,7 +228,7 @@ class BaseApprovalQueue:
         `placed=True` means the order IS live at the broker; `placed=False` means
         it is not, so the action may be requested again.
         """
-        a = self.get(approval_id)
+        a = self.get(account_key, approval_id)
         if a is None:
             raise ApprovalError(f"no approval {approval_id!r}")
         if not a.outcome_unknown:
@@ -232,10 +238,10 @@ class BaseApprovalQueue:
         verdict = "REACHED the broker" if placed else "did NOT reach the broker"
         who = f" by {resolved_by}" if resolved_by else ""
         stamp = f"reconciled{who}: the call {verdict}."
-        return self._resolve(a, f"{stamp} {note}".strip())
+        return self._resolve(account_key, a, f"{stamp} {note}".strip())
 
-    async def approve(self, approval_id: str, execute, *, decided_by: str = "",
-                      reason: str = "") -> Approval:
+    async def approve(self, account_key: str, approval_id: str, execute, *,
+                      decided_by: str = "", reason: str = "") -> Approval:
         """Approve and execute, once.
 
         `execute(connector_id, tool, args) -> dict` runs the real downstream call
@@ -243,7 +249,7 @@ class BaseApprovalQueue:
         Everything after `_claim` is on the far side of the compare-and-set, so a
         second concurrent approve raises instead of placing a second order.
         """
-        a = self._claim(approval_id, decided_by, reason)
+        a = self._claim(account_key, approval_id, decided_by, reason)
         try:
             # Deep copy: a shallow dict() still shares nested order payloads, and
             # what executes must be exactly what the human read on screen.
@@ -254,10 +260,11 @@ class BaseApprovalQueue:
             # A guardrail refusal happened *before* anything left Nakagai.
             # Anything else may have reached the broker.
             unknown = type(e).__name__ != "GuardrailDenied"
-            return self._finish(a, ERROR, error=f"{type(e).__name__}: {e}",
+            return self._finish(account_key, a, ERROR,
+                                error=f"{type(e).__name__}: {e}",
                                 outcome_unknown=unknown)
         try:
-            return self._finish(a, EXECUTED, result=result)
+            return self._finish(account_key, a, EXECUTED, result=result)
         except Exception as e:  # noqa: BLE001 - the order already FILLED
             # The write left Nakagai and the broker took it. A failure to RECORD
             # that is not a failure to EXECUTE, and reporting it as one is the
@@ -266,14 +273,14 @@ class BaseApprovalQueue:
             # position.
             #
             # So we return the truth in memory. The stored record stays `approved`
-            # and `reconcile_stale_approvals()` sweeps it to outcome_unknown, where
+            # and stale reconciliation sweeps it to outcome_unknown, where
             # a human resolves it against the broker, which is the correct
             # conservative end state: the owner is ASKED to check, never TOLD a
             # falsehood.
             #
             # That in-memory return is silent on its own, though: nobody else
             # learns this happened until the next process boot runs
-            # `reconcile_stale_approvals()` (see `_install_approval_queue()` in
+            # stale reconciliation (see `_install_approval_queue()` in
             # `nakagai/api/app.py`, which only runs once, at startup, not on a
             # schedule). On a long-running API that could be days away, with the
             # stored record sitting inconsistent with reality the whole time. So
@@ -295,21 +302,32 @@ class BaseApprovalQueue:
             a.status, a.result = EXECUTED, result
             return a
 
-    async def grant(self, approval_id: str, build_artifact, *,
+    async def grant(self, account_key: str, approval_id: str, build_artifact, *,
                     decided_by: str = "", reason: str = "") -> Approval:
         """Approve an EDGE-origin request: claim it (same CAS as approve), then
         record the signed artifact instead of executing. The platform holds no
         broker credentials, so execution happens at the edge, which reports
         back via record_execution()."""
-        a = self._claim(approval_id, decided_by, reason)
-        return self._grant(a, build_artifact(a))
+        a = self._claim(account_key, approval_id, decided_by, reason)
+        return self._grant(account_key, a, build_artifact(a))
 
-    def _grant(self, a: Approval, artifact: dict) -> Approval:
+    def _grant(self, account_key: str, a: Approval, artifact: dict) -> Approval:
         raise NotImplementedError
 
-    def record_execution(self, approval_id: str, agent_id: str, *, ok: bool,
+    def record_execution(self, account_key: str, approval_id: str, agent_id: str, *,
+                         ok: bool,
                          result=None, error: str = "",
                          outcome_unknown: bool = False) -> Approval:
+        raise NotImplementedError
+
+    def expire(self, account_key: str) -> list[Approval]:
+        raise NotImplementedError
+
+    def reconcile_stale(self, account_key: str) -> list[Approval]:
+        raise NotImplementedError
+
+    def _why_unclaimable(self, account_key: str,
+                         approval_id: str) -> ApprovalError:
         raise NotImplementedError
 
 
@@ -333,25 +351,12 @@ class ApprovalQueue(BaseApprovalQueue):
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue  # torn final line from a kill mid-append
-            if not isinstance(rec, dict) or "id" not in rec:
+            if (not isinstance(rec, dict) or "id" not in rec
+                    or not isinstance(rec.get("account_key"), str)
+                    or not rec["account_key"].strip()):
                 continue
             self._items[rec["id"]] = Approval(
                 **{k: rec[k] for k in Approval._FIELDS if k in rec})
-
-        # A record left `approved` means we died between the human's click and
-        # the downstream call. We cannot know whether the broker saw it. Do NOT
-        # execute it now. Surface it for a human to reconcile.
-        #
-        # GRANTED rows are deliberately NOT swept: the edge holds the signed
-        # artifact and reports the outcome via record_execution(). Only
-        # `approved` (platform-executes, died mid-call) is outcome-unknown.
-        for a in self._items.values():
-            if a.status == APPROVED:
-                a.status, a.error = ERROR, (
-                    "the server restarted after approval but before the call "
-                    "completed; check the broker before retrying")
-                a.outcome_unknown = True
-                self._journal(a)
 
     def _journal(self, a: Approval) -> None:
         if self._path is not None:
@@ -365,18 +370,21 @@ class ApprovalQueue(BaseApprovalQueue):
 
     # ---- enqueue -------------------------------------------------------
 
-    def enqueue(self, connector_id: str, tool: str, args: dict, *, ttl_s: int,
-                requested_by: str = "", workspace: str = "default", agent_id: str = "",
+    def enqueue(self, account_key: str, connector_id: str, tool: str, args: dict, *,
+                ttl_s: int, requested_by: str = "", agent_id: str = "",
                 signal_id: str = "", signal: dict | None = None,
                 notional: float = 0.0) -> Approval:
+        _require_account_key(account_key)
         now = time.time()
         with self._lock:
             pending = sum(1 for a in self._items.values()
-                          if a.status == PENDING and not a.is_expired(now))
-            if pending >= MAX_PENDING:
+                          if a.account_key == account_key and a.status == PENDING
+                          and not a.is_expired(now))
+            if pending >= APPROVAL_MAX_PENDING_PER_ACCOUNT:
                 raise ApprovalError(
                     f"{pending} approvals already await a human decision "
-                    f"(limit {MAX_PENDING}); resolve those before requesting more")
+                    f"(limit {APPROVAL_MAX_PENDING_PER_ACCOUNT}); resolve those "
+                    f"before requesting more")
             # Full 128 bits, not a short id: `get_approval(id)` is not scoped to
             # the requesting agent. The MCP tool never checks the caller's
             # identity (nakagai/identity.py) against agent_id below, so the id
@@ -388,9 +396,10 @@ class ApprovalQueue(BaseApprovalQueue):
             # Deep copy on the way in: a shallow dict() leaves nested payloads
             # (e.g. {"order": {...}}) aliased to the caller's dict, which would
             # let the requester change the order after a human read it.
-            a = Approval(id=uuid.uuid4().hex, connector_id=connector_id, tool=tool,
+            a = Approval(id=uuid.uuid4().hex, account_key=account_key,
+                         connector_id=connector_id, tool=tool,
                          args=copy.deepcopy(args), requested_by=requested_by,
-                         workspace=workspace, created_at=now, expires_at=now + ttl_s,
+                         created_at=now, expires_at=now + ttl_s,
                          agent_id=agent_id, signal_id=signal_id,
                          signal=copy.deepcopy(signal), notional=notional)
             self._items[a.id] = a
@@ -399,25 +408,26 @@ class ApprovalQueue(BaseApprovalQueue):
 
     # ---- read ----------------------------------------------------------
 
-    def get(self, approval_id: str, workspace: str | None = None) -> Approval | None:
+    def get(self, account_key: str, approval_id: str) -> Approval | None:
+        _require_account_key(account_key)
         with self._lock:
             a = self._items.get(approval_id)
-            if a is None or (workspace is not None and a.workspace != workspace):
+            if a is None or a.account_key != account_key:
                 return None
             expired = self._expire_locked(a)
         if expired:
             self._journal(a)
         return a
 
-    def list(self, status: str = "", workspace: str | None = None,
+    def list(self, account_key: str, *, status: str = "",
              limit: int = 100) -> list[dict]:
+        _require_account_key(account_key)
         with self._lock:
-            items = list(self._items.values())
+            items = [a for a in self._items.values()
+                     if a.account_key == account_key]
             newly = [a for a in items if self._expire_locked(a)]
         for a in newly:
             self._journal(a)
-        if workspace is not None:
-            items = [a for a in items if a.workspace == workspace]
         if status:
             items = [a for a in items if a.status == status]
         items.sort(key=lambda a: a.created_at)
@@ -431,14 +441,40 @@ class ApprovalQueue(BaseApprovalQueue):
             return True
         return False
 
-    def clear_history(self) -> int:
+    def expire(self, account_key: str) -> list[Approval]:
+        _require_account_key(account_key)
+        with self._lock:
+            newly = [a for a in self._items.values()
+                     if a.account_key == account_key and self._expire_locked(a)]
+        for a in newly:
+            self._journal(a)
+        return newly
+
+    def reconcile_stale(self, account_key: str) -> list[Approval]:
+        _require_account_key(account_key)
+        with self._lock:
+            stale = [a for a in self._items.values()
+                     if a.account_key == account_key and a.status == APPROVED]
+            for a in stale:
+                a.status, a.error = ERROR, (
+                    "the server restarted after approval but before the call "
+                    "completed; check the broker before retrying")
+                a.outcome_unknown = True
+        for a in stale:
+            self._journal(a)
+        return stale
+
+    def clear_history(self, account_key: str) -> int:
+        _require_account_key(account_key)
         now = time.time()
         with self._lock:
             # Sweep expiry first so a record that lapsed since the last read
             # counts as history, matching what the owner sees on the page.
-            newly = [a for a in self._items.values() if self._expire_locked(a)]
-            cleared = [a for a in self._items.values()
-                       if a.status != PENDING and not a.outcome_unknown
+            owned = [a for a in self._items.values()
+                     if a.account_key == account_key]
+            newly = [a for a in owned if self._expire_locked(a)]
+            cleared = [a for a in owned
+                       if a.status in TERMINAL and not a.outcome_unknown
                        and not a.cleared_at]
             for a in cleared:
                 a.cleared_at = now
@@ -448,12 +484,28 @@ class ApprovalQueue(BaseApprovalQueue):
 
     # ---- decide --------------------------------------------------------
 
-    def _claim(self, approval_id: str, decided_by: str, reason: str) -> Approval:
-        """Compare-and-set pending -> approved. The single point where a
-        concurrent second approve loses."""
+    def _why_unclaimable(self, account_key: str,
+                         approval_id: str) -> ApprovalError:
+        _require_account_key(account_key)
         with self._lock:
             a = self._items.get(approval_id)
-            if a is None:
+            if a is None or a.account_key != account_key:
+                return ApprovalError(f"no approval {approval_id!r}")
+            if a.status == EXPIRED:
+                return ApprovalError(
+                    f"approval {approval_id!r} expired before a human decided")
+            return ApprovalError(
+                f"approval {approval_id!r} is already {a.status!r}; "
+                f"it cannot be decided twice")
+
+    def _claim(self, account_key: str, approval_id: str, decided_by: str,
+               reason: str) -> Approval:
+        """Compare-and-set pending -> approved. The single point where a
+        concurrent second approve loses."""
+        _require_account_key(account_key)
+        with self._lock:
+            a = self._items.get(approval_id)
+            if a is None or a.account_key != account_key:
                 raise ApprovalError(f"no approval {approval_id!r}")
             if self._expire_locked(a):
                 raise ApprovalError(f"approval {approval_id!r} expired at "
@@ -467,10 +519,12 @@ class ApprovalQueue(BaseApprovalQueue):
         self._journal(a)
         return a
 
-    def deny(self, approval_id: str, decided_by: str = "", reason: str = "") -> Approval:
+    def deny(self, account_key: str, approval_id: str, *, decided_by: str = "",
+             reason: str = "") -> Approval:
+        _require_account_key(account_key)
         with self._lock:
             a = self._items.get(approval_id)
-            if a is None:
+            if a is None or a.account_key != account_key:
                 raise ApprovalError(f"no approval {approval_id!r}")
             self._expire_locked(a)
             if a.status != PENDING:
@@ -480,35 +534,56 @@ class ApprovalQueue(BaseApprovalQueue):
         self._journal(a)
         return a
 
-    def _finish(self, a: Approval, status: str, *, result=None, error: str = "",
+    def _finish(self, account_key: str, a: Approval, status: str, *, result=None,
+                error: str = "",
                 outcome_unknown: bool = False) -> Approval:
+        _require_account_key(account_key)
         with self._lock:
-            a.status, a.result, a.error = status, result, error
-            a.outcome_unknown = outcome_unknown
+            live = self._items.get(a.id)
+            if live is None or live.account_key != account_key:
+                raise ApprovalError(f"no approval {a.id!r}")
+            live.status, live.result, live.error = status, result, error
+            live.outcome_unknown = outcome_unknown
+            a = live
         self._journal(a)
         return a
 
-    def _resolve(self, a: Approval, note: str) -> Approval:
+    def _resolve(self, account_key: str, a: Approval, note: str) -> Approval:
+        _require_account_key(account_key)
         with self._lock:
-            live = self._items.get(a.id, a)
+            live = self._items.get(a.id)
+            if live is None or live.account_key != account_key:
+                raise ApprovalError(f"no approval {a.id!r}")
+            if not live.outcome_unknown:
+                raise ApprovalError(
+                    f"approval {a.id!r} is no longer awaiting reconciliation")
             live.outcome_unknown = False
             live.error = f"{live.error}; {note}".strip(" ;")
             a = live
         self._journal(a)
         return a
 
-    def _grant(self, a: Approval, artifact: dict) -> Approval:
+    def _grant(self, account_key: str, a: Approval, artifact: dict) -> Approval:
+        _require_account_key(account_key)
         with self._lock:
-            a.status, a.artifact = GRANTED, artifact
+            live = self._items.get(a.id)
+            if live is None or live.account_key != account_key:
+                raise ApprovalError(f"no approval {a.id!r}")
+            if live.status != APPROVED:
+                raise ApprovalError(f"approval {a.id!r} could not be granted")
+            live.status, live.artifact = GRANTED, artifact
+            a = live
         self._journal(a)
         return a
 
-    def record_execution(self, approval_id: str, agent_id: str, *, ok: bool,
+    def record_execution(self, account_key: str, approval_id: str, agent_id: str, *,
+                         ok: bool,
                          result=None, error: str = "",
                          outcome_unknown: bool = False) -> Approval:
+        _require_account_key(account_key)
         with self._lock:
             a = self._items.get(approval_id)
-            if a is None:
+            if a is None or a.account_key != account_key:
                 raise ApprovalError(f"no approval {approval_id!r}")
             if a.status != GRANTED:
                 raise ApprovalError(
@@ -522,22 +597,25 @@ class ApprovalQueue(BaseApprovalQueue):
         self._journal(a)
         return a
 
-    def set_rationale(self, approval_id: str, payload: dict) -> bool:
+    def set_rationale(self, account_key: str, approval_id: str,
+                      payload: dict) -> bool:
+        _require_account_key(account_key)
         with self._lock:
             a = self._items.get(approval_id)
-            if a is None:
+            if a is None or a.account_key != account_key:
                 return False
             a.rationale = copy.deepcopy(payload)
         self._journal(a)
         return True
 
-    def recent_for_symbol(self, symbol: str, *, exclude_id: str = "",
+    def recent_for_symbol(self, account_key: str, symbol: str, *, exclude_id: str = "",
                           limit: int = 5) -> list[dict]:
+        _require_account_key(account_key)
         if not symbol:
             return []
         with self._lock:
             items = [a for a in self._items.values()
-                     if a.id != exclude_id
+                     if a.account_key == account_key and a.id != exclude_id
                      and (a.signal or {}).get("symbol") == symbol]
         items.sort(key=lambda a: a.created_at, reverse=True)
         return [{"status": a.status, "decided_by": a.decided_by,
@@ -546,355 +624,328 @@ class ApprovalQueue(BaseApprovalQueue):
 
 
 class PgApprovalQueue(BaseApprovalQueue):
-    """Postgres-backed. The compare-and-set is `claim_approval()` in
-    `ops/db/0002_gateway.sql`, so two workers cannot both approve one record,
-    which is what makes running more than one API worker safe.
+    """Postgres-backed queue with account authority on every operation."""
 
-    Durable across redeploys, unlike `results/approvals.jsonl` on ephemeral disk.
-    """
+    COLUMNS = ("id", "account_key", "connector_id", "tool", "args", "status",
+               "requested_by", "created_at", "expires_at", "decided_at",
+               "decided_by", "reason", "result", "error", "outcome_unknown",
+               "agent_id", "artifact", "signal_id", "signal", "notional",
+               "rationale", "cleared_at")
+    DB_COLUMNS = ("id", "workspace_id", "connector_id", "tool", "args", "status",
+                  "requested_by", "created_at", "expires_at", "decided_at",
+                  "decided_by", "reason", "result", "error", "outcome_unknown",
+                  "agent_id", "artifact", "signal_id", "signal", "notional",
+                  "rationale", "cleared_at")
 
-    COLUMNS = ("id", "connector_id", "tool", "args", "status", "requested_by",
-               "created_at", "expires_at", "decided_at", "decided_by", "reason",
-               "result", "error", "outcome_unknown", "agent_id", "artifact",
-               "signal_id", "signal", "notional", "rationale", "cleared_at")
-
-    def __init__(self, database, workspace_id: str | None = None) -> None:
+    def __init__(self, database) -> None:
         self.db = database
-        self.workspace_id = workspace_id
 
-    # ---- the autopilot decision lock ---------------------------------------
+    @classmethod
+    def _columns(cls) -> str:
+        return ", ".join(cls.DB_COLUMNS)
 
-    @contextlib.contextmanager
-    def decision_lock(self, workspace: str, timeout_s: float = LOCK_TIMEOUT_S):
-        """Serialize autopilot's read → check → claim across API workers (see the
-        base class for why the CAS alone is not enough).
-
-        **Read this first, before the mechanism below:** with the wiring
-        `nakagai/api/app.py` actually uses (`PgApprovalQueue(database)`, no
-        `workspace_id`), the key this locks on degenerates to a single global
-        `"default"` (see `_lock_key`), so in production TODAY this is one global
-        lock, not one lock per workspace. Every autopilot decision, in every
-        workspace, serializes against every other one. That is safe (it can only
-        make a decision decline to a human tap, never let two through) but it is
-        not per-tenant isolation, whatever the per-workspace framing below
-        suggests. Read `_lock_key`'s docstring in full before changing that: making
-        the lock per-workspace while `PgApprovalQueue.list()` still reads the whole
-        table with no workspace filter would let two workspaces take two different
-        locks and both read the same global budget, reintroducing the exact cap
-        overshoot this lock exists to prevent.
-
-        **Transaction-scoped** (`pg_try_advisory_xact_lock`, never the session-scoped
-        `pg_advisory_lock`): Postgres releases it at COMMIT/ROLLBACK, and if the
-        worker dies, when the backend goes away. A session-scoped lock outliving a
-        dying worker would wedge autopilot for that workspace permanently, a far
-        worse failure than declining one order.
-
-        **TRY, not wait.** A blocking `pg_advisory_xact_lock` would be a *synchronous*
-        wait inside an async request: the lock-holder awaits the broker (seconds) with
-        the lock held, so a second concurrent decision in the same process would block
-        the event loop, and therefore block the very task it is waiting on. Trying
-        and giving up cannot deadlock, and costs nothing real: autopilot decides at most
-        `daily_order_max` times a day (default 5), so contention is vanishingly rare,
-        and losing the race merely means that order waits for a human tap.
-
-        The key is DERIVED from the workspace (`_lock_key`), but see that docstring
-        and the caveat at the top of this one before reading "one owner's decision
-        never blocks another's" as a description of production today: with the
-        wiring `api/app.py` actually uses, it degenerates to one global key, and it
-        must stay that way until `list()` is scoped to match. `hashtext` is
-        Postgres's own string hash (int4); the two-key form namespaces it under
-        `hashtext('nakagai:autopilot')`, so this cannot collide with an advisory lock
-        anyone later takes on a bare workspace hash. A hash collision between two
-        workspaces could only make one of them decline, never let two decisions
-        through, which is the direction that must not fail.
-
-        The lock is held on its own pooled connection for the body of the `with`. It
-        does not have to be the connection the reads and the claim run on: an advisory
-        lock serializes against other holders of the same key, and this key has
-        exactly one taker: the auto-approver.
-
-        Raises `DecisionLockError` if the lock is held elsewhere, or if the database
-        cannot be reached. The caller declines; it must never execute without it.
-        """
-        with contextlib.ExitStack() as stack:
-            # Only ACQUISITION failures become DecisionLockError. The body runs
-            # outside this try on purpose: wrapping it too would rewrite a broker
-            # error (or an ApprovalError from the CAS) into "could not take the
-            # lock", and the caller reasons about those very differently.
-            try:
-                # `timeout` bounds the wait for a free pooled connection; an
-                # exhausted pool or an unreachable database must decline, not hang.
-                c = stack.enter_context(self.db.pool.connection(timeout=timeout_s))
-                # The pool is autocommit; transaction() issues an explicit BEGIN, so
-                # the *xact*-scoped lock survives until this block ends. Without it
-                # each statement is its own transaction and the lock would be
-                # released before the caller had done a thing.
-                stack.enter_context(c.transaction())
-                # set_config(_, _, is_local => true), not `SET LOCAL`: `SET` is a
-                # utility statement and takes no bind parameters, so `set local
-                # statement_timeout = %s` is a syntax error over the extended
-                # protocol. set_config() is an ordinary function and does take them.
-                # Transaction-local, so it reverts with this transaction.
-                c.execute("select set_config('statement_timeout', %s, true)",
-                          (f"{max(int(timeout_s * 1000), 1)}ms",))
-                got = c.execute(
-                    "select pg_try_advisory_xact_lock("
-                    "hashtext('nakagai:autopilot'), hashtext(%s::text))",
-                    (self._lock_key(workspace),)).fetchone()[0]
-            except Exception as e:  # noqa: BLE001 (fail closed: the caller declines)
-                # The CAUSE, not a sentence: the caller (autoapprove.py) owns the
-                # owner-facing decline reason and wraps this.
-                raise DecisionLockError(f"{type(e).__name__}: {e}") from e
-            if not got:
-                raise DecisionLockError(
-                    "another worker is deciding an autopilot order for this workspace")
-            yield
-            # Exit: COMMIT (or ROLLBACK if the body raised) ends the transaction,
-            # which is what releases the lock. It cannot leak past this block, and
-            # cannot outlive the process.
-
-    def _lock_key(self, workspace: str) -> str:
-        """What this queue's autopilot decisions serialize against. `workspace_id` is
-        authoritative when set (it is the uuid every row of this queue is scoped
-        to), and the caller's workspace name is the fallback.
-
-        Be clear about what that means TODAY: `nakagai/api/app.py` builds
-        `PgApprovalQueue(database)` with no workspace_id, and `COLUMNS` does not
-        select the row's `workspace_id`, so `Approval.workspace` is always its
-        default. The key therefore degenerates to one global 'default': every
-        workspace's autopilot decisions serialize against each other.
-
-        That is SAFE: over-serializing can never let two decisions through, only
-        make one of them decline to a human tap, and a decision holds the lock for a
-        single broker round-trip a handful of times a day. It is not per-tenant
-        isolation, and no comment here should pretend it is.
-
-        Making this per-workspace is NOT a one-line change here. `list()`, the read
-        that computes the day's cap usage and the once-per-signal fence in
-        `autoapprove.py`, has no workspace filter (see `PgApprovalQueue.list()`
-        below and `_select()`); it reads every row in the table regardless of
-        `workspace`. Scoping `list()` to the workspace is a PREREQUISITE, not an
-        afterthought: pass a `workspace_id` here without also scoping `list()` and
-        two workspaces take two *different* locks while both still read the *same*
-        global budget: both can pass `daily_order_max` and both claim, which is
-        exactly the cap overshoot this lock was built to prevent. Only once `list()`
-        (and the budget/fence read it feeds) is workspace-scoped does keying the
-        lock per-workspace become safe to do on its own.
-        """
-        return self.workspace_id or workspace or "default"
-
-    # ---- row <-> Approval ----------------------------------------------
+    @classmethod
+    def _select(cls) -> str:
+        return f"select {cls._columns()} from approvals"
 
     @staticmethod
     def _row(row) -> Approval:
-        d = dict(zip(PgApprovalQueue.COLUMNS, row))
-        # Postgres hands back datetimes; the dataclass and the JSON contract
-        # both speak epoch seconds.
-        for k in ("created_at", "expires_at", "decided_at", "cleared_at"):
-            d[k] = d[k].timestamp() if d[k] is not None else 0.0
-        return Approval(**d)
+        values = dict(zip(PgApprovalQueue.COLUMNS, row))
+        for key in ("created_at", "expires_at", "decided_at", "cleared_at"):
+            values[key] = values[key].timestamp() if values[key] is not None else 0.0
+        return Approval(**values)
 
-    def _select(self) -> str:
-        return f"select {', '.join(self.COLUMNS)} from approvals"
+    @contextlib.contextmanager
+    def decision_lock(self, account_key: str, timeout_s: float = LOCK_TIMEOUT_S):
+        """Serialize one account's autopilot decision across API workers."""
+        _require_account_key(account_key)
+        with contextlib.ExitStack() as stack:
+            try:
+                connection = stack.enter_context(
+                    self.db.pool.connection(timeout=timeout_s)
+                )
+                stack.enter_context(connection.transaction())
+                connection.execute(
+                    "select set_config('statement_timeout', %s, true)",
+                    (f"{max(int(timeout_s * 1000), 1)}ms",),
+                )
+                locked = connection.execute(
+                    "select pg_try_advisory_xact_lock("
+                    "hashtext('nakagai:autopilot'), hashtext(%s::text))",
+                    (account_key,),
+                ).fetchone()[0]
+            except Exception as error:  # noqa: BLE001
+                raise DecisionLockError(f"{type(error).__name__}: {error}") from error
+            if not locked:
+                raise DecisionLockError(
+                    "another worker is deciding an autopilot order for this account"
+                )
+            yield
 
-    # ---- lifecycle -------------------------------------------------------
+    @classmethod
+    def _expire_with(cls, connection, account_key: str) -> list[Approval]:
+        rows = connection.execute(
+            f"update approvals set status = 'expired',"
+            f" error = 'expired before a human decided'"
+            f" where workspace_id = %s and status = 'pending'"
+            f" and expires_at <= now() returning {cls._columns()}",
+            (account_key,),
+        ).fetchall()
+        return [cls._row(row) for row in rows]
 
-    def reconcile_stale(self) -> list[Approval]:
-        """Turn abandoned `approved` rows into `error` + `outcome_unknown`.
+    def expire(self, account_key: str) -> list[Approval]:
+        _require_account_key(account_key)
+        with self.db.pool.connection() as connection:
+            return self._expire_with(connection, account_key)
 
-        Only rows older than the interval in SQL (10 min), because a row approved
-        seconds ago may be executing right now in a sibling worker.
-        """
-        with self.db.pool.connection() as c:
-            # Name the columns: the function returns `setof approvals`, i.e. every
-            # table column in table order (including workspace_id), which does not
-            # match COLUMNS.
-            rows = c.execute(
-                f"select {', '.join(self.COLUMNS)} from reconcile_stale_approvals()"
+    def reconcile_stale(self, account_key: str) -> list[Approval]:
+        _require_account_key(account_key)
+        with self.db.pool.connection() as connection:
+            rows = connection.execute(
+                f"update approvals set status = 'error', outcome_unknown = true,"
+                f" error = 'the server restarted after approval but before the call completed;"
+                f" check the broker before retrying'"
+                f" where workspace_id = %s and status = 'approved'"
+                f" and decided_at < now() - interval '10 minutes'"
+                f" returning {self._columns()}",
+                (account_key,),
             ).fetchall()
-        return [self._row(r) for r in rows]
+        return [self._row(row) for row in rows]
 
-    def _expire(self) -> None:
-        with self.db.pool.connection() as c:
-            c.execute("select expire_approvals()")
-
-    def clear_history(self) -> int:
-        self._expire()
-        with self.db.pool.connection() as c:
-            rows = c.execute(
-                "update approvals set cleared_at = now()"
-                " where status <> 'pending' and not outcome_unknown"
-                " and cleared_at is null returning id").fetchall()
+    def clear_history(self, account_key: str) -> int:
+        _require_account_key(account_key)
+        with self.db.pool.connection() as connection:
+            with connection.transaction():
+                self._expire_with(connection, account_key)
+                rows = connection.execute(
+                    "update approvals set cleared_at = now()"
+                    " where workspace_id = %s"
+                    " and status in ('denied', 'expired', 'executed', 'error')"
+                    " and not outcome_unknown and cleared_at is null returning id",
+                    (account_key,),
+                ).fetchall()
         return len(rows)
 
-    def enqueue(self, connector_id: str, tool: str, args: dict, *, ttl_s: int,
-                requested_by: str = "", workspace: str = "default", agent_id: str = "",
+    def enqueue(self, account_key: str, connector_id: str, tool: str, args: dict, *,
+                ttl_s: int, requested_by: str = "", agent_id: str = "",
                 signal_id: str = "", signal: dict | None = None,
                 notional: float = 0.0) -> Approval:
-        self._expire()
-        with self.db.pool.connection() as c:
-            pending = c.execute(
-                "select count(*) from approvals where status = 'pending'").fetchone()[0]
-            if pending >= MAX_PENDING:
-                raise ApprovalError(
-                    f"{pending} approvals already await a human decision "
-                    f"(limit {MAX_PENDING}); resolve those before requesting more")
-            row = c.execute(
-                f"insert into approvals (id, workspace_id, connector_id, tool, args,"
-                f" status, requested_by, expires_at, agent_id,"
-                f" signal_id, signal, notional)"
-                f" values (%s, %s, %s, %s, %s, 'pending', %s,"
-                f" now() + make_interval(secs => %s), %s, %s, %s, %s)"
-                f" returning {', '.join(self.COLUMNS)}",
-                (uuid.uuid4().hex, self.workspace_id, connector_id, tool,
-                 json.dumps(copy.deepcopy(args)), requested_by, ttl_s, agent_id,
-                 signal_id,
-                 json.dumps(copy.deepcopy(signal)) if signal is not None else None,
-                 notional)).fetchone()
+        _require_account_key(account_key)
+        with self.db.pool.connection() as connection:
+            with connection.transaction():
+                connection.execute(
+                    "select pg_advisory_xact_lock("
+                    "hashtext('nakagai:approval-admission'), hashtext(%s::text))",
+                    (account_key,),
+                )
+                self._expire_with(connection, account_key)
+                pending = connection.execute(
+                    "select count(*) from approvals"
+                    " where workspace_id = %s and status = 'pending'",
+                    (account_key,),
+                ).fetchone()[0]
+                if pending >= APPROVAL_MAX_PENDING_PER_ACCOUNT:
+                    raise ApprovalError(
+                        f"{pending} approvals already await a human decision "
+                        f"(limit {APPROVAL_MAX_PENDING_PER_ACCOUNT}); resolve those "
+                        f"before requesting more"
+                    )
+                row = connection.execute(
+                    f"insert into approvals (id, workspace_id, connector_id, tool, args,"
+                    f" status, requested_by, expires_at, agent_id, signal_id, signal, notional)"
+                    f" values (%s, %s, %s, %s, %s, 'pending', %s,"
+                    f" now() + make_interval(secs => %s), %s, %s, %s, %s)"
+                    f" returning {self._columns()}",
+                    (uuid.uuid4().hex, account_key, connector_id, tool,
+                     json.dumps(copy.deepcopy(args)), requested_by, ttl_s, agent_id,
+                     signal_id,
+                     json.dumps(copy.deepcopy(signal)) if signal is not None else None,
+                     notional),
+                ).fetchone()
         return self._row(row)
 
-    def get(self, approval_id: str, workspace: str | None = None) -> Approval | None:
-        self._expire()
-        with self.db.pool.connection() as c:
-            row = c.execute(f"{self._select()} where id = %s", (approval_id,)).fetchone()
+    def get(self, account_key: str, approval_id: str) -> Approval | None:
+        _require_account_key(account_key)
+        self.expire(account_key)
+        with self.db.pool.connection() as connection:
+            row = connection.execute(
+                f"{self._select()} where workspace_id = %s and id = %s",
+                (account_key, approval_id),
+            ).fetchone()
         return self._row(row) if row else None
 
-    def list(self, status: str = "", workspace: str | None = None,
+    def list(self, account_key: str, *, status: str = "",
              limit: int = 100) -> list[dict]:
-        self._expire()
-        sql = self._select()
-        params: tuple = ()
+        _require_account_key(account_key)
+        self.expire(account_key)
+        sql = f"{self._select()} where workspace_id = %s"
+        params: tuple = (account_key,)
         if status:
-            sql += " where status = %s"
-            params = (status,)
-        # NEWEST `limit`, returned oldest-first: the same contract as
-        # ApprovalQueue.list (which sorts ascending and slices `[-limit:]`).
-        # `asc limit N` would return the OLDEST N instead, which is not merely a
-        # cosmetic difference for the UI: autoapprove.py computes the day's autopilot
-        # budget and looks for unreconciled (`outcome_unknown`) calls from this very
-        # list, so on a table with more than N rows it would see nothing from today.
-        # The daily caps would silently stop binding, and only on Postgres.
+            sql += " and status = %s"
+            params += (status,)
         sql += " order by created_at desc limit %s"
-        with self.db.pool.connection() as c:
-            rows = c.execute(sql, (*params, limit)).fetchall()
-        return [self._row(r).to_dict() for r in reversed(rows)]
+        with self.db.pool.connection() as connection:
+            rows = connection.execute(sql, (*params, limit)).fetchall()
+        return [self._row(row).to_dict() for row in reversed(rows)]
 
-    # ---- decisions -------------------------------------------------------
-
-    def _why_unclaimable(self, approval_id: str) -> ApprovalError:
-        """The claim returned no row. Say which of the three reasons it was."""
-        a = self.get(approval_id)
-        if a is None:
+    def _why_unclaimable(self, account_key: str,
+                         approval_id: str) -> ApprovalError:
+        _require_account_key(account_key)
+        record = self.get(account_key, approval_id)
+        if record is None:
             return ApprovalError(f"no approval {approval_id!r}")
-        if a.status == EXPIRED:
-            return ApprovalError(f"approval {approval_id!r} expired before a human decided")
-        return ApprovalError(f"approval {approval_id!r} is already {a.status!r}; "
-                             f"it cannot be decided twice")
+        if record.status == EXPIRED:
+            return ApprovalError(
+                f"approval {approval_id!r} expired before a human decided"
+            )
+        return ApprovalError(
+            f"approval {approval_id!r} is already {record.status!r}; "
+            f"it cannot be decided twice"
+        )
 
-    def _claim(self, approval_id: str, decided_by: str, reason: str) -> Approval:
-        self._expire()
-        with self.db.pool.connection() as c:
-            # Name the columns: claim_approval() returns `setof approvals`
-            # (table order, workspace_id included), not this class's COLUMNS.
-            row = c.execute(
-                f"select {', '.join(self.COLUMNS)} from claim_approval(%s, %s, %s)",
-                (approval_id, decided_by, reason)).fetchone()
+    def _claim(self, account_key: str, approval_id: str, decided_by: str,
+               reason: str) -> Approval:
+        _require_account_key(account_key)
+        self.expire(account_key)
+        with self.db.pool.connection() as connection:
+            row = connection.execute(
+                f"update approvals set status = 'approved', decided_at = now(),"
+                f" decided_by = %s, reason = %s"
+                f" where workspace_id = %s and id = %s and status = 'pending'"
+                f" and expires_at > now()"
+                f" returning {self._columns()}",
+                (decided_by, reason, account_key, approval_id),
+            ).fetchone()
         if row is None:
-            raise self._why_unclaimable(approval_id)
+            raise self._why_unclaimable(account_key, approval_id)
         return self._row(row)
 
-    def deny(self, approval_id: str, decided_by: str = "", reason: str = "") -> Approval:
-        self._expire()
-        with self.db.pool.connection() as c:
-            row = c.execute(
+    def deny(self, account_key: str, approval_id: str, *, decided_by: str = "",
+             reason: str = "") -> Approval:
+        _require_account_key(account_key)
+        self.expire(account_key)
+        with self.db.pool.connection() as connection:
+            row = connection.execute(
                 f"update approvals set status = 'denied', decided_at = now(),"
                 f" decided_by = %s, reason = %s"
-                f" where id = %s and status = 'pending'"
-                f" returning {', '.join(self.COLUMNS)}",
-                (decided_by, reason, approval_id)).fetchone()
+                f" where workspace_id = %s and id = %s and status = 'pending'"
+                f" and expires_at > now()"
+                f" returning {self._columns()}",
+                (decided_by, reason, account_key, approval_id),
+            ).fetchone()
         if row is None:
-            raise self._why_unclaimable(approval_id)
+            raise self._why_unclaimable(account_key, approval_id)
         return self._row(row)
 
-    def _finish(self, a: Approval, status: str, *, result=None, error: str = "",
-                outcome_unknown: bool = False) -> Approval:
-        with self.db.pool.connection() as c:
-            row = c.execute(
+    def _finish(self, account_key: str, a: Approval, status: str, *, result=None,
+                error: str = "", outcome_unknown: bool = False) -> Approval:
+        _require_account_key(account_key)
+        with self.db.pool.connection() as connection:
+            row = connection.execute(
                 f"update approvals set status = %s, result = %s, error = %s,"
-                f" outcome_unknown = %s where id = %s"
-                f" returning {', '.join(self.COLUMNS)}",
+                f" outcome_unknown = %s where workspace_id = %s and id = %s"
+                f" returning {self._columns()}",
                 (status, json.dumps(result) if result is not None else None,
-                 error, outcome_unknown, a.id)).fetchone()
+                 error, outcome_unknown, account_key, a.id),
+            ).fetchone()
+        if row is None:
+            raise ApprovalError(f"no approval {a.id!r}")
         return self._row(row)
 
-    def _resolve(self, a: Approval, note: str) -> Approval:
-        with self.db.pool.connection() as c:
-            row = c.execute(
+    def _resolve(self, account_key: str, a: Approval, note: str) -> Approval:
+        _require_account_key(account_key)
+        with self.db.pool.connection() as connection:
+            row = connection.execute(
                 f"update approvals set outcome_unknown = false,"
                 f" error = trim(both ' ;' from coalesce(error, '') || '; ' || %s)"
-                f" where id = %s and outcome_unknown"
-                f" returning {', '.join(self.COLUMNS)}",
-                (note, a.id)).fetchone()
-        if row is None:  # another approver reconciled it first
+                f" where workspace_id = %s and id = %s and outcome_unknown"
+                f" returning {self._columns()}",
+                (note, account_key, a.id),
+            ).fetchone()
+        if row is None:
+            if self.get(account_key, a.id) is None:
+                raise ApprovalError(f"no approval {a.id!r}")
             raise ApprovalError(
-                f"approval {a.id!r} is no longer awaiting reconciliation")
+                f"approval {a.id!r} is no longer awaiting reconciliation"
+            )
         return self._row(row)
 
-    def _grant(self, a: Approval, artifact: dict) -> Approval:
-        with self.db.pool.connection() as c:
-            row = c.execute(
+    def _grant(self, account_key: str, a: Approval, artifact: dict) -> Approval:
+        _require_account_key(account_key)
+        with self.db.pool.connection() as connection:
+            row = connection.execute(
                 f"update approvals set status = 'granted', artifact = %s"
-                f" where id = %s and status = 'approved'"
-                f" returning {', '.join(self.COLUMNS)}",
-                (json.dumps(artifact), a.id)).fetchone()
-        if row is None:  # claim raced with something that moved it off approved
+                f" where workspace_id = %s and id = %s and status = 'approved'"
+                f" returning {self._columns()}",
+                (json.dumps(artifact), account_key, a.id),
+            ).fetchone()
+        if row is None:
+            if self.get(account_key, a.id) is None:
+                raise ApprovalError(f"no approval {a.id!r}")
             raise ApprovalError(f"approval {a.id!r} could not be granted")
         return self._row(row)
 
-    def record_execution(self, approval_id: str, agent_id: str, *, ok: bool,
-                         result=None, error: str = "",
+    def record_execution(self, account_key: str, approval_id: str, agent_id: str, *,
+                         ok: bool, result=None, error: str = "",
                          outcome_unknown: bool = False) -> Approval:
-        with self.db.pool.connection() as c:
-            row = c.execute(
+        _require_account_key(account_key)
+        with self.db.pool.connection() as connection:
+            row = connection.execute(
                 f"update approvals set status = %s, result = %s, error = %s,"
-                f" outcome_unknown = %s"
-                f" where id = %s and status = 'granted' and agent_id = %s"
-                f" returning {', '.join(self.COLUMNS)}",
+                f" outcome_unknown = %s where workspace_id = %s and id = %s"
+                f" and status = 'granted' and agent_id = %s"
+                f" returning {self._columns()}",
                 (EXECUTED if ok else ERROR,
                  json.dumps(result) if result is not None else None,
-                 error, outcome_unknown, approval_id, agent_id)).fetchone()
+                 error, outcome_unknown, account_key, approval_id, agent_id),
+            ).fetchone()
         if row is None:
-            a = self.get(approval_id)
-            if a is None:
+            record = self.get(account_key, approval_id)
+            if record is None:
                 raise ApprovalError(f"no approval {approval_id!r}")
-            if a.status != GRANTED:
+            if record.status != GRANTED:
                 raise ApprovalError(
-                    f"approval {approval_id!r} is {a.status!r}, not granted; "
-                    f"only a granted approval takes an execution report")
-            if a.agent_id != agent_id:
+                    f"approval {approval_id!r} is {record.status!r}, not granted; "
+                    f"only a granted approval takes an execution report"
+                )
+            if record.agent_id != agent_id:
                 raise ApprovalError(
-                    f"approval {approval_id!r} was granted to a different agent")
+                    f"approval {approval_id!r} was granted to a different agent"
+                )
             raise ApprovalError(
-                f"approval {approval_id!r} is {a.status!r}, not granted")
+                f"approval {approval_id!r} is {record.status!r}, not granted"
+            )
         return self._row(row)
 
-    def set_rationale(self, approval_id: str, payload: dict) -> bool:
-        with self.db.pool.connection() as c:
-            row = c.execute(
-                "update approvals set rationale = %s where id = %s returning id",
-                (json.dumps(payload), approval_id)).fetchone()
+    def set_rationale(self, account_key: str, approval_id: str,
+                      payload: dict) -> bool:
+        _require_account_key(account_key)
+        with self.db.pool.connection() as connection:
+            row = connection.execute(
+                "update approvals set rationale = %s"
+                " where workspace_id = %s and id = %s returning id",
+                (json.dumps(payload), account_key, approval_id),
+            ).fetchone()
         return row is not None
 
-    def recent_for_symbol(self, symbol: str, *, exclude_id: str = "",
+    def recent_for_symbol(self, account_key: str, symbol: str, *, exclude_id: str = "",
                           limit: int = 5) -> list[dict]:
+        _require_account_key(account_key)
         if not symbol:
             return []
-        with self.db.pool.connection() as c:
-            rows = c.execute(
+        with self.db.pool.connection() as connection:
+            rows = connection.execute(
                 "select status, decided_by, created_at, notional from approvals"
-                " where signal->>'symbol' = %s and id <> %s"
+                " where workspace_id = %s and signal->>'symbol' = %s and id <> %s"
                 " order by created_at desc limit %s",
-                (symbol, exclude_id, limit)).fetchall()
-        return [{"status": r[0], "decided_by": r[1],
-                 "created_at": r[2].timestamp() if r[2] is not None else 0.0,
-                 "notional": r[3]} for r in rows]
+                (account_key, symbol, exclude_id, limit),
+            ).fetchall()
+        return [
+            {
+                "status": row[0],
+                "decided_by": row[1],
+                "created_at": row[2].timestamp() if row[2] is not None else 0.0,
+                "notional": row[3],
+            }
+            for row in rows
+        ]

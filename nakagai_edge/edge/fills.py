@@ -126,7 +126,9 @@ async def account_rows(hub, spec, account: str) -> list[dict]:
     if wanted:
         args["status"] = wanted
     tool, resolved = resolve("list_orders", cap, args)
-    payload = (await hub.call(spec.id, tool, resolved)).get("data")
+    payload = (await hub.call(
+        spec.id, tool, resolved, account_key=hub.account_key
+    )).get("data")
     rows = first(payload, cap.items) if cap.items else payload
     if not isinstance(rows, list):
         return []

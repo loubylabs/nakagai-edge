@@ -5,6 +5,10 @@ the only place a broker credential is ever written to disk. Your agent talks to
 exactly one MCP endpoint, the edge, and never sees a token. The platform never
 sees one either.
 
+Version 0.4.0 requires an explicit `account_key` on every local approval queue
+operation. A paired edge uses its stable `agent_id` for that key. The key stays
+local; the hosted platform resolves account authority from the bearer token.
+
 ## Why an edge exists
 
 Broker credentials could live on the platform host. That topology has two

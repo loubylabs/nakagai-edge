@@ -123,6 +123,7 @@ class MapHub:
     """
 
     def __init__(self, specs=None, fail=None, payloads=None):
+        self.account_key = "ag1"
         self.calls: list[tuple] = []
         self.kwargs: list[dict] = []
         self.specs = _specs() if specs is None else specs
@@ -609,7 +610,9 @@ def _live_hub(state, client):
     from tests.fixtures.inproc import connect_to
 
     queue = RemoteApprovalQueue(client, state, "ag1")
-    return ConnectorHub(state.root, connect=connect_to(alien_server), approvals=queue)
+    hub = ConnectorHub(state.root, connect=connect_to(alien_server), approvals=queue)
+    hub.account_key = "ag1"
+    return hub
 
 
 async def test_place_order_returns_the_approval_envelope_intact(tmp_path):

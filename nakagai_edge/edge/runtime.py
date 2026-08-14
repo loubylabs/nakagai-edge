@@ -86,8 +86,13 @@ def build_hub(state: EdgeState, client: PlatformClient):
     # The synced registry's nakagai-mcp entry names this env var; exporting it
     # here keeps auth.py's env-indirection contract without a new auth mode.
     os.environ["NAKAGAI_AGENT_TOKEN"] = agent["token"]
-    queue = RemoteApprovalQueue(client, state, agent["agent_id"])
-    return ConnectorHub(state.root, approvals=queue)
+    account_key = agent.get("agent_id")
+    if not isinstance(account_key, str) or not account_key.strip():
+        raise SystemExit("paired edge identity is missing its agent_id")
+    queue = RemoteApprovalQueue(client, state, account_key)
+    hub = ConnectorHub(state.root, approvals=queue)
+    hub.account_key = account_key
+    return hub
 
 
 def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAudit,
@@ -118,7 +123,11 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
                          {"reason": "policy stale", **origin})
             return dict(STALE_POLICY)
         try:
-            out = await hub.call(connector_id, tool, args, signal_id=signal_id)
+            out = await hub.call(
+                connector_id, tool, args,
+                account_key=hub.account_key,
+                signal_id=signal_id,
+            )
             kind = "call" if not out.get("approval_required") else "intent"
             audit.record(kind, connector_id, tool,
                          {"is_write": out.get("is_write"), **origin})
@@ -360,7 +369,7 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         approved it and what the broker then answered."""
         if (stale := _gate()) is not None:
             return stale
-        rec = hub.approvals.get(approval_id)
+        rec = hub.approvals.get(hub.account_key, approval_id)
         if rec is None:
             return json.dumps({"is_error": True, "error": f"no approval {approval_id!r}"})
         return json.dumps(rec.public(), default=str)
@@ -886,7 +895,9 @@ async def _quotes(hub, state: EdgeState, symbols: list[str]) -> dict:
         try:
             cap = hub.spec(connector_id).capability("get_quote")
             tool, args = resolve("get_quote", cap, {"symbols": sorted(syms)})
-            got = await hub.call(connector_id, tool, args)
+            got = await hub.call(
+                connector_id, tool, args, account_key=hub.account_key
+            )
         except Exception as e:  # noqa: BLE001 (one connector, never the sweep)
             # CapabilityError lands here too: a connector that never declared
             # get_quote is skipped by name rather than dialed on a guessed tool

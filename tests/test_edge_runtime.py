@@ -246,6 +246,8 @@ async def test_write_tool_edge_client_error_returns_is_error_json(tmp_path):
     state = _state(tmp_path)
 
     class BoomHub:
+        account_key = "ag1"
+
         async def call(self, connector_id, tool, args, **kw):
             raise EdgeClientError("platform rejected the agent token. Was it revoked?")
 
@@ -294,6 +296,8 @@ async def test_get_open_risk_reports_positions_with_live_prices(tmp_path):
     record(state, _supervised_position())
 
     class QuoteHub:
+        account_key = "ag1"
+
         def spec(self, connector_id):
             return DEMO_SPEC
 
@@ -346,6 +350,7 @@ class MapQuoteHub:
     """Answers through the real connector maps, keyed by the tool asked for."""
 
     def __init__(self, payloads=None, fail=frozenset()):
+        self.account_key = "ag1"
         self.calls = []
         self.payloads = QUOTE_PAYLOADS if payloads is None else payloads
         self.fail = fail

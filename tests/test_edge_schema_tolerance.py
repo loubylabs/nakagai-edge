@@ -37,7 +37,7 @@ def hub(tmp_path):
 async def test_an_undeclared_property_still_returns_data(hub):
     """The live failure, end to end: the sweep gets its accounts back."""
     try:
-        out = await hub.call("lying-broker", "get_accounts", {})
+        out = await hub.call("lying-broker", "get_accounts", {}, account_key="test-account")
     finally:
         await hub.aclose()
     accounts = out["data"]["accounts"]
@@ -50,7 +50,8 @@ async def test_a_wrong_type_still_raises(hub):
     is still a refusal, not a warning."""
     with pytest.raises(RuntimeError, match="Invalid structured content"):
         try:
-            await hub.call("lying-broker", "get_accounts_wrong_type", {})
+            await hub.call("lying-broker", "get_accounts_wrong_type", {},
+                           account_key="test-account")
         finally:
             await hub.aclose()
 
@@ -60,8 +61,10 @@ async def test_the_tolerated_payload_is_logged_once(hub, caplog):
     either: the sweep runs on a timer and would otherwise repeat this forever."""
     with caplog.at_level(logging.WARNING, logger="nakagai.edge"):
         try:
-            await hub.call("lying-broker", "get_accounts", {})
-            await hub.call("lying-broker", "get_accounts", {})
+            await hub.call("lying-broker", "get_accounts", {},
+                           account_key="test-account")
+            await hub.call("lying-broker", "get_accounts", {},
+                           account_key="test-account")
         finally:
             await hub.aclose()
     warnings = [r for r in caplog.records if "unsettled_funds" in r.getMessage()]
