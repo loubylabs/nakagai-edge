@@ -188,8 +188,8 @@ async def test_edge_agent_can_arm_autopilot_after_checking_in_with_equity(
     # refuses one that carries none. This used to send a bearer token and
     # nothing else, which landed on the house "default" workspace: convenient
     # for a harness, and exactly the anonymous write the platform closed.
-    # The equity report is unaffected either way, since latest_equity_report()
-    # is scoped to the root rather than to a workspace.
+    # The Edge agent and mandate must belong to the same owner because
+    # latest_equity_report() reads that owner's tenant ActivityHistory.
     owner_email = f"edge-owner-{uuid.uuid4().hex}@example.com"
     owner_headers = {"Authorization": "Bearer api-secret", "X-User": owner_email}
 
