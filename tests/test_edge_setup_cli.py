@@ -443,18 +443,23 @@ def test_setup_default_mode_honors_an_explicit_port(edge_root, monkeypatch, caps
 
 # --- connectors login: roots correctly, refuses brokers ---------------------
 
-def _write_registry(root, entries):
-    """A minimal config/connectors.yaml under `root`, the shape
-    `_connector_role` (nakagai/cli.py) reads."""
-    path = root / "config" / "connectors.yaml"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(yaml.safe_dump({"connectors": entries}))
+def _add_signal_connector(database):
+    from nakagai_platform.api.connectors import ConnectorStore
+
+    ConnectorStore(database).add({
+        "id": "yfinance-signals",
+        "kind": "mcp-http",
+        "role": "signals",
+        "url": "https://signals.test/mcp",
+        "enabled": True,
+    })
 
 
-def test_connectors_login_roots_at_settings_not_cwd(tmp_path, monkeypatch, capsys):
+def test_connectors_login_roots_at_settings_not_cwd(
+        tmp_path, monkeypatch, capsys, platform_database):
     seen = {}
     workspace = tmp_path / "workspace"
-    _write_registry(workspace, [{"id": "yfinance-data", "role": "data"}])
+    _add_signal_connector(platform_database)
 
     async def fake_login(root, connector_id):
         seen["root"] = root
@@ -464,12 +469,13 @@ def test_connectors_login_roots_at_settings_not_cwd(tmp_path, monkeypatch, capsy
     monkeypatch.setenv("NAKAGAI_ROOT", str(workspace))
     monkeypatch.setenv("NAKAGAI_EDGE_ROOT", str(tmp_path / "edge"))
 
-    rc = platform_main(["connectors", "login", "yfinance-data"])
+    rc = platform_main(["connectors", "login", "yfinance-signals"])
     assert rc == 0
     assert seen["root"] == workspace
 
 
-def test_connectors_login_refuses_a_broker_connector(tmp_path, monkeypatch, capsys):
+def test_connectors_login_refuses_a_broker_connector(
+        tmp_path, monkeypatch, capsys, platform_database):
     """The load-bearing assertion: broker credentials never touch the
     platform, whether or not this machine happens to have a paired edge.
 
@@ -479,7 +485,6 @@ def test_connectors_login_refuses_a_broker_connector(tmp_path, monkeypatch, caps
     that actually enforces "never invoked".
     """
     workspace = tmp_path / "workspace"
-    _write_registry(workspace, [{"id": "robinhood-trading", "role": "broker"}])
     monkeypatch.setenv("NAKAGAI_ROOT", str(workspace))
     monkeypatch.setenv("NAKAGAI_EDGE_ROOT", str(tmp_path / "edge"))
 
@@ -499,14 +504,13 @@ def test_connectors_login_refuses_a_broker_connector(tmp_path, monkeypatch, caps
 
 
 def test_connectors_login_refuses_a_broker_even_when_edge_is_paired(
-        tmp_path, monkeypatch, capsys):
+        tmp_path, monkeypatch, capsys, platform_database):
     """The refusal must not depend on whether an edge is paired: a broker
     login on the platform is wrong either way."""
     from nakagai_edge.edge.state import EdgeState
 
     workspace = tmp_path / "workspace"
     edge = tmp_path / "edge"
-    _write_registry(workspace, [{"id": "robinhood-trading", "role": "broker"}])
     EdgeState(edge).save_agent("http://platform.test", "ag1", "nk_agent_x")
     monkeypatch.setenv("NAKAGAI_ROOT", str(workspace))
     monkeypatch.setenv("NAKAGAI_EDGE_ROOT", str(edge))
@@ -527,11 +531,10 @@ def test_connectors_login_refuses_a_broker_even_when_edge_is_paired(
 
 
 def test_connectors_login_refuses_an_unknown_connector_id(
-        tmp_path, monkeypatch, capsys):
+        tmp_path, monkeypatch, capsys, platform_database):
     """An id the registry does not list might be a broker we cannot see, so
     it must refuse rather than fall through to a platform login."""
     workspace = tmp_path / "workspace"
-    _write_registry(workspace, [{"id": "yfinance-data", "role": "data"}])
     monkeypatch.setenv("NAKAGAI_ROOT", str(workspace))
     monkeypatch.setenv("NAKAGAI_EDGE_ROOT", str(tmp_path / "edge"))
 
@@ -549,13 +552,10 @@ def test_connectors_login_refuses_an_unknown_connector_id(
 
 
 def test_connectors_login_refuses_when_the_registry_cannot_be_read(
-        tmp_path, monkeypatch, capsys):
+        tmp_path, monkeypatch, capsys, platform_database):
     """A registry that fails to parse must refuse too, same fail-closed
     posture as an unknown id: we cannot confirm the role isn't broker."""
     workspace = tmp_path / "workspace"
-    path = workspace / "config" / "connectors.yaml"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("connectors: [this is not: valid: yaml: at all")
     monkeypatch.setenv("NAKAGAI_ROOT", str(workspace))
     monkeypatch.setenv("NAKAGAI_EDGE_ROOT", str(tmp_path / "edge"))
 
@@ -566,6 +566,10 @@ def test_connectors_login_refuses_when_the_registry_cannot_be_read(
         return {"ok": True, "connector": connector_id, "tool_count": 1}
 
     monkeypatch.setattr("nakagai_edge.oauth_login.login", fake_login)
+    monkeypatch.setattr(
+        "nakagai_platform.api.connectors.ConnectorStore.list",
+        lambda self: (_ for _ in ()).throw(RuntimeError("registry unavailable")),
+    )
 
     rc = platform_main(["connectors", "login", "robinhood-trading"])
     assert rc == 1

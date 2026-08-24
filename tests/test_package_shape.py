@@ -5,7 +5,7 @@ import subprocess
 import sys
 
 
-def test_edge_release_version_is_042():
+def test_edge_release_version_is_043():
     import tomllib
     from pathlib import Path
 
@@ -13,17 +13,17 @@ def test_edge_release_version_is_042():
     pyproject = tomllib.loads((root / "pyproject.toml").read_text())
     project = pyproject["project"]
 
-    assert project["version"] == "0.4.2"
+    assert project["version"] == "0.4.3"
 
     lock = (root / "uv.lock").read_text()
     readme = (root / "README.md").read_text()
-    assert 'name = "nakagai-edge"\nversion = "0.4.2"' in lock
-    assert "0.4.2" in readme
+    assert 'name = "nakagai-edge"\nversion = "0.4.3"' in lock
+    assert "0.4.3" in readme
     assert "account_key" in readme
 
     ci_path = root / ".github" / "workflows" / "ci.yml"
     if ci_path.exists():
-        assert "version('nakagai-edge') == '0.4.2'" in ci_path.read_text()
+        assert "version('nakagai-edge') == '0.4.3'" in ci_path.read_text()
     else:
         excluded = pyproject["tool"]["hatch"]["build"]["targets"]["sdist"]["exclude"]
         assert ".github" in excluded
