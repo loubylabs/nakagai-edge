@@ -30,7 +30,7 @@ from nakagai_edge.edge.sync import BUNDLE_SCHEMA, apply_bundle  # noqa: E402
 
 pytestmark = pytest.mark.anyio
 
-APPROVER = {"X-User": "chris@x.com", "X-Approver-Token": "approver-secret"}
+APPROVER = {"X-User": "chris@nakag.ai", "X-Approver-Token": "approver-secret"}
 
 
 @pytest.fixture
@@ -88,18 +88,18 @@ def platform_root(tmp_path):
 def platform_app(platform_root, monkeypatch):
     monkeypatch.setenv("NAKAGAI_API_TOKEN", "api-secret")
     monkeypatch.setenv("NAKAGAI_APPROVER_TOKEN", "approver-secret")
-    monkeypatch.setenv("NAKAGAI_APPROVER_EMAILS", "chris@x.com")
+    monkeypatch.setenv("NAKAGAI_APPROVER_EMAILS", "chris@nakag.ai")
     return create_app(platform_root, with_mcp=False)
 
 
-def _history(root, user: str):
+def _history(user: str):
     from nakagai_platform.activity_history import ActivityHistory
-    from nakagai_platform.api.db import Database
+    from nakagai_platform.api.db import require_installed_database
     from nakagai_platform.api.tenancy import resolve_workspace_for_email
 
-    database = Database.from_env()
-    return ActivityHistory(root, database,
-                           resolve_workspace_for_email(database, user))
+    database = require_installed_database()
+    context = resolve_workspace_for_email(database, user)
+    return ActivityHistory(database, context.wid)
 
 
 def _enroll(app, *, name="edge-shim", user=APPROVER["X-User"]) -> str:
@@ -127,7 +127,7 @@ async def test_edge_checkin_lands_where_the_platform_can_read_it(
     agent (the defect this branch closes)."""
     from nakagai_platform import mandate as m
 
-    owner = f"equity-owner-{uuid.uuid4().hex}@example.com"
+    owner = f"equity-owner-{uuid.uuid4().hex}@nakag.ai"
     token = _enroll(platform_app, user=owner)
     platform_client = _bridged_platform_client(platform_app, token)
     mcp = _edge_mcp(tmp_path / "edge", platform_client)
@@ -139,7 +139,7 @@ async def test_edge_checkin_lands_where_the_platform_can_read_it(
     out = json.loads(text)
     assert out["ok"] is True
 
-    history = _history(platform_root, owner)
+    history = _history(owner)
     report = m.latest_equity_report(history)
     assert report is not None
     assert report["account_equity"] == 100_000.0
@@ -157,7 +157,7 @@ async def test_edge_checkin_discards_half_an_equity_report(
     baseline and would read as a flat day."""
     from nakagai_platform import mandate as m
 
-    owner = f"half-report-owner-{uuid.uuid4().hex}@example.com"
+    owner = f"half-report-owner-{uuid.uuid4().hex}@nakag.ai"
     token = _enroll(platform_app, user=owner)
     platform_client = _bridged_platform_client(platform_app, token)
     mcp = _edge_mcp(tmp_path / "edge", platform_client)
@@ -166,7 +166,7 @@ async def test_edge_checkin_discards_half_an_equity_report(
         "status": "scanning", "account_equity": 100_000.0})   # no day_pnl
 
     assert m.latest_equity_report(
-        _history(platform_root, owner)) is None
+        _history(owner)) is None
 
 
 async def test_edge_agent_can_arm_autopilot_after_checking_in_with_equity(
@@ -190,7 +190,7 @@ async def test_edge_agent_can_arm_autopilot_after_checking_in_with_equity(
     # for a harness, and exactly the anonymous write the platform closed.
     # The Edge agent and mandate must belong to the same owner because
     # latest_equity_report() reads that owner's tenant ActivityHistory.
-    owner_email = f"edge-owner-{uuid.uuid4().hex}@example.com"
+    owner_email = f"edge-owner-{uuid.uuid4().hex}@nakag.ai"
     owner_headers = {"Authorization": "Bearer api-secret", "X-User": owner_email}
 
     # Seed the mandate the way /api/mandate/arm itself resolves it: the same

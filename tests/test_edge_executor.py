@@ -304,12 +304,7 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
     from nakagai_edge.hub import ConnectorHub
     from tests.fixtures.inproc import connect_to
     from nakagai_edge.signing import generate_keypair, public_key_for
-    # The store seam, not scan.signal.append_signals: the platform moved signal
-    # writes behind get_signal_store so the file and Postgres backends share one
-    # door, and this test resolves its signal through whichever door the platform
-    # is actually using. Passing the platform ROOT, not root/"signals";
-    # FileSignalStore appends that segment itself.
-    from nakagai_platform.api.signal_store import get_signal_store
+    from nakagai_platform.api.signal_store import SignalStore
 
     NOW = pd.Timestamp("2026-07-13T15:00:00+00:00")   # Monday 08:00 LA, inside RTH
     monkeypatch.setattr(pd.Timestamp, "now", staticmethod(lambda tz=None: NOW))
@@ -330,7 +325,7 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
     priv, pub = generate_keypair()
     monkeypatch.setenv("NAKAGAI_API_TOKEN", "api-secret")
     monkeypatch.setenv("NAKAGAI_APPROVER_TOKEN", "approver-secret")
-    monkeypatch.setenv("NAKAGAI_APPROVER_EMAILS", "chris@x.com")
+    monkeypatch.setenv("NAKAGAI_APPROVER_EMAILS", "chris@nakag.ai")
     monkeypatch.setenv("NAKAGAI_APPROVAL_SIGNING_KEY", priv)
 
     order = {"symbol": "NVDA", "side": "buy", "quantity": 10,
@@ -344,8 +339,7 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
                  "price": "limit_price", "stop": "stop_price",
                  "account": "account_number"},
         "values": {"side": {"buy": ["buy", "buy_to_open", "buy_to_cover"],
-                            "sell": ["sell", "sell_to_open", "sell_short"]}},
-        "market_args": {"order_type": "market"}}
+                            "sell": ["sell", "sell_to_open", "sell_short"]}}}
 
     # ---- platform: autopilot armed, a seeded signal, the signing key ----
     plat = tmp_path / "platform"
@@ -356,7 +350,7 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
     # The mandate is a per-workspace Postgres row now, not config/mandate.yaml.
     # autoapprove.py resolves the account off the approval record's
     # `requested_by`, which agent_routes.py sets to the agent's owner email
-    # (the X-User the approver headers below carry, chris@x.com). Seed the
+    # (the X-User the approver headers below carry, chris@nakag.ai). Seed the
     # SAME account here, through MandateStore, or the enqueue below resolves
     # to a workspace-less context that reads the observer default and never
     # arms anything.
@@ -365,8 +359,8 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
     from nakagai_platform.mandate_store import MandateStore
 
     mandate_db = Database.from_env()
-    mandate_db.workspace_id("chris-x", "chris@x.com")
-    mandate_ctx = resolve_workspace_for_email(mandate_db, "chris@x.com")
+    mandate_db.workspace_id("chris-nakag", "chris@nakag.ai")
+    mandate_ctx = resolve_workspace_for_email(mandate_db, "chris@nakag.ai")
     mandate_store = MandateStore(plat, mandate_db, mandate_ctx)
     doc = mandate_store.load()
     doc["preset"] = "autopilot"
@@ -396,28 +390,27 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
     AllowlistStore(plat, mandate_db, mandate_ctx).apply(
         ["NVDA"], "seeded for the end-to-end autopilot loop")
 
-    (plat / "config" / "connectors.yaml").write_text(_yaml.safe_dump({"connectors": [{
+    from nakagai_platform.api.connectors import ConnectorStore
+
+    # Connector and signal setup share the same durable database the running
+    # platform reads. A file registry is no longer an input to PlatformHub.
+    ConnectorStore(mandate_db).add({
         "id": "broker", "kind": "mcp-http", "role": "broker",
         "url": "https://example.test/mcp", "enabled": True,
         "guardrails": {"allow_writes": True, "read_only_tools": ["get_*"],
                        "approvals": {"require_for": ["place_*"], "ttl_s": 900}},
-        "capabilities": {"place_order": place_order}}]}))
-    # Seeded through the SAME Postgres `mandate_db` the running platform uses,
-    # not a file store: the mandate now requires DATABASE_URL to grant
-    # anything, so create_app's hub.database is set here too, and
-    # provenance() (nakagai_platform/gateway/hub.py) resolves the signal
-    # store off that same database. A signal written to the file store while
-    # the hub reads Postgres would never be found, and the enqueue below would
-    # decline as "no signal was cited".
-    get_signal_store(plat, mandate_db).append([{
+        "capabilities": {"place_order": place_order},
+    })
+    SignalStore(mandate_db).append([{
         "id": signal_id, "bar_ts": "2026-07-13T14:55:00+00:00",
         "detected_ts": "2026-07-13T14:55:00+00:00", "symbol": "NVDA",
-        "strategy": "ict", "direction": "LONG", "entry": 118.4, "stop": 116.1,
+        "strategy": "ict", "direction": "LONG", "timeframe": "15m",
+        "entry": 118.4, "stop": 116.1,
         "target": 124.0,
         "stale_data": False, "expressions": {"swing": {"instrument": "shares"}}}])
 
     platform = TestClient(create_app(plat, with_mcp=False))
-    approver = {"Authorization": "Bearer api-secret", "X-User": "chris@x.com",
+    approver = {"Authorization": "Bearer api-secret", "X-User": "chris@nakag.ai",
                 "X-Approver-Token": "approver-secret"}
     code = platform.post("/api/agents", json={"name": "edge"},
                          headers=approver).json()["code"]
@@ -473,9 +466,11 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
                         signal_id=signal_id)
     assert rec.status == "pending"      # declined to a human tap, not auto-granted
 
+    from nakagai_platform.api.db import require_installed_database
     from nakagai_platform.gateway import get_hub
 
-    undecided = get_hub(plat).approvals.get(str(mandate_ctx.wid), rec.id)
+    hub = get_hub(plat, require_installed_database())
+    undecided = hub.approvals.get(str(mandate_ctx.wid), rec.id)
     assert undecided.status == "pending"
     assert undecided.artifact is None   # nothing was signed, so nothing is executable
     assert undecided.decided_by == ""
@@ -505,8 +500,8 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
     # the platform's own record: decided by the owner, then executed by the edge.
     # assert_owner_action returns the X-User it validated, lowercased, and that
     # is what hub.decide() stamps on the record as decided_by.
-    plat_rec = get_hub(plat).approvals.get(str(mandate_ctx.wid), rec.id)
-    assert plat_rec.decided_by == "chris@x.com"
+    plat_rec = hub.approvals.get(str(mandate_ctx.wid), rec.id)
+    assert plat_rec.decided_by == "chris@nakag.ai"
     assert plat_rec.status == "executed"
     await edge_hub.aclose()
 
