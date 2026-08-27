@@ -248,6 +248,10 @@ async def test_write_tool_edge_client_error_returns_is_error_json(tmp_path):
     class BoomHub:
         account_key = "ag1"
 
+        def spec(self, connector_id):
+            assert connector_id == "demo"
+            return ConnectorSpec(id="demo", kind="mcp-http", role="broker")
+
         async def call(self, connector_id, tool, args, **kw):
             raise EdgeClientError("platform rejected the agent token. Was it revoked?")
 

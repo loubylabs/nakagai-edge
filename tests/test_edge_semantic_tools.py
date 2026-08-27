@@ -183,10 +183,101 @@ def _server(state, hub, client=None):
                            Brake(state, hub, client, audit))
 
 
-async def _call(mcp, tool, **args):
-    result = await mcp.call_tool(tool, args)
+async def _call(mcp, name, **args):
+    result = await mcp.call_tool(name, args)
     text = result.content[0].text
     return json.loads(text)
+
+
+# ---- raw calls cannot bypass semantic order intent -----------------------
+
+
+@pytest.mark.parametrize("connector,raw_tool", [
+    (ALIEN, "submit"),
+    (ROBINHOOD, "place_equity_order"),
+])
+async def test_raw_declared_order_tool_requires_canonical_order_intent(
+        tmp_path, connector, raw_tool):
+    """Removing the refusal would let a caller bypass the canonical order
+    vocabulary and reach the hub with the broker's private order shape."""
+    hub = MapHub()
+    doc = await _call(
+        _server(_state(tmp_path), hub), "call_connector",
+        connector_id=connector, tool=raw_tool,
+        args_json=json.dumps({"account": ACCOUNTS[connector], "quantity": 1}),
+    )
+
+    assert doc == {
+        "is_error": True,
+        "code": "canonical_order_required",
+        "error": "raw order calls are retired; use place_order",
+    }
+    assert hub.calls == [], "the refusal must land before hub call or enqueue"
+
+
+async def test_semantic_place_order_still_resolves_the_declared_order_tool(
+        tmp_path):
+    """Guarding the raw name must not guard the semantic route after it has
+    translated canonical fields through the selected connector map."""
+    hub = MapHub(specs=_specs(ALIEN_CONNECTOR))
+    doc = await _call(
+        _server(_state(tmp_path), hub), "place_order",
+        connector_id=ALIEN, symbol="AAPL", side="buy", quantity=1,
+        account="AL-1",
+    )
+
+    assert doc["tool"] == "submit"
+    assert hub.calls == [(ALIEN, "submit", {
+        "ticker": "AAPL", "action": "BUY", "qty": 1.0,
+        "acct": "AL-1",
+    })]
+
+
+async def test_raw_operation_outside_the_order_capability_still_works(tmp_path):
+    """A broad write-name or connector-role check would retire operations the
+    canonical vocabulary does not cover."""
+    hub = MapHub(specs=_specs(ALIEN_CONNECTOR))
+    doc = await _call(
+        _server(_state(tmp_path), hub), "call_connector",
+        connector_id=ALIEN, tool="ticker",
+        args_json=json.dumps({"tickers": ["AAPL"]}),
+    )
+
+    assert doc["data"] == PAYLOADS["ticker"]
+    assert hub.calls == [(ALIEN, "ticker", {"tickers": ["AAPL"]})]
+
+
+async def test_raw_tool_is_unaffected_without_a_place_order_capability(tmp_path):
+    """Matching a guessed broker name would refuse connectors that never
+    declared the canonical capability and therefore have no semantic path."""
+    hub = MapHub(specs=_without(ALIEN_CONNECTOR, "place_order"))
+    doc = await _call(
+        _server(_state(tmp_path), hub), "call_connector",
+        connector_id=ALIEN, tool="submit",
+        args_json=json.dumps({"acct": "AL-1", "qty": 1}),
+    )
+
+    assert doc["data"] == PAYLOADS["submit"]
+    assert hub.calls == [(ALIEN, "submit", {"acct": "AL-1", "qty": 1})]
+
+
+async def test_raw_registry_error_still_returns_an_error_document(tmp_path):
+    """Adding the capability lookup must not turn a malformed registry from
+    the existing guarded error document into an escaped MCP execution error."""
+    class BrokenRegistryHub(MapHub):
+        def spec(self, connector_id):
+            raise ValueError("broken connector registry")
+
+        async def call(self, connector_id, tool, args, **kw):
+            raise ValueError("broken connector registry")
+
+    hub = BrokenRegistryHub()
+    doc = await _call(
+        _server(_state(tmp_path), hub), "call_connector",
+        connector_id=ALIEN, tool="ticker", args_json="{}",
+    )
+
+    assert doc == {"is_error": True, "error": "broken connector registry"}
 
 
 # ---- the reads: the same canonical fields out of two alien shapes ---------

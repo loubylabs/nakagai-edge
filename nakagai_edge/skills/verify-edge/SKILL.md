@@ -99,7 +99,7 @@ Only with the owner's explicit go-ahead, because it creates a real approval
 record and, on a real broker, a real order. Prefer the demo broker where
 available.
 
-1. Stage: `call_connector` on a broker with a small `place_*` order; expect
+1. Stage: semantic `place_order` with a small order; expect
    `approval_required: true` and an `approval_id` (or `auto_approved: true`
    under an armed autopilot mandate).
 2. Human approves on the platform's Approvals page.
