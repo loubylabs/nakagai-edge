@@ -5,9 +5,14 @@ the only place a broker credential is ever written to disk. Your agent talks to
 exactly one MCP endpoint, the edge, and never sees a token. The platform never
 sees one either.
 
-Version 0.4.3 requires an explicit `account_key` on every local approval queue
-operation. A paired edge uses its stable `agent_id` for that key. The key stays
-local; the hosted platform resolves account authority from the bearer token.
+Version 0.4.4 makes semantic `place_order` the only order entry. A raw
+`call_connector` request whose tool exactly matches the selected connector's
+declared `capabilities.place_order.tool` is refused before dispatch with
+`canonical_order_required`. Other raw connector operations remain available.
+
+Every local approval queue operation still requires an explicit `account_key`.
+A paired edge uses its stable `agent_id` for that key. The key stays local; the
+hosted platform resolves account authority from the bearer token.
 
 The queue exposes two bounded owner reads. `history(account_key, statuses=...,
 limit=..., before=...)` returns uncleared records in terminal-occurrence order.
@@ -353,9 +358,11 @@ Letting registry order decide which broker received an order is not something
 an agent can review or an owner can predict, so this is the one place the layer
 gets louder rather than quieter as brokers are added.
 
-`call_connector` remains the raw escape hatch: a broker tool outside the
-vocabulary is still reachable by its own name, through the same guardrails, the
-same approval queue, and the same audit record.
+`call_connector` remains the raw escape hatch for a broker tool outside the
+vocabulary. A connector's declared `place_order` tool is the exact exception:
+calling that raw name returns `canonical_order_required`, so every order starts
+through semantic `place_order`. Other raw operations still use the same
+guardrails, approval queue, and audit record.
 
 **Three read-only classifications, each of which fails silently.** An
 unclassified tool counts as a write (`unknown_is_write`, fail closed), and

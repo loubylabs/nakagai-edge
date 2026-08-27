@@ -53,6 +53,12 @@ STALE_POLICY = {"is_error": True, "error":
     "policy is past TTL; every connector call is refused until a sync "
     "succeeds"}
 
+CANONICAL_ORDER_REQUIRED = {
+    "is_error": True,
+    "code": "canonical_order_required",
+    "error": "raw order calls are retired; use place_order",
+}
+
 
 def freshness_error() -> str:
     return json.dumps(STALE_POLICY)
@@ -312,8 +318,9 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         (list_accounts, get_balance, list_positions, get_quote, list_orders,
         place_order, cancel_order) do the same work in one shared vocabulary
         and are what you want unless a broker offers something they do not
-        cover. Writes enqueue for human approval on the platform; poll
-        get_approval for the outcome."""
+        cover. A connector's declared raw order tool is refused here because
+        place_order is the only order entry. Other writes enqueue for human
+        approval on the platform; poll get_approval for the outcome."""
         try:
             args = json.loads(args_json or "{}")
         except json.JSONDecodeError as e:
@@ -325,6 +332,17 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
                 "is_error": True,
                 "error": f"platform tool {tool!r} is reserved for local edge correspondence",
             })
+        from nakagai_edge.hub import ConnectorError
+        try:
+            order = hub.spec(connector_id).capabilities.get("place_order")
+        except (ConnectorError, ValueError):
+            order = None
+        if order is not None and tool == order.tool:
+            audit.record("denial", connector_id, tool, {
+                "reason": CANONICAL_ORDER_REQUIRED["error"],
+                "code": CANONICAL_ORDER_REQUIRED["code"],
+            })
+            return json.dumps(CANONICAL_ORDER_REQUIRED)
         return json.dumps(await _guarded(connector_id, tool, args), default=str)
 
     @mcp.tool()
