@@ -360,6 +360,14 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
 
     mandate_db = Database.from_env()
     mandate_db.workspace_id("chris-nakag", "chris@nakag.ai")
+    # Autopilot stages orders, and the platform now refuses to persist a rung
+    # that stages orders for an account that is not Pro. Granted BEFORE the
+    # resolver on purpose: WorkspaceContext carries the plan it read at
+    # resolution time, so a grant after this line would leave the store
+    # holding a stale free context and the save below would still be refused.
+    mandate_db.grant_plan("chris@nakag.ai", plan="pro",
+                          reason="edge autopilot fixture",
+                          granted_by="edge-tests")
     mandate_ctx = resolve_workspace_for_email(mandate_db, "chris@nakag.ai")
     mandate_store = MandateStore(plat, mandate_db, mandate_ctx)
     doc = mandate_store.load()
