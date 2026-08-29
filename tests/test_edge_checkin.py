@@ -197,6 +197,17 @@ async def test_edge_agent_can_arm_autopilot_after_checking_in_with_equity(
     # email through the same resolver, so this store and the route land on one
     # workspace row.
     db = Database.from_env()
+    # Autopilot stages orders, and the platform now refuses to persist a rung
+    # that stages orders for an account that is not Pro. This owner is invented
+    # per-run, so it starts on the free default and the save below would be
+    # refused. A comp grant is the cheapest way to say "this is a paying
+    # account" without inventing Stripe identity.
+    #
+    # It has to land BEFORE the resolver: WorkspaceContext carries the plan it
+    # read at resolution time, so granting after this line would leave the
+    # store holding a stale free context and refuse anyway.
+    db.grant_plan(owner_email, plan="pro", reason="edge autopilot fixture",
+                  granted_by="edge-tests")
     ctx = resolve_workspace(db, "", owner_email)
     store = MandateStore(platform_root, db, ctx)
     doc = store.load()
