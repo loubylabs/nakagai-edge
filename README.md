@@ -5,10 +5,11 @@ the only place a broker credential is ever written to disk. Your agent talks to
 exactly one MCP endpoint, the edge, and never sees a token. The platform never
 sees one either.
 
-Version 0.4.4 makes semantic `place_order` the only order entry. A raw
-`call_connector` request whose tool exactly matches the selected connector's
-declared `capabilities.place_order.tool` is refused before dispatch with
-`canonical_order_required`. Other raw connector operations remain available.
+Version 0.4.5 is the current release. Since 0.4.4, semantic `place_order` is
+the only order entry: a raw `call_connector` request whose tool exactly matches
+the selected connector's declared `capabilities.place_order.tool` is refused
+before dispatch with `canonical_order_required`. Other raw connector operations
+remain available.
 
 Every local approval queue operation still requires an explicit `account_key`.
 A paired edge uses its stable `agent_id` for that key. The key stays local; the
