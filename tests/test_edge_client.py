@@ -140,6 +140,55 @@ def test_candidate_protocol_header_only_covers_authenticated_event_polls():
     ]
 
 
+def test_configured_candidate_wake_is_attested_only_on_event_polls():
+    seen = []
+
+    def handler(request):
+        seen.append((request.url.path,
+                     request.headers.get("x-nakagai-candidate-wake")))
+        if request.url.path == "/api/agent/events":
+            return httpx.Response(200, json={"ok": True, "events": []})
+        if request.url.path == "/api/agent/bundle":
+            return httpx.Response(200, json={"bundle_version": "v1"})
+        return httpx.Response(200, json={"ok": True})
+
+    client = PlatformClient(
+        "https://api.test", "nk_agent_t", candidate_wake=True,
+        transport=_transport(handler),
+    )
+    client.await_events(timeout_s=0)
+    client.list_peers()
+    client.get_bundle()
+    client.accept_candidate("candidate-1", "evidence is current")
+    client.report_candidate_outcome(
+        "candidate-1", mechanical_status="blocked",
+        mechanical_reason="approval is pending",
+    )
+    client.report_connectors([])
+
+    assert seen == [
+        ("/api/agent/events", "1"),
+        ("/api/agent/peers", None),
+        ("/api/agent/bundle", None),
+        ("/api/agent/candidates/candidate-1/accept", None),
+        ("/api/agent/candidates/candidate-1/outcome", None),
+        ("/api/agent/connectors", None),
+    ]
+
+
+def test_unconfigured_event_poll_omits_candidate_wake_attestation():
+    def handler(request):
+        assert request.url.path == "/api/agent/events"
+        assert request.headers["x-nakagai-candidate-protocol"] == "1"
+        assert request.headers.get("x-nakagai-candidate-wake") is None
+        return httpx.Response(200, json={"ok": True, "events": []})
+
+    client = PlatformClient(
+        "https://api.test", "nk_agent_t", transport=_transport(handler),
+    )
+    client.await_events(timeout_s=0)
+
+
 def test_candidate_decision_routes_put_only_rationale_in_the_body():
     seen = []
 

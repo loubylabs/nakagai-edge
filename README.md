@@ -5,7 +5,7 @@ the only place a broker credential is ever written to disk. Your agent talks to
 exactly one MCP endpoint, the edge, and never sees a token. The platform never
 sees one either.
 
-Version 0.5.1 is the current release. An agent woken for one execution
+Version 0.5.2 is the current release. An agent woken for one execution
 candidate can inspect that candidate, accept or abstain with a rationale, then
 stop. A listener-owned local scope enforces that boundary for the wake. The
 same candidate decision tools and read-only inspection remain available, while
@@ -16,6 +16,13 @@ or the brake can still refuse execution. Semantic
 `call_connector` request whose tool exactly matches the selected connector's
 declared `capabilities.place_order.tool` is refused before dispatch with
 `canonical_order_required`. Other raw connector operations remain available.
+
+A listener started with a parsed, nonempty `--wake-command` adds
+`X-Nakagai-Candidate-Wake: 1` only to its authenticated event polls. This
+attests that the current listener is configured to wake an agent. It remains a
+self-reported readiness fact and grants no execution authority. The separate
+`X-Nakagai-Candidate-Protocol: 1` header continues to mean only that the poll
+understands execution candidate events.
 
 Every local approval queue operation still requires an explicit `account_key`.
 A paired edge uses its stable `agent_id` for that key. The key stays local; the
