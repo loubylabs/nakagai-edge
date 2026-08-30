@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 import uuid
 from datetime import datetime
@@ -50,9 +51,20 @@ class CandidateWakeScope:
             "token": token,
             "candidate_id": candidate_id.strip(),
             "seq": event.get("seq"),
+            "owner_pid": os.getpid(),
             "expires_at": min(expires_at, now + CANDIDATE_WAKE_MAX_S),
         })
         return token
+
+    def remaining(self, token: str) -> float | None:
+        """Seconds left for the listener process that owns `token`."""
+        try:
+            doc = json.loads(self.state.candidate_wake_path.read_text())
+            if not isinstance(doc, dict) or doc.get("token") != token:
+                return None
+            return max(0.0, float(doc["expires_at"]) - time.time())
+        except (OSError, ValueError, TypeError, json.JSONDecodeError, KeyError):
+            return None
 
     def current(self) -> dict | None:
         path = self.state.candidate_wake_path
@@ -70,10 +82,24 @@ class CandidateWakeScope:
             expired = float(doc.get("expires_at", 0)) <= time.time()
         except (ValueError, TypeError):
             return self._corrupt_current(path)
-        if expired:
+        owner_pid = doc.get("owner_pid")
+        owner_live = (
+            isinstance(owner_pid, int) and not isinstance(owner_pid, bool)
+            and self._pid_live(owner_pid))
+        if expired and not owner_live:
             path.unlink(missing_ok=True)
             return None
         return {"candidate_id": doc["candidate_id"], "seq": doc.get("seq")}
+
+    @staticmethod
+    def _pid_live(pid: int) -> bool:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        return True
 
     @staticmethod
     def _corrupt_current(path) -> dict | None:

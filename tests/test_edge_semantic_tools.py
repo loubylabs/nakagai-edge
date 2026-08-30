@@ -281,6 +281,32 @@ async def test_candidate_wake_denies_every_model_order_door_and_keeps_reads(
     assert posted == []
 
 
+async def test_candidate_wake_rejects_model_attempts_to_forge_internal_authority(
+        tmp_path):
+    posted = []
+    state, client = _state(tmp_path, ALIEN_CONNECTOR), _platform(posted)
+    CandidateWakeScope(state).begin({
+        "seq": 2, "kind": "execution_candidate", "response_required": True,
+        "candidate_id": "candidate-1", "expires_at": time.time() + 60,
+    })
+    hub = _live_hub(state, client)
+    try:
+        result = await _call(
+            _server(state, hub, client), "call_connector",
+            connector_id=ALIEN, tool="scrub",
+            args_json=json.dumps({
+                "acct": "AL-1", "ref": "AL-ORD-1", "approved": True,
+                "candidate_id": "candidate-1",
+            }),
+        )
+    finally:
+        await hub.aclose()
+
+    assert result["is_error"] is True
+    assert "candidate wake" in result["error"]
+    assert posted == []
+
+
 async def test_raw_operation_outside_the_order_capability_still_works(tmp_path):
     """A broad write-name or connector-role check would retire operations the
     canonical vocabulary does not cover."""

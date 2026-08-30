@@ -44,13 +44,33 @@ class WakeRunner:
                 if event is None:
                     return
                 token = self.scope.begin(event)
+                if event.get("kind") == "execution_candidate" and token is None:
+                    self.note(f"[wake] skipped expired execution candidate for seq "
+                              f"{event.get('seq')}")
+                    continue
                 try:
+                    options = {
+                        "input": json.dumps(event, separators=(",", ":")) + "\n",
+                        "text": True,
+                        "check": False,
+                    }
+                    if token is not None:
+                        timeout = self.scope.remaining(token)
+                        if timeout is None or timeout <= 0:
+                            self.note(
+                                "[wake] skipped expired execution candidate for seq "
+                                f"{event.get('seq')}")
+                            continue
+                        options["timeout"] = timeout
                     result = self._run(
                         self.command,
-                        input=json.dumps(event, separators=(",", ":")) + "\n",
-                        text=True,
-                        check=False,
+                        **options,
                     )
+                except subprocess.TimeoutExpired:
+                    # subprocess.run kills and waits for its child before it
+                    # raises, so the scope remains closed through process death.
+                    self.note(f"[wake] command timed out for seq {event.get('seq')}")
+                    continue
                 finally:
                     self.scope.finish(token)
                 if result.returncode:

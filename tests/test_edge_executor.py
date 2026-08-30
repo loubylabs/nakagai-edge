@@ -12,7 +12,7 @@ pytest.importorskip("cryptography")
 from nakagai_edge.edge.audit import EdgeAudit
 from nakagai_edge.edge.client import PlatformClient
 from nakagai_edge.edge.candidate import candidate_entries_armed
-from nakagai_edge.edge.executor import poll_once
+from nakagai_edge.edge.executor import poll_once, reconcile_candidate_fills
 from nakagai_edge.edge.remote import RemoteApprovalQueue, intents
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.sync import BUNDLE_SCHEMA, apply_bundle
@@ -232,7 +232,7 @@ async def test_disarmed_brake_refuses_a_candidate_grant_before_broker_contact(tm
     assert "brake" in client.candidate_outcomes[0]["mechanical_reason"]
 
 
-async def test_candidate_reports_success_only_after_supervision_is_broker_readable(
+async def test_preexisting_position_does_not_turn_resting_candidate_limit_into_fill(
         tmp_path):
     trace = []
     artifact = _artifact(
@@ -269,23 +269,117 @@ async def test_candidate_reports_success_only_after_supervision_is_broker_readab
 
     assert await poll_once(hub, state, client, EdgeAudit(state)) == 1
 
-    assert trace == ["broker", "positions", "execution", "outcome"]
+    assert trace == ["broker", "execution"]
     assert reports == [{
         "ok": True, "result": {"is_error": False, "data": {"order_id": "42"}},
-        "error": "", "outcome_unknown": False, "order_id": "",
+        "error": "", "outcome_unknown": False, "order_id": "42",
     }]
-    stored = load_supervision(state)["a1"]
-    assert stored["state"] == "armed"
-    assert stored["symbol"] == "AAPL"
-    assert client.candidate_outcomes == [{
-        "mechanical_status": "submitted",
-        "mechanical_reason": "broker execution reported and supervision verified",
-        "approval_id": "a1", "urgent": False, "outcome_unknown": False,
-    }]
+    assert load_supervision(state) == {}
+    assert client.candidate_outcomes == []
+    assert intents(state)["a1"]["phase"] == "submitted"
+    assert intents(state)["a1"]["broker_order_id"] == "42"
     assert candidate_entries_armed(state) is True
 
 
-async def test_supervision_failure_disarms_entries_reports_urgent_and_alerts_owner(
+async def test_candidate_execution_report_failure_keeps_submission_and_disarms(
+        tmp_path):
+    artifact = _artifact(
+        "a1", args=CANDIDATE_ARGS, candidate_id="candidate-1",
+        account="463605220")
+    state, client, queue, reports = _setup(
+        tmp_path, artifact=artifact, broken_execution=True,
+        record_overrides={
+            "args": CANDIDATE_ARGS, "signal_id": "signal-1",
+            "exit_warrant": {
+                "expires_at": time.time() + 3600, "signature": "warrant"},
+        },
+    )
+    queue.enqueue(
+        "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
+        candidate_id="candidate-1", intent_account="463605220",
+    )
+
+    await poll_once(CandidateHub(), state, client, EdgeAudit(state))
+
+    assert reports and reports[0]["ok"] is True
+    assert intents(state)["a1"]["phase"] == "submitted"
+    assert intents(state)["a1"]["broker_order_id"] == "42"
+    assert candidate_entries_armed(state) is False
+    assert client.candidate_outcomes[0]["mechanical_status"] == "blocked"
+    assert client.candidate_outcomes[0]["urgent"] is True
+    assert client.candidate_alerts
+
+
+async def test_later_matching_fill_establishes_supervision_and_completes_candidate(
+        tmp_path):
+    artifact = _artifact(
+        "a1", args=CANDIDATE_ARGS, candidate_id="candidate-1",
+        account="463605220")
+    warrant = {"expires_at": time.time() + 3600, "signature": "warrant"}
+    state, client, queue, reports = _setup(
+        tmp_path, artifact=artifact,
+        record_overrides={
+            "args": CANDIDATE_ARGS, "signal_id": "signal-1",
+            "exit_warrant": warrant,
+        },
+    )
+    queue.enqueue(
+        "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
+        candidate_id="candidate-1", intent_account="463605220",
+    )
+    hub = CandidateHub(positions=[{"symbol": "AAPL", "quantity": "3"}])
+    await poll_once(hub, state, client, EdgeAudit(state))
+
+    matched = await reconcile_candidate_fills(
+        hub, state, client, EdgeAudit(state), hub.spec("demo"), "463605220",
+        [{"order_id": "42", "symbol": "AAPL", "side": "buy",
+          "quantity": 3.0, "status": "filled", "fill_price": 211.31}],
+    )
+
+    assert matched == 1
+    stored = load_supervision(state)["a1"]
+    assert stored["state"] == "armed"
+    assert stored["entry_price"] == 211.31
+    assert intents(state) == {}
+    assert client.candidate_outcomes == [{
+        "mechanical_status": "submitted",
+        "mechanical_reason": "broker fill reconciled and supervision verified",
+        "approval_id": "a1", "urgent": False, "outcome_unknown": False,
+    }]
+
+
+async def test_mismatched_fill_order_id_cannot_complete_candidate(tmp_path):
+    artifact = _artifact(
+        "a1", args=CANDIDATE_ARGS, candidate_id="candidate-1",
+        account="463605220")
+    state, client, queue, _reports = _setup(
+        tmp_path, artifact=artifact,
+        record_overrides={
+            "args": CANDIDATE_ARGS, "signal_id": "signal-1",
+            "exit_warrant": {
+                "expires_at": time.time() + 3600, "signature": "warrant"},
+        },
+    )
+    queue.enqueue(
+        "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
+        candidate_id="candidate-1", intent_account="463605220",
+    )
+    hub = CandidateHub()
+    await poll_once(hub, state, client, EdgeAudit(state))
+
+    matched = await reconcile_candidate_fills(
+        hub, state, client, EdgeAudit(state), hub.spec("demo"), "463605220",
+        [{"order_id": "other-order", "symbol": "AAPL", "side": "buy",
+          "quantity": 3.0, "status": "filled", "fill_price": 211.31}],
+    )
+
+    assert matched == 0
+    assert load_supervision(state) == {}
+    assert intents(state)["a1"]["phase"] == "submitted"
+    assert client.candidate_outcomes == []
+
+
+async def test_supervision_failure_after_actual_fill_disarms_and_alerts_owner(
         tmp_path):
     artifact = _artifact(
         "a1", args=CANDIDATE_ARGS, candidate_id="candidate-1",
@@ -306,19 +400,24 @@ async def test_supervision_failure_disarms_entries_reports_urgent_and_alerts_own
     hub = CandidateHub(position_error=RuntimeError("positions unreadable"))
 
     assert await poll_once(hub, state, client, EdgeAudit(state)) == 1
+    assert reports[0]["ok"] is True
 
+    matched = await reconcile_candidate_fills(
+        hub, state, client, EdgeAudit(state), hub.spec("demo"), "463605220",
+        [{"order_id": "42", "symbol": "AAPL", "side": "buy",
+          "quantity": 3.0, "status": "filled", "fill_price": 211.31}],
+    )
+
+    assert matched == 1
     assert len(hub.calls) == 1
-    assert reports[0]["ok"] is False
-    assert reports[0]["outcome_unknown"] is True
-    assert "supervision" in reports[0]["error"]
     assert client.candidate_outcomes == [{
         "mechanical_status": "blocked",
-        "mechanical_reason": reports[0]["error"],
+        "mechanical_reason": client.candidate_alerts[0]["note"],
         "approval_id": "a1", "urgent": True, "outcome_unknown": True,
     }]
     assert client.candidate_alerts == [{
         "status": "alert",
-        "note": reports[0]["error"],
+        "note": client.candidate_outcomes[0]["mechanical_reason"],
         "account_equity": None,
         "day_pnl": None,
     }]
@@ -326,13 +425,6 @@ async def test_supervision_failure_disarms_entries_reports_urgent_and_alerts_own
     from nakagai_edge.edge.brake import armed
     assert armed(state) is True
     assert intents(state) == {}
-    assert not any(
-        event["kind"] == "execution" and event["detail"].get("ok") is True
-        for event in EdgeAudit(state).pending()
-    )
-
-    await poll_once(hub, state, client, EdgeAudit(state))
-    assert len(hub.calls) == 1
 
 
 async def test_candidate_outcome_unknown_keeps_the_existing_fence_and_alerts(

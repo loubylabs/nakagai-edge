@@ -133,7 +133,9 @@ ROBINHOOD_CONNECTOR = {
                                "time_in_force": "string", "account": "string"},
             "values": {"side": {"buy": ["buy", "buy_to_open", "buy_to_cover"],
                                 "sell": ["sell", "sell_to_open", "sell_short"]},
-                       "order_type": {"limit": ["limit"], "market": ["market"]}}},
+                       "order_type": {"limit": ["limit"], "market": ["market"]}},
+            "fields": {"order_id": ["order_id"],
+                       "fill_price": ["average_price"]}},
         # The broker that declares everything the fill journal can use: both
         # enrichment fields, and a word for `filled` so the sweep can ask for
         # filled orders instead of taking the default. The alien fixture above

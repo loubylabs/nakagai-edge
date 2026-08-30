@@ -4,7 +4,7 @@
     config/connectors.yaml   synced from the bundle (secret-free)
     secrets/tokens/     broker OAuth tokens (the gateway's own layout)
     cache/bundle.json   last bundle + fetch metadata
-    cache/intents.json  write intents awaiting a platform grant
+    cache/intents.json  write intents awaiting a grant or an exact broker fill
     cache/supervised.json    positions the brake watches, and their warrants
     cache/brake-off.json     local disarm; its presence never needs the network
     cache/candidate-wake.json    bounded listener-owned candidate write scope

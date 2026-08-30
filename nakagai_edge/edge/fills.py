@@ -1,9 +1,9 @@
-"""The fill journal: what the broker's order history says, recorded locally and
-shipped to the platform (POST /api/agent/fills).
+"""The fill journal: what the broker's order history says, recorded locally,
+reconciled against submitted candidates, and shipped to the platform.
 
-This is the one path that carries trades the AGENT did not place. Everything
-else the edge reports is about its own conduct; a trade the owner made by hand
-in the broker's app reaches the platform here or not at all.
+This is the one path that declares an order filled. A submitted candidate must
+match its exact broker order id here before supervision starts. An order id no
+approval claims remains an owner-placed trade when the rows reach the platform.
 
 Three rules govern this module, and each of them inverts a rule that holds
 elsewhere in the edge. They are worth reading before changing anything.
@@ -38,6 +38,7 @@ from pathlib import Path
 
 from nakagai_edge.capability import (CapabilityError, first, read_partial,
                                      read_row, resolve)
+from nakagai_edge.edge.audit import EdgeAudit
 from nakagai_edge.edge.journal import Journal
 from nakagai_edge.edge.portfolio import (broker_specs, listed_accounts,
                                          tiered_accounts)
@@ -248,6 +249,10 @@ class FillsReporter:
                                 "are not journaled this cycle: %s", spec.id, error)
                     continue
                 for account, rows in accounts:
+                    from nakagai_edge.edge.executor import reconcile_candidate_fills
+                    await reconcile_candidate_fills(
+                        self._hub, self._state, self._client,
+                        EdgeAudit(self._state), spec, account, rows)
                     journaled.extend(self._absorb(spec.id, account, rows))
             await self._ship()
             return journaled

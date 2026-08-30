@@ -1,6 +1,8 @@
 import json
 import os
 import subprocess
+import sys
+import threading
 import time
 
 from nakagai_edge.edge.candidate import CandidateWakeScope
@@ -65,7 +67,7 @@ def test_candidate_wake_scope_exists_only_while_that_candidate_runs(tmp_path):
     assert CandidateWakeScope(state).current() is None
 
 
-def test_candidate_wake_scope_is_bounded_by_candidate_expiry(tmp_path):
+def test_an_expired_candidate_wake_is_not_launched(tmp_path):
     state = EdgeState(tmp_path)
     seen = []
 
@@ -83,8 +85,102 @@ def test_candidate_wake_scope_is_bounded_by_candidate_expiry(tmp_path):
     })
     runner.close()
 
-    assert seen == [None]
+    assert seen == []
     assert CandidateWakeScope(state).current() is None
+
+
+def test_scope_stays_closed_after_expiry_until_the_live_wake_process_exits(
+        tmp_path):
+    state = EdgeState(tmp_path)
+    started = threading.Event()
+    release = threading.Event()
+
+    def run(command, **kwargs):
+        started.set()
+        assert release.wait(2)
+        return subprocess.CompletedProcess(command, 0)
+
+    runner = WakeRunner(["agent"], state=state, note=lambda _: None, run=run)
+    runner.emit({
+        "seq": 17,
+        "kind": "execution_candidate",
+        "response_required": True,
+        "candidate_id": "candidate-live",
+        "expires_at": time.time() + 0.1,
+    })
+    assert started.wait(1)
+    try:
+        time.sleep(0.15)
+        assert CandidateWakeScope(state).current() == {
+            "candidate_id": "candidate-live", "seq": 17}
+    finally:
+        release.set()
+        runner.close()
+
+    assert CandidateWakeScope(state).current() is None
+
+
+def test_candidate_wake_receives_its_remaining_hard_timeout(tmp_path):
+    seen = []
+
+    def run(command, **kwargs):
+        seen.append(kwargs["timeout"])
+        return subprocess.CompletedProcess(command, 0)
+
+    runner = WakeRunner(["agent"], EdgeState(tmp_path), note=lambda _: None,
+                        run=run)
+    runner.emit({
+        "seq": 18,
+        "kind": "execution_candidate",
+        "response_required": True,
+        "candidate_id": "candidate-timeout",
+        "expires_at": time.time() + 5,
+    })
+    runner.close()
+
+    assert len(seen) == 1
+    assert 0 < seen[0] <= 5
+
+
+def test_real_candidate_process_is_dead_before_its_scope_is_cleared(tmp_path):
+    state = EdgeState(tmp_path / "edge")
+    pid_path = tmp_path / "wake.pid"
+    notes = []
+    command = [
+        sys.executable, "-c",
+        ("import os,time,pathlib; "
+         f"pathlib.Path({str(pid_path)!r}).write_text(str(os.getpid())); "
+         "time.sleep(10)"),
+    ]
+    runner = WakeRunner(command, state, note=notes.append)
+    runner.emit({
+        "seq": 19, "kind": "execution_candidate", "response_required": True,
+        "candidate_id": "candidate-real", "expires_at": time.time() + 0.25,
+    })
+    deadline = time.monotonic() + 2
+    while not pid_path.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert pid_path.exists()
+    pid = int(pid_path.read_text())
+    observed_live_scope = False
+    violation = False
+    while time.monotonic() < deadline:
+        live = CandidateWakeScope._pid_live(pid)
+        current = CandidateWakeScope(state).current()
+        observed_live_scope = observed_live_scope or (
+            live and current == {"candidate_id": "candidate-real", "seq": 19})
+        violation = violation or (live and current is None)
+        if not live and current is None:
+            break
+        time.sleep(0.002)
+
+    runner.close()
+
+    assert observed_live_scope is True
+    assert violation is False
+    assert CandidateWakeScope(state).current() is None
+    assert CandidateWakeScope._pid_live(pid) is False
+    assert notes == ["[wake] command timed out for seq 19"]
 
 
 def test_a_crashed_listener_scope_expires_closed(tmp_path, monkeypatch):
@@ -100,6 +196,10 @@ def test_a_crashed_listener_scope_expires_closed(tmp_path, monkeypatch):
         "expires_at": 1_005.0,
     })
     assert scope.current() == {"candidate_id": "candidate-crash", "seq": 14}
+
+    doc = json.loads(state.candidate_wake_path.read_text())
+    doc["owner_pid"] = 2_147_483_647
+    state._write_private(state.candidate_wake_path, doc)
 
     clock[0] = 1_006.0
 

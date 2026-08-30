@@ -3,8 +3,8 @@
 ConnectorHub calls `queue.enqueue(...)` when a guardrail verdict is `approve`;
 here that posts the intent to the platform (where a human sees it) and records
 it locally with its args_hash. The executor later verifies the platform's
-signed artifact against OUR copy of the args, so neither side can substitute
-an order after the human read it."""
+signed artifact against OUR copy of the args, then retains a broker-accepted
+candidate until the fill journal matches its exact order id."""
 
 import json
 import time
@@ -25,13 +25,31 @@ def intents(state: EdgeState) -> dict:
 
 
 def _write_intents(state: EdgeState, doc: dict) -> None:
-    state.intents_path.parent.mkdir(parents=True, exist_ok=True)
-    state.intents_path.write_text(json.dumps(doc, indent=2))
+    state._write_private(state.intents_path, doc)
 
 
 def drop_intent(state: EdgeState, approval_id: str) -> None:
     doc = intents(state)
     doc.pop(approval_id, None)
+    _write_intents(state, doc)
+
+
+def mark_submitted(
+        state: EdgeState, approval_id: str, *, order_id: str,
+        approval: dict, result: dict) -> None:
+    """Freeze a broker-accepted intent until its exact order id fills."""
+    doc = intents(state)
+    intent = doc.get(approval_id)
+    if not isinstance(intent, dict):
+        raise ValueError(f"local intent {approval_id!r} disappeared before submission")
+    doc[approval_id] = {
+        **intent,
+        "phase": "submitted",
+        "broker_order_id": order_id,
+        "approval": approval,
+        "broker_result": result,
+        "submitted_at": time.time(),
+    }
     _write_intents(state, doc)
 
 

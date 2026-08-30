@@ -17,7 +17,7 @@ from nakagai_edge.edge.candidate import (
     flush_candidate_outcomes,
 )
 from nakagai_edge.edge.portfolio import position_rows
-from nakagai_edge.edge.remote import drop_intent, intents
+from nakagai_edge.edge.remote import drop_intent, intents, mark_submitted
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.supervision import (is_guarded, load as load_positions,
                                            record as record_position)
@@ -99,7 +99,7 @@ def placed_order_id(hub, intent: dict, result) -> str:
     return str(_placed(cap, result).get("order_id", "") or "")
 
 
-def _fill_price(placed: dict, fallback: float) -> float:
+def _fill_price(fill: dict, fallback: float) -> float:
     """What the position actually cost, when the broker says so.
 
     R is measured from the entry, so a fill 6 cents from the limit is 6 cents
@@ -108,16 +108,16 @@ def _fill_price(placed: dict, fallback: float) -> float:
     not a real price, so only a strictly positive number may displace the
     order's own price.
     """
-    value = placed.get("fill_price")
+    value = fill.get("fill_price")
     return value if isinstance(value, float) and value > 0 else fallback
 
 
 def supervise(hub, state: EdgeState, approval_id: str, intent: dict,
-              record_doc: dict, result) -> dict | None:
-    """Turn a just-executed entry into a supervised position.
+              record_doc: dict, fill: dict) -> dict | None:
+    """Turn one broker-reconciled fill into a supervised position.
 
-    Never raises. This runs after the broker already succeeded, and a
-    bookkeeping failure must never relabel a really-executed trade.
+    Never raises. This runs only after the fill journal matched the broker's
+    order id. A bookkeeping failure must never hide that filled exposure.
 
     `approval_id` is the caller's own key from its intent store, not
     something read back off `record_doc`: a platform that omitted or
@@ -170,7 +170,7 @@ def supervise(hub, state: EdgeState, approval_id: str, intent: dict,
             "signal_id": record_doc.get("signal_id", ""),
             "entry_args": intent.get("args") or {},
             "entry_qty": entry["qty"],
-            "entry_price": _fill_price(_placed(cap, result), entry["price"]),
+            "entry_price": _fill_price(fill, entry["price"]),
             "stop": entry["stop"],
             "confirmed_qty": entry["qty"], "last_confirmed_at": 0.0,
             "unguarded_qty": 0.0,
@@ -191,28 +191,28 @@ def supervise(hub, state: EdgeState, approval_id: str, intent: dict,
         # The swallow is deliberate and the log is not decoration: the broker
         # already executed, so raising would relabel a real trade, but a lost
         # record means a LIVE position nothing is watching and no trace of why.
-        log.warning("a just-executed entry was not recorded for supervision, "
+        log.warning("a reconciled fill was not recorded for supervision, "
                     "so %s is unsupervised: %s", approval_id, e)
         return None
 
 
 async def _verify_candidate_supervision(
         hub, state: EdgeState, approval_id: str, intent: dict,
-        record_doc: dict, result) -> None:
-    rec = supervise(hub, state, approval_id, intent, record_doc, result)
-    if rec is None:
-        raise ValueError("supervision record was not durably persisted")
-    from nakagai_edge.edge.brake import armed, disarmed_positions
-    if not is_guarded(
-            rec, brake_armed=armed(state), disarmed=disarmed_positions(state),
-            now=time.time()):
-        raise ValueError("supervision record is not armed and warranted")
+        record_doc: dict, fill: dict) -> None:
     spec = hub.spec(intent["connector_id"])
-    status, rows, error = await position_rows(hub, spec, rec["account"])
+    status, rows, error = await position_rows(hub, spec, intent["account"])
     if status != "ok":
         raise ValueError(error or "broker positions are unreadable")
-    symbol = str(rec["symbol"]).upper()
-    direction = rec.get("direction")
+    cap = spec.capability("place_order")
+    entry = read_entry(cap, intent.get("args") or {})
+    if entry is None:
+        raise ValueError("submitted entry is no longer readable through its capability")
+    symbol = str(entry["symbol"]).upper()
+    aliases = cap.values.get("side") or {}
+    buys = [str(value).lower() for value in aliases.get("buy") or []]
+    sells = [str(value).lower() for value in aliases.get("sell") or []]
+    direction = ("long" if entry["side"] in buys
+                 else "short" if entry["side"] in sells else "")
     visible = any(
         str(row.get("symbol") or "").upper() == symbol
         and isinstance(row.get("quantity"), (int, float))
@@ -222,8 +222,116 @@ async def _verify_candidate_supervision(
         for row in rows if isinstance(row, dict))
     if not visible:
         raise ValueError("broker positions do not show the supervised entry")
+    rec = supervise(hub, state, approval_id, intent, record_doc, fill)
+    if rec is None:
+        raise ValueError("supervision record was not durably persisted")
+    from nakagai_edge.edge.brake import armed, disarmed_positions
+    if not is_guarded(
+            rec, brake_armed=armed(state), disarmed=disarmed_positions(state),
+            now=time.time()):
+        raise ValueError("supervision record is not armed and warranted")
     if load_positions(state).get(approval_id) != rec:
         raise ValueError("supervision record changed before broker verification completed")
+
+
+def _declared_fill(spec, row: dict) -> bool:
+    try:
+        cap = spec.capability("list_orders")
+    except CapabilityError:
+        return False
+    declared = {
+        str(value).strip().lower()
+        for value in (cap.values.get("status") or {}).get("filled") or []
+    }
+    return bool(declared) and str(row.get("status") or "").strip().lower() in declared
+
+
+def _matching_fill(spec, intent: dict, row: dict) -> str:
+    """Empty for the exact submitted order, otherwise the safe refusal."""
+    try:
+        entry = read_entry(spec.capability("place_order"), intent.get("args") or {})
+    except CapabilityError as error:
+        return str(error)
+    if entry is None:
+        return "submitted entry is unreadable through its capability"
+    if str(row.get("symbol") or "").upper() != str(entry["symbol"]).upper():
+        return "matched broker order id returned a different symbol"
+    if row.get("side") not in ("buy", "sell"):
+        return "matched broker order id returned an unreadable side"
+    aliases = spec.capability("place_order").values.get("side") or {}
+    expected_side = next((canonical for canonical in ("buy", "sell")
+                          if entry["side"] in [
+                              str(value).lower()
+                              for value in aliases.get(canonical) or []]), "")
+    if row["side"] != expected_side:
+        return "matched broker order id returned a different side"
+    quantity = row.get("quantity")
+    if (not isinstance(quantity, (int, float)) or isinstance(quantity, bool)
+            or float(quantity) != float(entry["qty"])):
+        return "matched broker order id returned a different quantity"
+    return ""
+
+
+async def reconcile_candidate_fills(
+        hub, state: EdgeState, client: PlatformClient, audit: EdgeAudit,
+        spec, account: str, rows: list[dict]) -> int:
+    """Complete submitted candidates only from exact broker fill rows."""
+    matched = 0
+    for approval_id, intent in list(intents(state).items()):
+        if (not isinstance(intent, dict) or intent.get("phase") != "submitted"
+                or intent.get("connector_id") != spec.id
+                or intent.get("account") != account
+                or not intent.get("candidate_id")):
+            continue
+        fill = next((row for row in rows
+                     if isinstance(row, dict)
+                     and str(row.get("order_id") or "")
+                     == str(intent.get("broker_order_id") or "")
+                     and _declared_fill(spec, row)), None)
+        if fill is None:
+            continue
+        matched += 1
+        reason = _matching_fill(spec, intent, fill)
+        try:
+            if reason:
+                raise ValueError(reason)
+            await _verify_candidate_supervision(
+                hub, state, approval_id, intent,
+                intent.get("approval") or {}, fill)
+        except Exception as error:  # noqa: BLE001 (a matched fill now exists)
+            reason = reason or (
+                "candidate supervision failed after reconciled broker fill: "
+                f"{type(error).__name__}: {error}")
+            disarm_candidate_entries(
+                state, candidate_id=intent["candidate_id"],
+                approval_id=approval_id, reason=reason)
+            _candidate_outcome(
+                state, client, intent["candidate_id"],
+                mechanical_status="blocked", reason=reason,
+                approval_id=approval_id, urgent=True, outcome_unknown=True)
+            _alert_candidate(client, reason)
+            try:
+                audit.record(
+                    "error", intent["connector_id"], intent["tool"],
+                    {"approval_id": approval_id, "error": reason,
+                     "outcome_unknown": True})
+            except Exception:  # noqa: BLE001 (the durable outcome owns retry)
+                pass
+        else:
+            try:
+                audit.record(
+                    "execution", intent["connector_id"], intent["tool"],
+                    {"approval_id": approval_id, "ok": True,
+                     "order_id": intent["broker_order_id"], "filled": True})
+            except Exception:  # noqa: BLE001 (journal is best effort)
+                pass
+            _candidate_outcome(
+                state, client, intent["candidate_id"],
+                mechanical_status="submitted",
+                reason="broker fill reconciled and supervision verified",
+                approval_id=approval_id)
+        drop_intent(state, approval_id)
+    return matched
 
 
 def _candidate_outcome(state: EdgeState, client: PlatformClient,
@@ -256,6 +364,8 @@ async def poll_once(hub, state: EdgeState, client: PlatformClient,
         pass
     resolved = 0
     for approval_id, intent in list(intents(state).items()):
+        if isinstance(intent, dict) and intent.get("phase") == "submitted":
+            continue
         try:
             record = client.get_approval(approval_id)
         except (EdgeClientError, httpx.HTTPError, ValueError):
@@ -372,16 +482,18 @@ async def poll_once(hub, state: EdgeState, client: PlatformClient,
                     approval_id=approval_id, urgent=unknown,
                     outcome_unknown=unknown)
         else:
-            # The broker call already succeeded. A failure to audit or report
-            # it must not relabel a really-executed trade as unknown/failed,
-            # and it must never keep the intent alive for a second execution.
+            # Broker acceptance is a submitted order, not a fill. Candidate
+            # entries stay durable under their exact broker id until the fill
+            # journal sees that same order in a declared filled state.
             if intent.get("candidate_id"):
+                order_id = placed_order_id(hub, intent, result)
                 try:
-                    await _verify_candidate_supervision(
-                        hub, state, approval_id, intent, record, result)
-                except Exception as error:  # noqa: BLE001 (a fill may already exist)
+                    mark_submitted(
+                        state, approval_id, order_id=order_id,
+                        approval=record, result=result)
+                except Exception as error:  # noqa: BLE001 (the broker accepted)
                     reason = (
-                        "candidate supervision failed after broker result: "
+                        "candidate submission could not be persisted after broker result: "
                         f"{type(error).__name__}: {error}")
                     disarm_candidate_entries(
                         state, candidate_id=intent["candidate_id"],
@@ -406,10 +518,23 @@ async def poll_once(hub, state: EdgeState, client: PlatformClient,
                     except Exception:  # noqa: BLE001 (journal is best-effort here)
                         pass
                 else:
+                    if not order_id:
+                        reason = (
+                            "candidate broker result has no declared order id; "
+                            "fill attribution is impossible")
+                        disarm_candidate_entries(
+                            state, candidate_id=intent["candidate_id"],
+                            approval_id=approval_id, reason=reason)
+                        _candidate_outcome(
+                            state, client, intent["candidate_id"],
+                            mechanical_status="blocked", reason=reason,
+                            approval_id=approval_id, urgent=True,
+                            outcome_unknown=True)
+                        _alert_candidate(client, reason)
                     try:
                         client.report_execution(
                             approval_id, ok=True, result=result,
-                            order_id=placed_order_id(hub, intent, result))
+                            order_id=order_id)
                     except Exception as error:  # noqa: BLE001 (never retry the broker)
                         reason = (
                             "candidate execution report failed after broker result: "
@@ -432,15 +557,10 @@ async def poll_once(hub, state: EdgeState, client: PlatformClient,
                         try:
                             audit.record(
                                 "execution", intent["connector_id"], intent["tool"],
-                                {"approval_id": approval_id, "ok": True})
+                                {"approval_id": approval_id, "ok": True,
+                                 "order_id": order_id, "submitted": True})
                         except Exception:  # noqa: BLE001 (journal is best-effort here)
                             pass
-                        _candidate_outcome(
-                            state, client, intent["candidate_id"],
-                            mechanical_status="submitted",
-                            reason=("broker execution reported and supervision "
-                                    "verified"),
-                            approval_id=approval_id)
             else:
                 try:
                     audit.record(
@@ -454,7 +574,8 @@ async def poll_once(hub, state: EdgeState, client: PlatformClient,
                         order_id=placed_order_id(hub, intent, result))
                 except Exception:  # noqa: BLE001 (never re-arm an executed intent)
                     pass
-                supervise(hub, state, approval_id, intent, record, result)
-        drop_intent(state, approval_id)
+        current = intents(state).get(approval_id)
+        if not isinstance(current, dict) or current.get("phase") != "submitted":
+            drop_intent(state, approval_id)
         resolved += 1
     return resolved

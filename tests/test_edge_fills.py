@@ -35,6 +35,9 @@ class EnvelopeHub:
         self.account_key = "ag1"
         self.responses, self.calls = responses, []
 
+    def spec(self, connector_id):
+        return SPECS[connector_id]
+
     async def call(self, connector_id, tool, args, **kw):
         self.calls.append((connector_id, tool, dict(args)))
         out = self.responses[tool]
@@ -203,12 +206,20 @@ def test_an_unreadable_anchor_file_does_not_raise(tmp_path):
 
 class Client:
     def __init__(self, fail=False):
-        self.batches, self.fail = [], fail
+        self.batches, self.outcomes, self.alerts, self.fail = [], [], [], fail
 
     def report_fills(self, fills):
         if self.fail:
             raise RuntimeError("platform down")
         self.batches.append(fills)
+        return {"ok": True}
+
+    def report_candidate_outcome(self, candidate_id, **payload):
+        self.outcomes.append((candidate_id, payload))
+        return {"ok": True}
+
+    def agent_checkin(self, status, note, **payload):
+        self.alerts.append((status, note, payload))
         return {"ok": True}
 
 
@@ -230,6 +241,48 @@ async def test_the_first_sweep_anchors_and_ships_nothing(tmp_path):
     r = FillsReporter(_rh_only(tmp_path), _rh_hub([ORDER]), client)
     assert await r.sweep() == []
     assert client.batches == []
+
+
+async def test_fill_sweep_completes_exact_submitted_candidate_before_anchoring(
+        tmp_path):
+    state = _rh_only(tmp_path)
+    state._write_private(state.intents_path, {
+        "approval-1": {
+            "connector_id": "robinhood-trading",
+            "tool": "place_equity_order",
+            "args": {
+                "account_number": "463605220", "symbol": "NVDA",
+                "side": "buy", "type": "limit", "quantity": "60",
+                "limit_price": "112.35", "stop_price": "109.50",
+                "time_in_force": "day",
+            },
+            "args_hash": "frozen", "candidate_id": "candidate-1",
+            "account": "463605220", "phase": "submitted",
+            "broker_order_id": "ord-1",
+            "approval": {
+                "signal_id": "signal-1",
+                "exit_warrant": {
+                    "expires_at": 4_102_444_800.0, "signature": "warrant"},
+            },
+            "broker_result": {"data": {"order_id": "ord-1"}},
+        },
+    })
+    hub = EnvelopeHub({
+        "get_accounts": {"accounts": [{"account_number": "463605220"}]},
+        "get_equity_orders": {"orders": [ORDER]},
+        "get_equity_positions": {"positions": [
+            {"symbol": "NVDA", "quantity": "60"}]},
+    })
+    client = Client()
+
+    await FillsReporter(state, hub, client).sweep()
+
+    from nakagai_edge.edge.remote import intents
+    from nakagai_edge.edge.supervision import load
+    assert intents(state) == {}
+    assert load(state)["approval-1"]["state"] == "armed"
+    assert client.outcomes[0][0] == "candidate-1"
+    assert client.outcomes[0][1]["mechanical_status"] == "submitted"
 
 
 async def test_only_what_appears_after_the_anchor_is_journaled(tmp_path):

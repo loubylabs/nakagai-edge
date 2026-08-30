@@ -124,6 +124,31 @@ async def test_candidate_scope_allows_only_its_accepted_intent(tmp_path) -> None
     assert queue.calls[0][-1]["candidate_id"] == "candidate-1"
 
 
+@pytest.mark.anyio
+@pytest.mark.parametrize("args", [
+    {"symbol": "SPY", "side": "buy"},
+    {"symbol": "SPY", "side": "sell", "reduce_only": True},
+], ids=["signed-candidate-executor", "signed-brake-exit"])
+async def test_candidate_scope_preserves_verified_internal_writes(
+        tmp_path, args) -> None:
+    queue = RecordingQueue()
+    hub = configured_hub(tmp_path, queue)
+    CandidateWakeScope(EdgeState(tmp_path)).begin({
+        "seq": 2, "kind": "execution_candidate", "response_required": True,
+        "candidate_id": "candidate-1", "expires_at": time.time() + 60,
+    })
+    try:
+        result = await hub.call(
+            "echo", "place_equity_order", args,
+            account_key="agent-a", approved=True,
+        )
+    finally:
+        await hub.aclose()
+
+    assert result["is_write"] is True
+    assert queue.calls == []
+
+
 class RemoteClient:
     def __init__(self) -> None:
         self.enqueues = []

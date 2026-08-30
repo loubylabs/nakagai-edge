@@ -462,9 +462,10 @@ class ConnectorHub:
             from nakagai_edge.edge.state import EdgeState
             active_candidate = CandidateWakeScope(EdgeState(self.root)).current()
             if (active_candidate is not None
+                    and not approved
                     and not (
                         candidate_id == active_candidate["candidate_id"]
-                        and (require_approval or approved))):
+                        and require_approval)):
                 raise GuardrailDenied(
                     "execution candidate wake permits read-only inspection; "
                     "this write is denied until the candidate wake ends")

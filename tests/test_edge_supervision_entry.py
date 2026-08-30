@@ -135,31 +135,16 @@ def test_a_place_order_map_missing_a_field_is_not_supervised(tmp_path):
 def test_a_reported_fill_price_beats_the_order_price(tmp_path):
     state = EdgeState(tmp_path)
     supervise(FakeHub(), state, "ap_1", _intent(), _record({"grant_id": "wr_1"}),
-              {"data": {"order_id": "42", "average_price": "47.61"}})
+              {"order_id": "42", "fill_price": 47.61})
     assert load(state)["ap_1"]["entry_price"] == 47.61
 
 
-def test_an_undeclared_fill_price_falls_back_to_the_order_price(tmp_path):
-    # The connector names no path to a fill price, and the broker's payload uses
-    # a key the edge used to guess at. Nothing may read it: a price the map
-    # never pointed at is a price no connector author chose. This is the test
-    # that fails if the guess-list in executor.py ever comes back.
-    state = EdgeState(tmp_path)
-    hub = FakeHub()
-    hub.spec("demo").capabilities["place_order"] = PLACE_ORDER.model_copy(
-        update={"fields": {}})
-    supervise(hub, state, "ap_1", _intent(), _record({"grant_id": "wr_1"}),
-              {"data": {"order_id": "42", "average_price": "47.61"}})
-    assert load(state)["ap_1"]["entry_price"] == 47.55
-
-
 def test_a_zero_fill_price_falls_back_to_the_order_price(tmp_path):
-    # A broker can plausibly echo "0" for an order accepted but not yet
-    # filled. Trusting it would put a zero-priced entry into every R this
-    # position ever reports.
+    # A malformed canonical fill price must not put a zero-priced entry into
+    # every R this position ever reports.
     state = EdgeState(tmp_path)
     supervise(FakeHub(), state, "ap_1", _intent(), _record({"grant_id": "wr_1"}),
-              {"data": {"order_id": "42", "average_price": "0"}})
+              {"order_id": "42", "fill_price": 0.0})
     assert load(state)["ap_1"]["entry_price"] == 47.55
 
 
