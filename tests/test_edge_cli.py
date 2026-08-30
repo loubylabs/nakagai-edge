@@ -34,15 +34,21 @@ def test_version_prints_and_exits_without_a_subcommand():
     assert package_version() in r.stdout
 
 
-@pytest.mark.parametrize(("wake_command", "expected"), [
-    ("agent run", True),
-    ("", False),
-    ("   ", False),
+@pytest.mark.parametrize(("wake_command", "expected", "runner_command"), [
+    ("agent run", True, ("agent", "run")),
+    ("", False, None),
+    ("   ", False, None),
+    ("\t  ", False, None),
+    ("''", False, None),
+    ('""', False, None),
+    ("'   '", False, None),
+    ('"\t"', False, None),
 ])
 def test_listen_configures_candidate_wake_attestation_from_parsed_command(
-        tmp_path, monkeypatch, wake_command, expected):
+        tmp_path, monkeypatch, wake_command, expected, runner_command):
     monkeypatch.setenv("NAKAGAI_EDGE_ROOT", str(tmp_path))
     configured = []
+    runner_commands = []
 
     class Client:
         def close(self):
@@ -55,18 +61,27 @@ def test_listen_configures_candidate_wake_attestation_from_parsed_command(
         def run(self):
             return 0
 
+    class Runner:
+        def __init__(self, command, state, **kwargs):
+            runner_commands.append(tuple(command))
+
+        def close(self):
+            pass
+
     def edge_client(state, *, candidate_wake=False):
         configured.append(candidate_wake)
         return Client()
 
     monkeypatch.setattr("nakagai_edge.cli._edge_client", edge_client)
     monkeypatch.setattr("nakagai_edge.edge.listen.ChannelListener", Listener)
+    monkeypatch.setattr("nakagai_edge.edge.wake.WakeRunner", Runner)
 
     args = ["listen"]
     if wake_command:
         args.extend(["--wake-command", wake_command])
     assert main(args) == 0
     assert configured == [expected]
+    assert runner_commands == ([] if runner_command is None else [runner_command])
 
 
 def test_setup_without_a_code_on_an_unpaired_edge_explains_itself(tmp_path, monkeypatch):

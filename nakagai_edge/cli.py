@@ -472,7 +472,10 @@ def _cmd_listen(args) -> int:
     from nakagai_edge.edge.wake import WakeRunner
 
     state = EdgeState(default_root())
-    wake_command = _shlex.split(args.wake_command)
+    parsed_wake_command = _shlex.split(args.wake_command)
+    wake_command = (parsed_wake_command
+                    if parsed_wake_command and parsed_wake_command[0].strip()
+                    else [])
     client = _edge_client(state, candidate_wake=bool(wake_command))
     if client is None:
         print(_json.dumps({"ok": False, "error": "edge is not paired: run "
