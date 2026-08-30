@@ -14,6 +14,7 @@ CHAT_PROTOCOL_VERSION = "2"
 CHAT_PROTOCOL_HEADER = "X-Nakagai-Chat-Protocol"
 CANDIDATE_PROTOCOL_VERSION = "1"
 CANDIDATE_PROTOCOL_HEADER = "X-Nakagai-Candidate-Protocol"
+CANDIDATE_WAKE_HEADER = "X-Nakagai-Candidate-Wake"
 
 
 class EdgeClientError(Exception):
@@ -73,7 +74,7 @@ def pair(platform_url: str, code: str, *, transport=None) -> dict:
 
 class PlatformClient:
     def __init__(self, platform_url: str, token: str, timeout: float = 15.0,
-                 *, transport=None) -> None:
+                 *, candidate_wake: bool = False, transport=None) -> None:
         self._client = httpx.Client(
             base_url=platform_url.rstrip("/"), timeout=timeout, transport=transport,
             # The version rides on every request rather than on one dedicated
@@ -93,6 +94,7 @@ class PlatformClient:
         # memory on purpose: a restart re-sends once, which costs one payload
         # and cannot disagree with the platform the way a cache file could.
         self._reported_tools: dict[str, str] = {}
+        self._candidate_wake = bool(candidate_wake)
 
     def close(self) -> None:
         self._client.close()
@@ -168,10 +170,13 @@ class PlatformClient:
         # The one PlatformClient call whose response is SUPPOSED to take up
         # to the hold cap: give httpx a read timeout past it, or every quiet
         # hold would surface as a transport error.
+        headers = {**self._chat_headers(),
+                   CANDIDATE_PROTOCOL_HEADER: CANDIDATE_PROTOCOL_VERSION}
+        if self._candidate_wake:
+            headers[CANDIDATE_WAKE_HEADER] = "1"
         return self._chat_result(self._client.get(
             "/api/agent/events", params={"after": after, "timeout_s": timeout_s},
-            headers={**self._chat_headers(),
-                     CANDIDATE_PROTOCOL_HEADER: CANDIDATE_PROTOCOL_VERSION},
+            headers=headers,
             timeout=httpx.Timeout(15.0, read=float(timeout_s) + 10.0)))
 
     def accept_candidate(self, candidate_id: str, rationale: str) -> dict:

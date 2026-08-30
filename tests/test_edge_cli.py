@@ -34,6 +34,41 @@ def test_version_prints_and_exits_without_a_subcommand():
     assert package_version() in r.stdout
 
 
+@pytest.mark.parametrize(("wake_command", "expected"), [
+    ("agent run", True),
+    ("", False),
+    ("   ", False),
+])
+def test_listen_configures_candidate_wake_attestation_from_parsed_command(
+        tmp_path, monkeypatch, wake_command, expected):
+    monkeypatch.setenv("NAKAGAI_EDGE_ROOT", str(tmp_path))
+    configured = []
+
+    class Client:
+        def close(self):
+            pass
+
+    class Listener:
+        def __init__(self, client, root, **kwargs):
+            pass
+
+        def run(self):
+            return 0
+
+    def edge_client(state, *, candidate_wake=False):
+        configured.append(candidate_wake)
+        return Client()
+
+    monkeypatch.setattr("nakagai_edge.cli._edge_client", edge_client)
+    monkeypatch.setattr("nakagai_edge.edge.listen.ChannelListener", Listener)
+
+    args = ["listen"]
+    if wake_command:
+        args.extend(["--wake-command", wake_command])
+    assert main(args) == 0
+    assert configured == [expected]
+
+
 def test_setup_without_a_code_on_an_unpaired_edge_explains_itself(tmp_path, monkeypatch):
     """The message must stand on its own: an alpha user has no repo to read."""
     monkeypatch.setenv("NAKAGAI_EDGE_ROOT", str(tmp_path))
