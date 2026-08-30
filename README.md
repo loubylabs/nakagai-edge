@@ -7,8 +7,11 @@ sees one either.
 
 Version 0.5.0 is the current release. An agent woken for one execution
 candidate can inspect that candidate, accept or abstain with a rationale, then
-stop. It cannot alter a prepared order field. The platform compiles the order,
-and local policy or the brake can still refuse execution. Semantic
+stop. A listener-owned local scope enforces that boundary for the wake. The
+same candidate decision tools and read-only inspection remain available, while
+every other write is refused until the wake ends or expires. The agent cannot
+alter a prepared order field. The platform compiles the order, and local policy
+or the brake can still refuse execution. Semantic
 `place_order` remains the only owner-mediated order entry: a raw
 `call_connector` request whose tool exactly matches the selected connector's
 declared `capabilities.place_order.tool` is refused before dispatch with
@@ -369,6 +372,12 @@ the Portfolio page still lists them. A connector declaring an incomplete
 are missing, rather than found later by a position that had no stop watching
 it. A connector that places no orders at all simply declares no `place_order`.
 
+The model-facing `place_order` tool creates limit entries only. Quantity must
+be a positive whole-share count, and both the limit and protective stop must
+be positive. Market orders carrying either priced field are refused. The only
+market orders the edge constructs are reduce-only warrant exits, and those
+payloads omit both priced fields.
+
 **The order inside `values.side` is load-bearing.** The list is every spelling
 this connector recognizes when it reads a side back off an order, and the first
 entry is the single spelling the edge sends when it places one or builds a
@@ -379,10 +388,10 @@ the one meant to cover a short.
 
 The generic broker surface exposes seven named tools that work against any
 broker. The shared MCP surface remains present during an execution-candidate
-wake. Read-only inspection remains allowed. `accept_candidate` and
-`abstain_candidate` are the only authorized write actions for an
-execution-candidate workflow. Connector writes and order construction remain
-forbidden for that event.
+wake. Read-only inspection remains allowed. The edge enforces
+`accept_candidate` and `abstain_candidate` as the only write actions for the
+same candidate during that wake. Connector writes and order construction are
+refused in code until the wake ends or expires.
 `connector_id` is optional only while exactly one enabled broker declares the
 capability. Enable a second and the edge stops filling it in: the call comes
 back naming both candidates and the agent has to say which brokerage it meant.
@@ -491,7 +500,7 @@ did, so they are on the Portfolio page like any other. What they lack is
 everything downstream of the supervision ledger. There is no approval behind
 them, so there is no ledger record, no stop, no exit warrant, and nothing that
 will exit them. They are absent from `get_open_risk` and contribute nothing to
-portfolio heat, exactly like an agent order placed without a stop.
+portfolio heat, like any broker position with no supervision record.
 
 The fill journal is what tells the platform they were yours. Every
 `FILLS_INTERVAL_S` (300s) the edge reads each broker's order history through

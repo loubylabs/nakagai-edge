@@ -457,6 +457,17 @@ class ConnectorHub:
                                  f"(has: {known})")
 
         verdict = evaluate(spec, tool, args, read_only_hint=self._hint_for(conn, tool))
+        if verdict.is_write:
+            from nakagai_edge.edge.candidate import CandidateWakeScope
+            from nakagai_edge.edge.state import EdgeState
+            active_candidate = CandidateWakeScope(EdgeState(self.root)).current()
+            if (active_candidate is not None
+                    and not (
+                        candidate_id == active_candidate["candidate_id"]
+                        and (require_approval or approved))):
+                raise GuardrailDenied(
+                    "execution candidate wake permits read-only inspection; "
+                    "this write is denied until the candidate wake ends")
         if verdict.decision == "deny":
             raise GuardrailDenied(verdict.reason)
         if require_approval and verdict.decision != "approve":

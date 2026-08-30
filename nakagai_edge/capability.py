@@ -285,11 +285,15 @@ def _outbound_value(field: str, value: Any, cap: Capability) -> Any:
             f"connector declares no supported outbound type for {field!r}")
     if field == "quantity":
         number = _finite_number(field, value)
+        if number <= 0:
+            raise CapabilityError("'quantity' must be positive")
         if int(number) != number:
             raise CapabilityError("'quantity' must be a whole-share integer")
         value = int(number)
     elif field in ("limit_price", "stop_price"):
         value = _finite_number(field, value)
+        if value <= 0:
+            raise CapabilityError(f"{field!r} must be positive")
     elif isinstance(value, bool):
         raise CapabilityError(f"{field!r} must not be a boolean")
     if outbound_type == "number":
@@ -322,6 +326,11 @@ def resolve(name: str, cap: Capability, args: dict) -> tuple[str, dict]:
         if args.get("order_type") == "limit":
             missing.extend(field for field in ("limit_price", "stop_price")
                            if args.get(field) is None)
+        elif args.get("order_type") == "market" and any(
+                args.get(field) is not None
+                for field in ("limit_price", "stop_price")):
+            raise CapabilityError(
+                "market orders must not carry limit_price or stop_price")
         if missing:
             raise CapabilityError(
                 f"place_order is missing required fields: {', '.join(missing)}")

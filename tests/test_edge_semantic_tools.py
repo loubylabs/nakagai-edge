@@ -25,6 +25,7 @@ from nakagai_edge.config import load_specs
 from nakagai_edge.edge.audit import EdgeAudit
 from nakagai_edge.edge.brake import Brake
 from nakagai_edge.edge.client import PlatformClient
+from nakagai_edge.edge.candidate import CandidateWakeScope
 from nakagai_edge.edge.remote import RemoteApprovalQueue
 from nakagai_edge.edge.runtime import create_edge_mcp
 from nakagai_edge.edge.state import EdgeState
@@ -34,8 +35,8 @@ from tests.fixtures.alien_registry import ALIEN_CONNECTOR, ROBINHOOD_CONNECTOR
 
 pytestmark = pytest.mark.anyio
 
-ORDER = {"order_type": "limit", "limit_price": 190.0,
-         "stop_price": 180.0, "time_in_force": "day"}
+ORDER = {"limit_price": 190.0, "stop_price": 180.0,
+         "time_in_force": "day"}
 
 ALIEN, ROBINHOOD = "alien-broker", "robinhood-trading"
 ACCOUNTS = {ALIEN: "AL-1", ROBINHOOD: "463605220"}
@@ -235,6 +236,49 @@ async def test_semantic_place_order_still_resolves_the_declared_order_tool(
         "qty": "1", "limit": "190.0", "trigger": "180.0",
         "tif": "day", "acct": "AL-1",
     })]
+
+
+async def test_semantic_place_order_exposes_only_limit_entries(tmp_path):
+    tools = {
+        tool.name: tool
+        for tool in await _server(_state(tmp_path), MapHub()).list_tools()
+    }
+
+    schema = tools["place_order"].input_schema
+    assert "order_type" not in schema["properties"]
+    assert "order_type" not in schema["required"]
+    assert {"limit_price", "stop_price"} <= set(schema["required"])
+
+
+async def test_candidate_wake_denies_every_model_order_door_and_keeps_reads(
+        tmp_path):
+    posted = []
+    state, client = _state(tmp_path, ALIEN_CONNECTOR), _platform(posted)
+    CandidateWakeScope(state).begin({
+        "seq": 1, "kind": "execution_candidate", "response_required": True,
+        "candidate_id": "candidate-1", "expires_at": time.time() + 60,
+    })
+    hub = _live_hub(state, client)
+    mcp = _server(state, hub, client)
+    try:
+        place = await _call(
+            mcp, "place_order", symbol="AAPL", side="buy", quantity=1,
+            account="AL-1", **ORDER)
+        cancel = await _call(
+            mcp, "cancel_order", order_id="AL-ORD-1", account="AL-1")
+        raw = await _call(
+            mcp, "call_connector", connector_id=ALIEN, tool="scrub",
+            args_json=json.dumps({"ref": "AL-ORD-1", "acct": "AL-1"}))
+        positions = await _call(
+            mcp, "list_positions", connector_id=ALIEN, account="AL-1")
+    finally:
+        await hub.aclose()
+
+    for result in (place, cancel, raw):
+        assert result["is_error"] is True
+        assert "candidate wake" in result["error"]
+    assert positions["is_error"] is False
+    assert posted == []
 
 
 async def test_raw_operation_outside_the_order_capability_still_works(tmp_path):

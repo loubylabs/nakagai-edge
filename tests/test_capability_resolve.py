@@ -81,8 +81,14 @@ def test_resolve_translates_the_complete_canonical_limit_order():
 
 @pytest.mark.parametrize("field, value", [
     ("quantity", 5.5),
+    ("quantity", 0),
+    ("quantity", -1),
     ("quantity", True),
+    ("limit_price", 0),
+    ("limit_price", -1.0),
     ("limit_price", float("nan")),
+    ("stop_price", 0),
+    ("stop_price", -1.0),
     ("stop_price", float("inf")),
 ])
 def test_resolve_refuses_invalid_equity_order_numbers(field, value):
@@ -92,6 +98,30 @@ def test_resolve_refuses_invalid_equity_order_numbers(field, value):
     args[field] = value
     with pytest.raises(CapabilityError, match=field):
         resolve("place_order", ORDER, args)
+
+
+@pytest.mark.parametrize("priced", [
+    {"limit_price": 187.2},
+    {"stop_price": 180.0},
+    {"limit_price": 187.2, "stop_price": 180.0},
+])
+def test_resolve_refuses_priced_fields_on_market_orders(priced):
+    with pytest.raises(CapabilityError, match="market orders must not carry"):
+        resolve("place_order", ORDER, {
+            "symbol": "AAPL", "side": "sell", "order_type": "market",
+            "quantity": 5, "time_in_force": "gfd",
+            "account": "463605220", **priced})
+
+
+def test_resolve_accepts_a_market_order_without_priced_fields():
+    _, args = resolve("place_order", ORDER, {
+        "symbol": "AAPL", "side": "sell", "order_type": "market",
+        "quantity": 5, "time_in_force": "gfd", "account": "463605220"})
+
+    assert args == {
+        "symbol": "AAPL", "side": "sell", "type": "market",
+        "quantity": "5", "time_in_force": "gfd",
+        "account_number": "463605220"}
 
 
 def test_resolve_refuses_a_missing_required_equity_order_field():

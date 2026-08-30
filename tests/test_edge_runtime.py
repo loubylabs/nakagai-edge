@@ -15,7 +15,8 @@ from nakagai_edge.capability import Capability
 from nakagai_edge.config import ConnectorSpec, load_specs
 from nakagai_edge.edge.audit import EdgeAudit
 from nakagai_edge.edge.brake import Brake
-from nakagai_edge.edge.client import PlatformClient
+from nakagai_edge.edge.client import EdgeClientError, PlatformClient
+from nakagai_edge.edge.candidate import CandidateWakeScope
 from nakagai_edge.edge.runtime import (_prepared_order, build_hub, create_edge_mcp,
                                        freshness_error)
 from nakagai_edge.edge.state import EdgeState
@@ -52,17 +53,33 @@ def _candidate_spec():
     return load_specs({"connectors": [ROBINHOOD_CONNECTOR]})["robinhood-trading"]
 
 
+CANONICAL_ORDER = {
+    "symbol": "AAPL", "side": "buy", "order_type": "limit",
+    "quantity": 3, "limit_price": 211.25, "stop_price": 207.0,
+    "time_in_force": "day", "account": "broker-account",
+}
+
+BROKER_ORDER = {
+    "symbol": "AAPL", "side": "buy", "type": "limit", "quantity": "3",
+    "limit_price": "211.25", "stop_price": "207.0",
+    "time_in_force": "day", "account_number": "broker-account",
+}
+
+
 def _prepared_response(**overrides):
-    broker_args = {
-        "symbol": "AAPL", "side": "buy", "type": "limit", "quantity": "3",
-        "limit_price": "211.25", "stop_price": "207.0",
-        "time_in_force": "day", "account_number": "broker-account"}
     prepared = {
         "connector_id": "robinhood-trading", "account_id": "broker-account",
-        "tool": "place_equity_order", "args": broker_args,
-        "args_hash": args_hash(broker_args), **overrides}
+        "tool": "place_equity_order", "args": dict(BROKER_ORDER),
+        "args_hash": args_hash(BROKER_ORDER), **overrides}
     return {"candidate_id": "candidate-1", "decision": "accepted",
-            "prepared_order": prepared}
+            "canonical_order": dict(CANONICAL_ORDER), "prepared_order": prepared}
+
+
+def _candidate_scope(state, candidate_id="candidate-1"):
+    return CandidateWakeScope(state).begin({
+        "seq": 1, "kind": "execution_candidate", "response_required": True,
+        "candidate_id": candidate_id, "expires_at": time.time() + 300,
+    })
 
 
 class _Reporter:
@@ -70,8 +87,22 @@ class _Reporter:
     tool passthrough, not the portfolio path, so a no-op stand-in keeps their
     intent unchanged."""
 
-    async def snapshot_and_push(self):
+    async def snapshot_and_push(self, **_kwargs):
         return {"connectors": []}
+
+
+class _ReadyReporter:
+    def __init__(self):
+        self.calls = []
+
+    async def snapshot_and_push(self, **kwargs):
+        self.calls.append(kwargs)
+        return {"connectors": [{
+            "id": "robinhood-trading", "status": "ok", "accounts": [{
+                "account_number": "broker-account", "status": "ok",
+                "positions": [], "open_orders": [],
+            }],
+        }]}
 
 
 async def test_call_connector_denied_on_stale_policy(tmp_path, monkeypatch):
@@ -231,6 +262,68 @@ async def test_candidate_tools_publish_only_candidate_id_and_rationale(tmp_path)
             "candidate_id", "rationale"}
 
 
+async def test_candidate_scope_allows_only_the_same_candidate_decision(tmp_path):
+    requests = []
+
+    def handler(req):
+        requests.append(req.url.path)
+        return httpx.Response(200, json={
+            "candidate_id": "candidate-1", "decision": "abstained"})
+
+    state = _state(tmp_path)
+    _candidate_scope(state)
+    client = PlatformClient("https://api.test", "t",
+                            transport=httpx.MockTransport(handler))
+    hub = build_hub(state, client)
+    audit = EdgeAudit(state)
+    mcp = create_edge_mcp(state, hub, client, audit, _Reporter(),
+                          Brake(state, hub, client, audit))
+
+    wrong = await mcp.call_tool("abstain_candidate", {
+        "candidate_id": "candidate-2", "rationale": "wrong wake"})
+    right = await mcp.call_tool("abstain_candidate", {
+        "candidate_id": "candidate-1", "rationale": "bounded decision"})
+
+    assert json.loads(wrong.content[0].text)["is_error"] is True
+    assert "candidate-1" in json.loads(wrong.content[0].text)["error"]
+    assert json.loads(right.content[0].text)["decision"] == "abstained"
+    assert requests == ["/api/agent/candidates/candidate-1/abstain"]
+
+
+async def test_candidate_scope_denies_direct_platform_writes(tmp_path):
+    requests = []
+
+    def handler(req):
+        requests.append(req.url.path)
+        return httpx.Response(200, json={"ok": True})
+
+    state = _state(tmp_path)
+    _candidate_scope(state)
+    client = PlatformClient("https://api.test", "t",
+                            transport=httpx.MockTransport(handler))
+    hub = build_hub(state, client)
+    audit = EdgeAudit(state)
+    mcp = create_edge_mcp(state, hub, client, audit, _Reporter(),
+                          Brake(state, hub, client, audit))
+
+    calls = [
+        ("agent_checkin", {"status": "idle"}),
+        ("claim_message", {"message_seq": 1}),
+        ("send_message", {"text": "x", "room_id": "desk",
+                          "idempotency_key": "x"}),
+        ("request_peer", {"agent_ids": ["a2"], "text": "x",
+                          "idempotency_key": "x"}),
+        ("refresh_portfolio", {}),
+    ]
+    for tool, args in calls:
+        result = await mcp.call_tool(tool, args)
+        doc = json.loads(result.content[0].text)
+        assert doc["is_error"] is True, tool
+        assert "candidate wake" in doc["error"], tool
+
+    assert requests == []
+
+
 @pytest.mark.parametrize("missing", [
     "connector_id", "account_id", "tool", "args", "args_hash",
 ])
@@ -279,7 +372,7 @@ def test_prepared_order_rejects_account_substitution_inside_frozen_args():
     response["prepared_order"]["args_hash"] = args_hash(
         response["prepared_order"]["args"])
 
-    with pytest.raises(ValueError, match="order account"):
+    with pytest.raises(ValueError, match="local capability map"):
         _prepared_order("candidate-1", response, _candidate_spec(), "broker-account")
 
 
@@ -290,15 +383,36 @@ def test_prepared_order_rejects_args_hash_mismatch():
         _prepared_order("candidate-1", response, _candidate_spec(), "broker-account")
 
 
+def test_prepared_order_requires_an_exact_canonical_order():
+    response = _prepared_response()
+    del response["canonical_order"]
+
+    with pytest.raises(ValueError, match="canonical_order"):
+        _prepared_order("candidate-1", response, _candidate_spec(), "broker-account")
+
+
+def test_prepared_order_rejects_local_capability_map_drift():
+    response = _prepared_response()
+    response["canonical_order"]["quantity"] = 4
+
+    with pytest.raises(ValueError, match="local capability map"):
+        _prepared_order("candidate-1", response, _candidate_spec(), "broker-account")
+
+
+def test_blocked_candidate_response_cannot_carry_a_prepared_order():
+    response = _prepared_response()
+    response["mechanical_status"] = "blocked"
+
+    with pytest.raises(ValueError, match="blocked.*prepared"):
+        _prepared_order("candidate-1", response, _candidate_spec(), "broker-account")
+
+
 async def test_accept_candidate_refreshes_broker_evidence_then_submits_exact_order(
         tmp_path, monkeypatch):
     from nakagai_edge.edge import runtime
 
     calls = []
-    broker_args = {"symbol": "AAPL", "side": "buy", "type": "limit",
-                   "quantity": "3", "limit_price": "211.25",
-                   "stop_price": "207.0", "time_in_force": "day",
-                   "account_number": "broker-account"}
+    broker_args = dict(BROKER_ORDER)
 
     def handler(req):
         calls.append((req.url.path, json.loads(req.content) if req.content else None))
@@ -307,6 +421,7 @@ async def test_accept_candidate_refreshes_broker_evidence_then_submits_exact_ord
         if req.url.path.endswith("/accept"):
             return httpx.Response(200, json={
                 "candidate_id": "candidate-1", "decision": "accepted",
+                "canonical_order": dict(CANONICAL_ORDER),
                 "prepared_order": {
                     "connector_id": "robinhood-trading",
                     "account_id": "broker-account",
@@ -331,11 +446,18 @@ async def test_accept_candidate_refreshes_broker_evidence_then_submits_exact_ord
         def __init__(self):
             self.calls = 0
 
-        async def snapshot_and_push(self):
+        async def snapshot_and_push(self, **kwargs):
             self.calls += 1
-            return {"connectors": []}
+            assert kwargs == {"force": True, "require_ack": True}
+            return {"connectors": [{
+                "id": "robinhood-trading", "status": "ok", "accounts": [{
+                    "account_number": "broker-account", "status": "ok",
+                    "positions": [], "open_orders": [],
+                }],
+            }]}
 
     state = _state(tmp_path)
+    _candidate_scope(state)
     spec = _candidate_spec()
     spec.guardrails.accounts.allow = ["broker-account"]
     monkeypatch.setattr(runtime, "broker_specs", lambda _root: [spec])
@@ -373,21 +495,28 @@ async def test_accept_candidate_refreshes_broker_evidence_then_submits_exact_ord
     assert "prepared_order" not in doc
 
 
-async def test_accept_candidate_rejects_hash_mismatch_without_connector_contact(
+async def test_accept_candidate_rejects_local_map_mismatch_without_connector_contact(
         tmp_path, monkeypatch):
     from nakagai_edge.edge import runtime
 
-    broker_args = {"symbol": "AAPL"}
+    broker_args = dict(BROKER_ORDER)
+    requests = []
 
     def handler(req):
+        requests.append((req.url.path, json.loads(req.content)))
         if req.url.path == "/api/agent/checkin":
             return httpx.Response(200, json={"ok": True})
+        if req.url.path.endswith("/outcome"):
+            return httpx.Response(200, json={"ok": True})
+        canonical = dict(CANONICAL_ORDER)
+        canonical["quantity"] = 4
         return httpx.Response(200, json={
             "candidate_id": "candidate-1", "decision": "accepted",
+            "canonical_order": canonical,
             "prepared_order": {"connector_id": "robinhood-trading",
                                "account_id": "broker-account",
                                "tool": "place_equity_order", "args": broker_args,
-                               "args_hash": "wrong"}})
+                               "args_hash": args_hash(broker_args)}})
 
     class Hub:
         account_key = "ag1"
@@ -406,10 +535,11 @@ async def test_accept_candidate_rejects_hash_mismatch_without_connector_contact(
 
     monkeypatch.setattr(runtime, "balance_evidence", evidence)
     state = _state(tmp_path)
+    _candidate_scope(state)
     client = PlatformClient("https://api.test", "t",
                             transport=httpx.MockTransport(handler))
     hub = Hub()
-    mcp = create_edge_mcp(state, hub, client, EdgeAudit(state), _Reporter(),
+    mcp = create_edge_mcp(state, hub, client, EdgeAudit(state), _ReadyReporter(),
                           Brake(state, hub, client, EdgeAudit(state)))
 
     result = await mcp.call_tool("accept_candidate", {
@@ -417,21 +547,82 @@ async def test_accept_candidate_rejects_hash_mismatch_without_connector_contact(
     doc = json.loads(result.content[0].text)
 
     assert doc["is_error"] is True
-    assert "hash" in doc["error"]
+    assert "local capability map" in doc["error"]
     assert hub.calls == []
+    outcome = next(body for path, body in requests if path.endswith("/outcome"))
+    assert outcome["mechanical_status"] == "blocked"
+    assert "local capability map" in outcome["mechanical_reason"]
+
+
+async def test_accept_candidate_rejects_blocked_response_with_prepared_order(
+        tmp_path, monkeypatch):
+    from nakagai_edge.edge import runtime
+
+    requests = []
+
+    def handler(req):
+        requests.append((req.url.path, json.loads(req.content)))
+        if req.url.path == "/api/agent/checkin":
+            return httpx.Response(200, json={"ok": True})
+        if req.url.path.endswith("/outcome"):
+            return httpx.Response(200, json={"ok": True})
+        response = _prepared_response()
+        response["mechanical_status"] = "blocked"
+        return httpx.Response(200, json=response)
+
+    class Hub:
+        account_key = "ag1"
+        calls = []
+
+        async def call(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+
+    spec = _candidate_spec()
+    spec.guardrails.accounts.allow = ["broker-account"]
+    monkeypatch.setattr(runtime, "broker_specs", lambda _root: [spec])
+
+    async def evidence(*_args):
+        return {"status": "ok", "equity": 10.0, "day_pnl": 0.0}
+
+    monkeypatch.setattr(runtime, "balance_evidence", evidence)
+    state = _state(tmp_path)
+    _candidate_scope(state)
+    client = PlatformClient(
+        "https://api.test", "t", transport=httpx.MockTransport(handler))
+    hub = Hub()
+    audit = EdgeAudit(state)
+    mcp = create_edge_mcp(
+        state, hub, client, audit, _ReadyReporter(),
+        Brake(state, hub, client, audit))
+
+    result = await mcp.call_tool("accept_candidate", {
+        "candidate_id": "candidate-1", "rationale": "accept"})
+    doc = json.loads(result.content[0].text)
+
+    assert doc["is_error"] is True
+    assert "blocked candidate response" in doc["error"]
+    assert hub.calls == []
+    outcome = next(body for path, body in requests if path.endswith("/outcome"))
+    assert outcome["mechanical_status"] == "blocked"
+    assert "blocked candidate response" in outcome["mechanical_reason"]
 
 
 async def test_accept_candidate_stale_local_policy_creates_no_approval(
         tmp_path, monkeypatch):
     from nakagai_edge.edge import runtime
 
-    broker_args = {"account_number": "broker-account", "quantity": "3"}
+    broker_args = dict(BROKER_ORDER)
+    requests = []
 
     def handler(req):
+        requests.append((req.url.path, json.loads(req.content)))
         if req.url.path == "/api/agent/checkin":
+            return httpx.Response(200, json={"ok": True})
+        if req.url.path.endswith("/outcome"):
             return httpx.Response(200, json={"ok": True})
         return httpx.Response(200, json={
             "candidate_id": "candidate-1", "decision": "accepted",
+            "canonical_order": dict(CANONICAL_ORDER),
             "prepared_order": {"connector_id": "robinhood-trading",
                                "account_id": "broker-account",
                                "tool": "place_equity_order", "args": broker_args,
@@ -459,10 +650,11 @@ async def test_accept_candidate_stale_local_policy_creates_no_approval(
                             transport=httpx.MockTransport(handler))
     hub = Hub()
     audit = EdgeAudit(state)
-    mcp = create_edge_mcp(state, hub, client, audit, _Reporter(),
+    mcp = create_edge_mcp(state, hub, client, audit, _ReadyReporter(),
                           Brake(state, hub, client, audit))
     real = time.time
     monkeypatch.setattr(time, "time", lambda: real() + 1000)
+    _candidate_scope(state)
 
     result = await mcp.call_tool("accept_candidate", {
         "candidate_id": "candidate-1", "rationale": "accept"})
@@ -471,6 +663,123 @@ async def test_accept_candidate_stale_local_policy_creates_no_approval(
     assert doc["is_error"] is True
     assert "policy stale" in doc["error"]
     assert hub.calls == []
+    outcome = next(body for path, body in requests if path.endswith("/outcome"))
+    assert outcome["mechanical_status"] == "blocked"
+    assert "policy stale" in outcome["mechanical_reason"]
+
+
+@pytest.mark.parametrize("failure", ["portfolio", "balance"])
+async def test_accepted_blocked_judgment_survives_unreadable_broker_evidence(
+        tmp_path, monkeypatch, failure):
+    from nakagai_edge.edge import runtime
+
+    calls = []
+
+    def handler(req):
+        calls.append((req.url.path, json.loads(req.content)))
+        if req.url.path == "/api/agent/checkin":
+            return httpx.Response(200, json={"ok": True})
+        if req.url.path.endswith("/accept"):
+            return httpx.Response(200, json={
+                "candidate_id": "candidate-1", "decision": "accepted",
+                "mechanical_status": "blocked",
+                "mechanical_reason": "broker evidence unreadable",
+            })
+        raise AssertionError(req.url.path)
+
+    class Reporter(_ReadyReporter):
+        async def snapshot_and_push(self, **kwargs):
+            if failure == "portfolio":
+                raise EdgeClientError("portfolio POST failed")
+            return await super().snapshot_and_push(**kwargs)
+
+    class Hub:
+        account_key = "ag1"
+        calls = []
+
+        async def call(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+
+    state = _state(tmp_path)
+    _candidate_scope(state)
+    spec = _candidate_spec()
+    spec.guardrails.accounts.allow = ["broker-account"]
+    monkeypatch.setattr(runtime, "broker_specs", lambda _root: [spec])
+
+    async def evidence(*_args):
+        if failure == "balance":
+            return {"status": "unreadable", "equity": None, "day_pnl": None}
+        return {"status": "ok", "equity": 10.0, "day_pnl": -1.0}
+
+    monkeypatch.setattr(runtime, "balance_evidence", evidence)
+    client = PlatformClient("https://api.test", "t",
+                            transport=httpx.MockTransport(handler))
+    hub = Hub()
+    mcp = create_edge_mcp(state, hub, client, EdgeAudit(state), Reporter(),
+                          Brake(state, hub, client, EdgeAudit(state)))
+
+    result = await mcp.call_tool("accept_candidate", {
+        "candidate_id": "candidate-1", "rationale": "accept despite unreadable data"})
+    doc = json.loads(result.content[0].text)
+
+    assert doc["decision"] == "accepted"
+    assert doc["mechanical_status"] == "blocked"
+    assert calls[0] == ("/api/agent/checkin", {
+        "status": "research", "note": "candidate broker evidence unreadable",
+        "account_equity": None, "day_pnl": None,
+    })
+    assert calls[1][0].endswith("/accept")
+    assert hub.calls == []
+
+
+async def test_prepared_order_is_not_submitted_after_portfolio_report_failure(
+        tmp_path, monkeypatch):
+    from nakagai_edge.edge import runtime
+
+    requests = []
+
+    def handler(req):
+        body = json.loads(req.content)
+        requests.append((req.url.path, body))
+        if req.url.path == "/api/agent/checkin":
+            return httpx.Response(200, json={"ok": True})
+        if req.url.path.endswith("/accept"):
+            return httpx.Response(200, json=_prepared_response())
+        if req.url.path.endswith("/outcome"):
+            return httpx.Response(200, json={"ok": True})
+        raise AssertionError(req.url.path)
+
+    class Reporter:
+        async def snapshot_and_push(self, **kwargs):
+            raise EdgeClientError("portfolio POST failed")
+
+    class Hub:
+        account_key = "ag1"
+        calls = []
+
+        async def call(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+
+    state = _state(tmp_path)
+    _candidate_scope(state)
+    spec = _candidate_spec()
+    spec.guardrails.accounts.allow = ["broker-account"]
+    monkeypatch.setattr(runtime, "broker_specs", lambda _root: [spec])
+    client = PlatformClient("https://api.test", "t",
+                            transport=httpx.MockTransport(handler))
+    hub = Hub()
+    mcp = create_edge_mcp(state, hub, client, EdgeAudit(state), Reporter(),
+                          Brake(state, hub, client, EdgeAudit(state)))
+
+    result = await mcp.call_tool("accept_candidate", {
+        "candidate_id": "candidate-1", "rationale": "accept"})
+    doc = json.loads(result.content[0].text)
+
+    assert doc["is_error"] is True
+    assert hub.calls == []
+    outcome = next(body for path, body in requests if path.endswith("/outcome"))
+    assert outcome["mechanical_status"] == "blocked"
+    assert "portfolio" in outcome["mechanical_reason"]
 
 
 async def test_abstain_candidate_never_contacts_a_connector(tmp_path):
@@ -489,6 +798,7 @@ async def test_abstain_candidate_never_contacts_a_connector(tmp_path):
             self.calls.append((args, kwargs))
 
     state = _state(tmp_path)
+    _candidate_scope(state)
     client = PlatformClient("https://api.test", "t",
                             transport=httpx.MockTransport(handler))
     hub = Hub()

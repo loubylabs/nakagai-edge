@@ -149,6 +149,17 @@ def test_readme_keeps_candidate_inspection_read_only():
 
     assert "Read-only inspection remains allowed." in readme
     assert (
-        "`accept_candidate` and `abstain_candidate` are the only authorized "
-        "write actions for an execution-candidate workflow."
+        "The edge enforces `accept_candidate` and `abstain_candidate` as the "
+        "only write actions for the same candidate during that wake."
     ) in readme
+    assert "refused in code until the wake ends or expires" in readme
+
+
+def test_readme_states_the_strict_entry_and_market_exit_contract():
+    readme = " ".join((REPO / "README.md").read_text().split())
+
+    assert "model-facing `place_order` tool creates limit entries only" in readme
+    assert "positive whole-share count" in readme
+    assert "both the limit and protective stop must be positive" in readme
+    assert "Market orders carrying either priced field are refused" in readme
+    assert "reduce-only warrant exits" in readme

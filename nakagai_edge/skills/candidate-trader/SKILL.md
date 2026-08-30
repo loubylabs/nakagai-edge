@@ -40,8 +40,10 @@ candidate, or begin a follow-up trading task in this wake.
 
 ## Boundaries
 
-The candidate tools are the only write-shaped tools for this event. Do not call
-`place_order`, `call_connector`, an approval tool, or a broker write.
+The edge enforces the candidate tools as the only write actions for this event.
+It refuses `place_order`, every write through `call_connector`, approval tools,
+and broker writes until this wake ends or expires. Read-only inspection remains
+available.
 
 Accepting does not authorize changing any prepared field. The platform alone
 constructs the frozen order and retains authority for its symbol, side, order

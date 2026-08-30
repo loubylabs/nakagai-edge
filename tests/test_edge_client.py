@@ -161,6 +161,31 @@ def test_candidate_decision_routes_put_only_rationale_in_the_body():
     ]
 
 
+def test_candidate_mechanical_outcome_uses_the_internal_outcome_route():
+    seen = []
+
+    def handler(request):
+        seen.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={"ok": True, "candidate_id": "candidate-1"})
+
+    client = PlatformClient("https://api.test", "nk_agent_t",
+                            transport=_transport(handler))
+    out = client.report_candidate_outcome(
+        "candidate-1", mechanical_status="blocked",
+        mechanical_reason="local policy is stale", approval_id="approval-1",
+        urgent=False, outcome_unknown=False,
+    )
+
+    assert out["ok"] is True
+    assert seen == [("/api/agent/candidates/candidate-1/outcome", {
+        "mechanical_status": "blocked",
+        "mechanical_reason": "local policy is stale",
+        "approval_id": "approval-1",
+        "urgent": False,
+        "outcome_unknown": False,
+    })]
+
+
 def test_chat_conflict_body_is_returned_intact():
     conflict = {
         "ok": False,

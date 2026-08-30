@@ -149,7 +149,7 @@ async def connector_snapshot(hub, spec) -> dict:
             except Exception as e:  # noqa: BLE001 (per-account degradation, by design)
                 row["status"] = _status(row["status"], "unreadable")
                 errors.append(_error("get_balance unreadable", e))
-        position_status, positions, position_error = await _positions(hub, spec, num)
+        position_status, positions, position_error = await position_rows(hub, spec, num)
         order_status, orders, order_error = await _open_orders(hub, spec, num)
         row["positions"], row["open_orders"] = positions, orders
         row["status"] = _status(row["status"], position_status, order_status)
@@ -158,6 +158,19 @@ async def connector_snapshot(hub, spec) -> dict:
         entry["accounts"].append(row)
     entry["status"] = _status(*(a["status"] for a in entry["accounts"]))
     return entry
+
+
+def account_snapshot_readable(
+        doc: dict, connector_id: str, account: str) -> bool:
+    """Whether one freshly assembled portfolio account is authoritative."""
+    for connector in doc.get("connectors") or []:
+        if connector.get("id") != connector_id or connector.get("status") != "ok":
+            continue
+        for row in connector.get("accounts") or []:
+            if (str(row.get("account_number") or "") == account
+                    and row.get("status") == "ok"):
+                return True
+    return False
 
 
 async def listed_accounts(hub, spec) -> list[dict]:
@@ -256,7 +269,7 @@ async def balance_evidence(hub, spec, account: str) -> dict:
     return {"status": "ok", "equity": equity, "day_pnl": day_pnl}
 
 
-async def _positions(hub, spec, account: str) -> tuple[str, list, str]:
+async def position_rows(hub, spec, account: str) -> tuple[str, list, str]:
     """Raw position rows carrying normalized `symbol` and `quantity`.
 
     Both keys deliberately overwrite whatever the broker called them, because
@@ -367,7 +380,8 @@ class PortfolioReporter:
         self._last_doc: dict | None = None
         self._lock = asyncio.Lock()
 
-    async def snapshot_and_push(self) -> dict:
+    async def snapshot_and_push(self, *, force: bool = False,
+                                require_ack: bool = False) -> dict:
         # Imported here, not at module scope: brake.py is the one place the
         # disarm switches actually live, and snapshot_and_push is the one
         # portfolio caller close enough to the loop to read them fresh each
@@ -375,7 +389,7 @@ class PortfolioReporter:
         from nakagai_edge.edge.brake import armed, disarmed_positions
         async with self._lock:
             now = time.time()
-            if (self._last_doc is not None
+            if (not force and self._last_doc is not None
                     and now - self._last_run < REFRESH_MIN_INTERVAL_S):
                 return self._last_doc
             doc = {"connectors": mark_guarded(
@@ -386,9 +400,13 @@ class PortfolioReporter:
             self._last_run = time.time()
             self._last_doc = doc
             try:
-                await asyncio.to_thread(
+                acknowledged = await asyncio.to_thread(
                     self._client.report_portfolio, doc["connectors"])
+                if require_ack and acknowledged.get("ok") is not True:
+                    raise ValueError("platform did not acknowledge fresh portfolio evidence")
             except Exception as e:  # noqa: BLE001 (a down platform must not hurt the edge)
+                if require_ack:
+                    raise
                 log.warning("portfolio snapshot not reported to the platform "
                             "this cycle: %s", e)
             return doc

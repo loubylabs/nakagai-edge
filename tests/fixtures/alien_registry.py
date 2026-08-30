@@ -107,7 +107,8 @@ ROBINHOOD_CONNECTOR = {
                        "cash": ["cash"],
                        "buying_power": ["buying_power.buying_power",
                                         "buying_power"],
-                       "currency": ["currency"]}},
+                       "currency": ["currency"],
+                       "day_pnl": ["day_pnl"]}},
         "list_positions": {
             "tool": "get_equity_positions",
             "args": {"account": "account_number"},

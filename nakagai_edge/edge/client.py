@@ -184,6 +184,20 @@ class PlatformClient:
             f"/api/agent/candidates/{candidate_id}/abstain",
             json={"rationale": rationale}))
 
+    def report_candidate_outcome(
+            self, candidate_id: str, *, mechanical_status: str,
+            mechanical_reason: str, approval_id: str = "", urgent: bool = False,
+            outcome_unknown: bool = False) -> dict:
+        return self._check(self._client.post(
+            f"/api/agent/candidates/{candidate_id}/outcome",
+            json={
+                "mechanical_status": mechanical_status,
+                "mechanical_reason": mechanical_reason,
+                "approval_id": approval_id,
+                "urgent": urgent,
+                "outcome_unknown": outcome_unknown,
+            }))
+
     def list_peers(self) -> dict:
         return self._chat_result(self._client.get(
             "/api/agent/peers", headers=self._chat_headers()))

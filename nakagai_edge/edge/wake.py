@@ -8,15 +8,20 @@ import subprocess
 import threading
 from collections.abc import Callable, Sequence
 
+from nakagai_edge.edge.candidate import CandidateWakeScope
+from nakagai_edge.edge.state import EdgeState
+
 
 class WakeRunner:
     """Run one wake command at a time while the listener keeps polling."""
 
-    def __init__(self, command: Sequence[str], *, note: Callable[[str], None],
+    def __init__(self, command: Sequence[str], state: EdgeState, *,
+                 note: Callable[[str], None],
                  run: Callable[..., subprocess.CompletedProcess] = subprocess.run) -> None:
         if not command:
             raise ValueError("wake command must not be empty")
         self.command = tuple(command)
+        self.scope = CandidateWakeScope(state)
         self.note = note
         self._run = run
         self._queue: queue.Queue[dict | None] = queue.Queue()
@@ -38,12 +43,16 @@ class WakeRunner:
             try:
                 if event is None:
                     return
-                result = self._run(
-                    self.command,
-                    input=json.dumps(event, separators=(",", ":")) + "\n",
-                    text=True,
-                    check=False,
-                )
+                token = self.scope.begin(event)
+                try:
+                    result = self._run(
+                        self.command,
+                        input=json.dumps(event, separators=(",", ":")) + "\n",
+                        text=True,
+                        check=False,
+                    )
+                finally:
+                    self.scope.finish(token)
                 if result.returncode:
                     self.note(f"[wake] command exited {result.returncode} for seq "
                               f"{event.get('seq')}")

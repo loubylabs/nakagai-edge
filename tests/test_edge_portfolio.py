@@ -172,7 +172,6 @@ async def test_balance_evidence_keeps_platform_equity_authority_on_checkin():
     not gain a second equity authority. Removing either validation makes an
     unreadable number look ready to relay through `agent_checkin`."""
     spec = _spec()
-    spec.capability("get_balance").fields["day_pnl"] = ["day_pnl"]
 
     evidence = await balance_evidence(_hub_ok(), spec, "463605220")
 
@@ -611,6 +610,28 @@ async def test_two_pokes_inside_the_window_are_one_broker_sweep(tmp_path):
     second = await reporter.snapshot_and_push()
     assert len(hub.calls) == calls_after_first   # no second sweep
     assert second == first                        # the fresh-enough snapshot back
+
+
+async def test_forced_snapshot_bypasses_the_agent_refresh_cache(tmp_path):
+    hub = _hub_ok()
+    reporter = _reporter(tmp_path, hub,
+                         lambda r: httpx.Response(200, json={"ok": True}))
+    await reporter.snapshot_and_push()
+    calls_after_first = len(hub.calls)
+
+    await reporter.snapshot_and_push(force=True, require_ack=True)
+
+    assert len(hub.calls) > calls_after_first
+
+
+async def test_required_portfolio_ack_does_not_swallow_report_failure(tmp_path):
+    reporter = _reporter(
+        tmp_path, _hub_ok(),
+        lambda r: httpx.Response(503, json={"detail": "down"}),
+    )
+
+    with pytest.raises(Exception, match="503"):
+        await reporter.snapshot_and_push(force=True, require_ack=True)
 
 
 async def test_a_down_platform_does_not_lose_the_snapshot(tmp_path):

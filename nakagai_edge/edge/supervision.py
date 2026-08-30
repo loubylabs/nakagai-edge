@@ -115,10 +115,7 @@ def load(state: EdgeState) -> dict:
 
 
 def save(state: EdgeState, doc: dict) -> None:
-    state.supervised_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = state.supervised_path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(doc, indent=2, default=str))
-    tmp.replace(state.supervised_path)
+    state._write_private(state.supervised_path, doc)
 
 
 def record(state: EdgeState, rec: dict) -> None:

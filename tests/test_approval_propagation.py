@@ -10,8 +10,10 @@ import yaml
 
 from nakagai_edge.edge.remote import RemoteApprovalQueue
 from nakagai_edge.edge.runtime import build_hub
+from nakagai_edge.edge.candidate import CandidateWakeScope
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.hub import ConnectorHub
+from nakagai_edge.hub import GuardrailDenied
 from tests.fixtures.echo_mcp import mcp as echo_server
 from tests.fixtures.inproc import connect_to
 
@@ -69,6 +71,57 @@ async def test_read_only_hub_call_requires_identity_without_touching_queue(tmp_p
     assert result["is_write"] is False
     assert queue.calls == []
     await hub.aclose()
+
+
+@pytest.mark.anyio
+async def test_candidate_scope_denies_a_write_after_real_classification(tmp_path) -> None:
+    queue = RecordingQueue()
+    hub = configured_hub(tmp_path, queue)
+    CandidateWakeScope(EdgeState(tmp_path)).begin({
+        "seq": 1, "kind": "execution_candidate", "response_required": True,
+        "candidate_id": "candidate-1", "expires_at": time.time() + 60,
+    })
+    try:
+        with pytest.raises(GuardrailDenied, match="candidate wake"):
+            await hub.call(
+                "echo", "place_equity_order", {"symbol": "SPY"},
+                account_key="agent-a",
+            )
+        read = await hub.call(
+            "echo", "echo", {"text": "still readable"},
+            account_key="agent-a",
+        )
+    finally:
+        await hub.aclose()
+
+    assert read["is_write"] is False
+    assert queue.calls == []
+
+
+@pytest.mark.anyio
+async def test_candidate_scope_allows_only_its_accepted_intent(tmp_path) -> None:
+    queue = RecordingQueue()
+    hub = configured_hub(tmp_path, queue)
+    CandidateWakeScope(EdgeState(tmp_path)).begin({
+        "seq": 1, "kind": "execution_candidate", "response_required": True,
+        "candidate_id": "candidate-1", "expires_at": time.time() + 60,
+    })
+    try:
+        with pytest.raises(GuardrailDenied, match="candidate wake"):
+            await hub.call(
+                "echo", "place_equity_order", {"symbol": "SPY"},
+                account_key="agent-a", candidate_id="candidate-1",
+            )
+        result = await hub.call(
+            "echo", "place_equity_order", {"symbol": "SPY"},
+            account_key="agent-a", candidate_id="candidate-1",
+            require_approval=True,
+        )
+    finally:
+        await hub.aclose()
+
+    assert result["approval_id"] == "approval-a"
+    assert queue.calls[0][-1]["candidate_id"] == "candidate-1"
 
 
 class RemoteClient:

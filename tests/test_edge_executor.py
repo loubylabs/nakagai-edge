@@ -11,11 +11,15 @@ pytest.importorskip("cryptography")
 
 from nakagai_edge.edge.audit import EdgeAudit
 from nakagai_edge.edge.client import PlatformClient
+from nakagai_edge.edge.candidate import candidate_entries_armed
 from nakagai_edge.edge.executor import poll_once
 from nakagai_edge.edge.remote import RemoteApprovalQueue, intents
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.sync import BUNDLE_SCHEMA, apply_bundle
+from nakagai_edge.edge.supervision import load as load_supervision
+from nakagai_edge.config import load_specs
 from nakagai_edge.signing import build_payload, generate_keypair, sign_artifact
+from tests.fixtures.alien_registry import ROBINHOOD_CONNECTOR
 
 pytestmark = pytest.mark.anyio
 
@@ -27,6 +31,11 @@ def anyio_backend():
 
 PRIV, PUB = generate_keypair()
 ARGS = {"account_number": "463605220", "qty": 1}
+CANDIDATE_ARGS = {
+    "account_number": "463605220", "symbol": "AAPL", "side": "buy",
+    "type": "limit", "quantity": "3", "limit_price": "211.25",
+    "stop_price": "207.0", "time_in_force": "day",
+}
 
 
 def _bundle():
@@ -59,11 +68,11 @@ class FakeHub:
 
 
 def _setup(tmp_path, grant_status="granted", artifact=None,
-           broken_execution=False):
+           broken_execution=False, record_overrides=None):
     state = EdgeState(tmp_path)
     state.save_agent("https://api.test", "ag1", "nk_agent_t")
     apply_bundle(state, _bundle(), "v1")
-    reports = []
+    reports, outcomes, alerts = [], [], []
 
     def handler(req):
         if req.url.path == "/api/agent/approvals" and req.method == "POST":
@@ -71,15 +80,22 @@ def _setup(tmp_path, grant_status="granted", artifact=None,
                                              "status": "pending",
                                              "expires_at": time.time() + 900})
         if req.url.path == "/api/agent/approvals/a1" and req.method == "GET":
-            return httpx.Response(200, json={
+            return httpx.Response(200, json={**{
                 "id": "a1", "status": grant_status, "connector_id": "demo",
                 "tool": "place_order", "args": ARGS, "agent_id": "ag1",
-                "artifact": artifact, "expires_at": time.time() + 900})
+                "artifact": artifact, "expires_at": time.time() + 900},
+                **(record_overrides or {})})
         if req.url.path.endswith("/execution"):
             reports.append(json.loads(req.content))
             if broken_execution:
                 return httpx.Response(200, text="<html>proxy</html>")
             return httpx.Response(200, json={"ok": True, "status": "executed"})
+        if req.url.path.endswith("/outcome"):
+            outcomes.append(json.loads(req.content))
+            return httpx.Response(200, json={"ok": True})
+        if req.url.path == "/api/agent/checkin":
+            alerts.append(json.loads(req.content))
+            return httpx.Response(200, json={"ok": True})
         if req.url.path == "/api/agent/audit":
             return httpx.Response(200, json={"ok": True, "accepted": 1})
         return httpx.Response(404, json={"detail": "?"})
@@ -87,7 +103,41 @@ def _setup(tmp_path, grant_status="granted", artifact=None,
     client = PlatformClient("https://api.test", "nk_agent_t",
                             transport=httpx.MockTransport(handler))
     queue = RemoteApprovalQueue(client, state, "ag1")
+    client.candidate_outcomes = outcomes
+    client.candidate_alerts = alerts
     return state, client, queue, reports
+
+
+class CandidateHub(FakeHub):
+    def __init__(self, *, positions=None, position_error=None, trace=None):
+        super().__init__()
+        entry = {**ROBINHOOD_CONNECTOR, "id": "demo"}
+        entry["capabilities"] = {
+            name: dict(value) for name, value in ROBINHOOD_CONNECTOR["capabilities"].items()
+        }
+        entry["capabilities"]["place_order"] = {
+            **entry["capabilities"]["place_order"], "tool": "place_order"}
+        self._spec = load_specs({"connectors": [entry]})["demo"]
+        self.positions = ([{"symbol": "AAPL", "quantity": "3"}]
+                          if positions is None else positions)
+        self.position_error = position_error
+        self.trace = trace if trace is not None else []
+
+    def spec(self, connector_id):
+        assert connector_id == "demo"
+        return self._spec
+
+    async def call(self, connector_id, tool, args, **kw):
+        if kw.get("approved"):
+            self.calls.append((connector_id, tool, args, kw))
+            self.trace.append("broker")
+            return {"is_error": False, "data": {"order_id": "42"}}
+        assert tool == "get_equity_positions"
+        self.trace.append("positions")
+        if self.position_error is not None:
+            raise self.position_error
+        return {"is_error": False, "data": {
+            "data": {"positions": self.positions}}}
 
 
 async def test_enqueue_records_local_intent(tmp_path):
@@ -129,6 +179,8 @@ async def test_candidate_grant_requires_the_same_candidate(tmp_path):
 
     assert hub.calls == []
     assert reports and reports[0]["ok"] is False
+    assert client.candidate_outcomes[0]["mechanical_status"] == "blocked"
+    assert "candidate_id mismatch" in client.candidate_outcomes[0]["mechanical_reason"]
 
 
 async def test_candidate_grant_requires_the_same_frozen_account(tmp_path):
@@ -144,6 +196,8 @@ async def test_candidate_grant_requires_the_same_frozen_account(tmp_path):
     assert hub.calls == []
     assert reports and reports[0]["ok"] is False
     assert "account mismatch" in reports[0]["error"]
+    assert client.candidate_outcomes[0]["mechanical_status"] == "blocked"
+    assert "account mismatch" in client.candidate_outcomes[0]["mechanical_reason"]
 
 
 async def test_lost_candidate_approval_never_contacts_the_broker(tmp_path):
@@ -174,6 +228,136 @@ async def test_disarmed_brake_refuses_a_candidate_grant_before_broker_contact(tm
     assert hub.calls == []
     assert reports and reports[0]["ok"] is False
     assert "brake" in reports[0]["error"]
+    assert client.candidate_outcomes[0]["mechanical_status"] == "blocked"
+    assert "brake" in client.candidate_outcomes[0]["mechanical_reason"]
+
+
+async def test_candidate_reports_success_only_after_supervision_is_broker_readable(
+        tmp_path):
+    trace = []
+    artifact = _artifact(
+        "a1", args=CANDIDATE_ARGS, candidate_id="candidate-1",
+        account="463605220")
+    warrant = {"expires_at": time.time() + 3600, "signature": "warrant"}
+    state, client, queue, reports = _setup(
+        tmp_path, artifact=artifact,
+        record_overrides={
+            "args": CANDIDATE_ARGS,
+            "signal_id": "signal-1",
+            "exit_warrant": warrant,
+        },
+    )
+    queue.enqueue(
+        "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
+        candidate_id="candidate-1", intent_account="463605220",
+    )
+    hub = CandidateHub(trace=trace)
+    original_report = client.report_execution
+
+    def report(*args, **kwargs):
+        trace.append("execution")
+        return original_report(*args, **kwargs)
+
+    original_outcome = client.report_candidate_outcome
+
+    def outcome(*args, **kwargs):
+        trace.append("outcome")
+        return original_outcome(*args, **kwargs)
+
+    client.report_execution = report
+    client.report_candidate_outcome = outcome
+
+    assert await poll_once(hub, state, client, EdgeAudit(state)) == 1
+
+    assert trace == ["broker", "positions", "execution", "outcome"]
+    assert reports == [{
+        "ok": True, "result": {"is_error": False, "data": {"order_id": "42"}},
+        "error": "", "outcome_unknown": False, "order_id": "",
+    }]
+    stored = load_supervision(state)["a1"]
+    assert stored["state"] == "armed"
+    assert stored["symbol"] == "AAPL"
+    assert client.candidate_outcomes == [{
+        "mechanical_status": "submitted",
+        "mechanical_reason": "broker execution reported and supervision verified",
+        "approval_id": "a1", "urgent": False, "outcome_unknown": False,
+    }]
+    assert candidate_entries_armed(state) is True
+
+
+async def test_supervision_failure_disarms_entries_reports_urgent_and_alerts_owner(
+        tmp_path):
+    artifact = _artifact(
+        "a1", args=CANDIDATE_ARGS, candidate_id="candidate-1",
+        account="463605220")
+    state, client, queue, reports = _setup(
+        tmp_path, artifact=artifact,
+        record_overrides={
+            "args": CANDIDATE_ARGS,
+            "signal_id": "signal-1",
+            "exit_warrant": {
+                "expires_at": time.time() + 3600, "signature": "warrant"},
+        },
+    )
+    queue.enqueue(
+        "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
+        candidate_id="candidate-1", intent_account="463605220",
+    )
+    hub = CandidateHub(position_error=RuntimeError("positions unreadable"))
+
+    assert await poll_once(hub, state, client, EdgeAudit(state)) == 1
+
+    assert len(hub.calls) == 1
+    assert reports[0]["ok"] is False
+    assert reports[0]["outcome_unknown"] is True
+    assert "supervision" in reports[0]["error"]
+    assert client.candidate_outcomes == [{
+        "mechanical_status": "blocked",
+        "mechanical_reason": reports[0]["error"],
+        "approval_id": "a1", "urgent": True, "outcome_unknown": True,
+    }]
+    assert client.candidate_alerts == [{
+        "status": "alert",
+        "note": reports[0]["error"],
+        "account_equity": None,
+        "day_pnl": None,
+    }]
+    assert candidate_entries_armed(state) is False
+    from nakagai_edge.edge.brake import armed
+    assert armed(state) is True
+    assert intents(state) == {}
+    assert not any(
+        event["kind"] == "execution" and event["detail"].get("ok") is True
+        for event in EdgeAudit(state).pending()
+    )
+
+    await poll_once(hub, state, client, EdgeAudit(state))
+    assert len(hub.calls) == 1
+
+
+async def test_candidate_outcome_unknown_keeps_the_existing_fence_and_alerts(
+        tmp_path):
+    artifact = _artifact(
+        "a1", args=CANDIDATE_ARGS, candidate_id="candidate-1",
+        account="463605220")
+    state, client, queue, reports = _setup(tmp_path, artifact=artifact)
+    queue.enqueue(
+        "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
+        candidate_id="candidate-1", intent_account="463605220",
+    )
+    hub = CandidateHub()
+
+    async def uncertain(*args, **kwargs):
+        raise RuntimeError("broker timed out")
+
+    hub.call = uncertain
+
+    assert await poll_once(hub, state, client, EdgeAudit(state)) == 1
+
+    assert reports[0]["outcome_unknown"] is True
+    assert client.candidate_outcomes[0]["urgent"] is True
+    assert client.candidate_outcomes[0]["outcome_unknown"] is True
+    assert candidate_entries_armed(state) is False
 
 
 async def test_expired_artifact_never_executes(tmp_path):

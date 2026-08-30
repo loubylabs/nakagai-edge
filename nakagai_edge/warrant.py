@@ -157,9 +157,8 @@ def _present(args: dict, key: str) -> bool:
 
 def read_entry(cap: Capability, args: dict) -> dict | None:
     """The five fields the ledger needs, or None if this entry cannot be
-    supervised. A missing stop is disqualifying here (unlike the envelope,
-    which reports it and lets policy decide): with no stop there is no level,
-    and with no level there is nothing to watch."""
+    supervised. A missing stop is disqualifying: with no stop there is no
+    level, and with no level there is nothing to watch."""
     if not configured(cap) or not isinstance(args, dict):
         return None
     keys = {field: cap.args[field] for field in ENTRY_FIELDS}

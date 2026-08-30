@@ -484,7 +484,8 @@ def _cmd_listen(args) -> int:
             return 1
         wake = None
         try:
-            wake = (WakeRunner(_shlex.split(args.wake_command), note=_stderr_note)
+            wake = (WakeRunner(_shlex.split(args.wake_command), state,
+                               note=_stderr_note)
                     if args.wake_command else None)
 
             def emit(msg):
