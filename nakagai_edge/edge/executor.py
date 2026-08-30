@@ -53,6 +53,8 @@ def _verify(
         signal_id = intent.get("signal_id")
         if not isinstance(signal_id, str) or not signal_id.strip():
             return "candidate signal_id is missing or empty"
+        if signal_id != signal_id.strip():
+            return "candidate signal_id is not whitespace-exact"
         if record.get("signal_id") != signal_id:
             return "signal_id mismatch"
     checks = (

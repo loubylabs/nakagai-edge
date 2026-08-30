@@ -243,9 +243,10 @@ async def test_candidate_grant_requires_the_same_frozen_signal(tmp_path):
         ("", ""),
         ("signal-1", ""),
         (" signal-1 ", "signal-1"),
+        (" signal-1 ", " signal-1 "),
     ],
     ids=["missing-local", "missing-remote", "empty-local", "empty-remote",
-         "whitespace-exact-mismatch"],
+         "whitespace-exact-mismatch", "both-sides-untrimmed"],
 )
 async def test_candidate_signal_binding_fails_closed_at_persisted_verification(
         tmp_path, local_signal, remote_signal):
