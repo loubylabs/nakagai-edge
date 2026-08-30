@@ -11,14 +11,17 @@ pytest.importorskip("cryptography")
 
 from nakagai_edge.edge.audit import EdgeAudit
 from nakagai_edge.edge.client import PlatformClient
-from nakagai_edge.edge.candidate import candidate_entries_armed
+from nakagai_edge.edge.candidate import (
+    candidate_entries_armed,
+    pending_candidate_outcomes,
+)
 from nakagai_edge.edge.executor import poll_once, reconcile_submitted_fills
 from nakagai_edge.edge.remote import RemoteApprovalQueue, intents
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.sync import BUNDLE_SCHEMA, apply_bundle
 from nakagai_edge.edge.supervision import load as load_supervision
 from nakagai_edge.config import load_specs
-from nakagai_edge.signing import build_payload, generate_keypair, sign_artifact
+from nakagai_edge.signing import args_hash, build_payload, generate_keypair, sign_artifact
 from tests.fixtures.alien_registry import ROBINHOOD_CONNECTOR
 
 pytestmark = pytest.mark.anyio
@@ -83,7 +86,8 @@ def _setup(tmp_path, grant_status="granted", artifact=None,
             return httpx.Response(200, json={**{
                 "id": "a1", "status": grant_status, "connector_id": "demo",
                 "tool": "place_order", "args": ARGS, "agent_id": "ag1",
-                "artifact": artifact, "expires_at": time.time() + 900},
+                "artifact": artifact, "expires_at": time.time() + 900,
+                "signal_id": "signal-1"},
                 **(record_overrides or {})})
         if req.url.path.endswith("/execution"):
             reports.append(json.loads(req.content))
@@ -172,7 +176,8 @@ async def test_candidate_grant_requires_the_same_candidate(tmp_path):
     artifact = _artifact("a1", candidate_id="candidate-other")
     state, client, queue, reports = _setup(tmp_path, artifact=artifact)
     queue.enqueue("ag1", "demo", "place_order", ARGS, ttl_s=900,
-                  candidate_id="candidate-1", intent_account="463605220")
+                  signal_id="signal-1", candidate_id="candidate-1",
+                  intent_account="463605220")
     hub = FakeHub()
 
     await poll_once(hub, state, client, EdgeAudit(state))
@@ -188,7 +193,8 @@ async def test_candidate_grant_requires_the_same_frozen_account(tmp_path):
                          account="other-account")
     state, client, queue, reports = _setup(tmp_path, artifact=artifact)
     queue.enqueue("ag1", "demo", "place_order", ARGS, ttl_s=900,
-                  candidate_id="candidate-1", intent_account="463605220")
+                  signal_id="signal-1", candidate_id="candidate-1",
+                  intent_account="463605220")
     hub = FakeHub()
 
     await poll_once(hub, state, client, EdgeAudit(state))
@@ -200,10 +206,34 @@ async def test_candidate_grant_requires_the_same_frozen_account(tmp_path):
     assert "account mismatch" in client.candidate_outcomes[0]["mechanical_reason"]
 
 
+async def test_candidate_grant_requires_the_same_frozen_signal(tmp_path):
+    artifact = _artifact(
+        "a1", candidate_id="candidate-1", account="463605220")
+    state, client, queue, reports = _setup(
+        tmp_path,
+        artifact=artifact,
+        record_overrides={"signal_id": "other-signal"},
+    )
+    queue.enqueue(
+        "ag1", "demo", "place_order", ARGS, ttl_s=900,
+        signal_id="signal-1", candidate_id="candidate-1",
+        intent_account="463605220",
+    )
+    hub = FakeHub()
+
+    await poll_once(hub, state, client, EdgeAudit(state))
+
+    assert hub.calls == []
+    assert reports and reports[0]["ok"] is False
+    assert client.candidate_outcomes[0]["mechanical_status"] == "blocked"
+    assert "signal_id mismatch" in client.candidate_outcomes[0]["mechanical_reason"]
+
+
 async def test_lost_candidate_approval_never_contacts_the_broker(tmp_path):
     state, client, queue, reports = _setup(tmp_path, grant_status="denied")
     queue.enqueue("ag1", "demo", "place_order", ARGS, ttl_s=900,
-                  candidate_id="candidate-1", intent_account="463605220")
+                  signal_id="signal-1", candidate_id="candidate-1",
+                  intent_account="463605220")
     hub = FakeHub()
 
     await poll_once(hub, state, client, EdgeAudit(state))
@@ -219,7 +249,8 @@ async def test_disarmed_brake_refuses_a_candidate_grant_before_broker_contact(tm
     artifact = _artifact("a1", candidate_id="candidate-1")
     state, client, queue, reports = _setup(tmp_path, artifact=artifact)
     queue.enqueue("ag1", "demo", "place_order", ARGS, ttl_s=900,
-                  candidate_id="candidate-1", intent_account="463605220")
+                  signal_id="signal-1", candidate_id="candidate-1",
+                  intent_account="463605220")
     set_local_disarm(state, all_positions=True)
     hub = FakeHub()
 
@@ -230,6 +261,45 @@ async def test_disarmed_brake_refuses_a_candidate_grant_before_broker_contact(tm
     assert "brake" in reports[0]["error"]
     assert client.candidate_outcomes[0]["mechanical_status"] == "blocked"
     assert "brake" in client.candidate_outcomes[0]["mechanical_reason"]
+
+
+async def test_signed_brake_refusal_retries_candidate_outcome_until_acknowledged(
+        tmp_path):
+    from nakagai_edge.edge.brake import set_local_disarm
+
+    artifact = _artifact("a1", candidate_id="candidate-1")
+    state, client, queue, reports = _setup(tmp_path, artifact=artifact)
+    queue.enqueue(
+        "ag1", "demo", "place_order", ARGS, ttl_s=900,
+        signal_id="signal-1", candidate_id="candidate-1",
+        intent_account="463605220",
+    )
+    set_local_disarm(state, all_positions=True)
+    hub = FakeHub()
+    original = client.report_candidate_outcome
+    attempts = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("platform unavailable")
+        return original(*args, **kwargs)
+
+    client.report_candidate_outcome = fail_once
+
+    assert await poll_once(hub, state, client, EdgeAudit(state)) == 1
+    assert hub.calls == []
+    assert reports and reports[0]["ok"] is False
+    pending = pending_candidate_outcomes(state)
+    assert pending["candidate-1"]["mechanical_status"] == "blocked"
+    assert "brake" in pending["candidate-1"]["mechanical_reason"]
+    assert intents(state) == {}
+
+    assert await poll_once(hub, state, client, EdgeAudit(state)) == 0
+    assert attempts == 2
+    assert pending_candidate_outcomes(state) == {}
+    assert hub.calls == []
 
 
 async def test_preexisting_position_does_not_turn_resting_candidate_limit_into_fill(
@@ -249,7 +319,8 @@ async def test_preexisting_position_does_not_turn_resting_candidate_limit_into_f
     )
     queue.enqueue(
         "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
-        candidate_id="candidate-1", intent_account="463605220",
+        signal_id="signal-1", candidate_id="candidate-1",
+        intent_account="463605220",
     )
     hub = CandidateHub(trace=trace)
     original_report = client.report_execution
@@ -296,7 +367,8 @@ async def test_candidate_execution_report_failure_keeps_submission_and_disarms(
     )
     queue.enqueue(
         "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
-        candidate_id="candidate-1", intent_account="463605220",
+        signal_id="signal-1", candidate_id="candidate-1",
+        intent_account="463605220",
     )
 
     await poll_once(CandidateHub(), state, client, EdgeAudit(state))
@@ -326,7 +398,8 @@ async def test_later_matching_fill_establishes_supervision_and_completes_candida
     )
     queue.enqueue(
         "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
-        candidate_id="candidate-1", intent_account="463605220",
+        signal_id="signal-1", candidate_id="candidate-1",
+        intent_account="463605220",
     )
     hub = CandidateHub(positions=[{"symbol": "AAPL", "quantity": "3"}])
     await poll_once(hub, state, client, EdgeAudit(state))
@@ -398,7 +471,8 @@ async def test_mismatched_fill_order_id_cannot_complete_candidate(tmp_path):
     )
     queue.enqueue(
         "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
-        candidate_id="candidate-1", intent_account="463605220",
+        signal_id="signal-1", candidate_id="candidate-1",
+        intent_account="463605220",
     )
     hub = CandidateHub()
     await poll_once(hub, state, client, EdgeAudit(state))
@@ -430,7 +504,8 @@ async def test_declared_terminal_order_blocks_candidate_without_supervision(
     )
     queue.enqueue(
         "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
-        candidate_id="candidate-1", intent_account="463605220",
+        signal_id="signal-1", candidate_id="candidate-1",
+        intent_account="463605220",
     )
     hub = CandidateHub()
     await poll_once(hub, state, client, EdgeAudit(state))
@@ -463,7 +538,8 @@ async def test_undeclared_order_status_keeps_submitted_candidate_durable(
     )
     queue.enqueue(
         "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
-        candidate_id="candidate-1", intent_account="463605220",
+        signal_id="signal-1", candidate_id="candidate-1",
+        intent_account="463605220",
     )
     hub = CandidateHub()
     await poll_once(hub, state, client, EdgeAudit(state))
@@ -496,7 +572,8 @@ async def test_supervision_failure_after_actual_fill_disarms_and_alerts_owner(
     )
     queue.enqueue(
         "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
-        candidate_id="candidate-1", intent_account="463605220",
+        signal_id="signal-1", candidate_id="candidate-1",
+        intent_account="463605220",
     )
     hub = CandidateHub(position_error=RuntimeError("positions unreadable"))
 
@@ -536,7 +613,8 @@ async def test_candidate_outcome_unknown_keeps_the_existing_fence_and_alerts(
     state, client, queue, reports = _setup(tmp_path, artifact=artifact)
     queue.enqueue(
         "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
-        candidate_id="candidate-1", intent_account="463605220",
+        signal_id="signal-1", candidate_id="candidate-1",
+        intent_account="463605220",
     )
     hub = CandidateHub()
 
@@ -702,46 +780,21 @@ def test_signal_id_travels_from_edge_to_platform(tmp_path):
 
 
 async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
-    """The whole point of the task, end to end, in the two halves it now has.
-
-    First: **the platform declines every auto-execution to the owner.** Its
-    envelope lost the evidence condition and has not yet gained the confluence
-    condition that replaces it, so autopilot refuses to act on one condition
-    fewer than it was designed for. Even this order (an armed autopilot mandate,
-    a signal the platform itself emitted, a symbol on the auto-execute fence,
-    inside every cap) comes back `pending` with no artifact, and a poll against
-    it puts nothing at the broker. That is the safety property, so it is pinned
-    here explicitly rather than left as a gap between two other assertions: no
-    order reaches a broker without a human.
-
-    Then: **the owner taps approve, and the edge closes the loop.** The
-    owner-action route (`POST /api/approvals/{id}`, guarded by
-    assert_owner_action's separate approver token) grants an edge-origin
-    approval by SIGNING an artifact rather than executing it, because the
-    platform holds no broker credentials. The edge's poll_once independently
-    verifies that artifact and places the trade at a real (memory-transport)
-    broker. That half is this repo's own responsibility and has not changed.
-
-    Nothing security-critical is stubbed. The platform really signs (real
-    Ed25519); poll_once really verifies signature + args_hash + agent_id +
-    expiry; the broker call really runs over the MCP ClientSession. Only the
-    HTTP hop is a MockTransport, and it forwards to the real platform FastAPI
-    app, so this is a genuine enqueue → decline → tap → grant → poll, not a
-    canned reply. The owner decides (`decided_by` is the approver's email); the
-    edge only executes an artifact it verified; the agent's token never grants
-    its own order.
-    """
+    """One real candidate reaches one supervised broker position."""
     pytest.importorskip("nakagai_platform")
 
     import pandas as pd
-    import yaml as _yaml
-
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
     from mcp.server.mcpserver import MCPServer
 
     from nakagai_platform.api.app import create_app
+    from nakagai_platform.candidate_store import CandidateStore
     from nakagai_edge.hub import ConnectorHub
+    from nakagai_edge.capability import resolve
+    from nakagai_edge.edge.candidate import CandidateWakeScope
+    from nakagai_edge.edge.runtime import _prepared_order
+    from nakagai_edge.edge.supervision import apply_renewals, renewal_request
     from tests.fixtures.inproc import connect_to
     from nakagai_edge.signing import generate_keypair, public_key_for
     from nakagai_platform.api.signal_store import SignalStore
@@ -762,33 +815,24 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
 
     signal_id = f"test-{uuid.uuid4().hex}"
 
-    priv, pub = generate_keypair()
+    priv, _ = generate_keypair()
     monkeypatch.setenv("NAKAGAI_API_TOKEN", "api-secret")
     monkeypatch.setenv("NAKAGAI_APPROVER_TOKEN", "approver-secret")
     monkeypatch.setenv("NAKAGAI_APPROVER_EMAILS", "chris@nakag.ai")
     monkeypatch.setenv("NAKAGAI_APPROVAL_SIGNING_KEY", priv)
 
-    order = {"symbol": "NVDA", "side": "buy", "order_type": "limit",
-             "quantity": 10, "limit_price": 118.40, "stop_price": 116.10,
-             "time_in_force": "day"}
-    # The connector's own words for placing an order. `tool` is also the
-    # positive gate: exactly one declared share-order tool, so an option order
-    # cannot ride in on a `place_*` glob and be sized without its multiplier.
-    place_order = {
-        "tool": "place_equity_order",
-        "args": {"symbol": "symbol", "side": "side", "order_type": "type",
-                 "quantity": "quantity", "limit_price": "limit_price",
-                 "stop_price": "stop_price", "time_in_force": "time_in_force",
-                 "account": "account_number"},
-        "outbound_types": {"symbol": "string", "side": "string",
-                           "order_type": "string", "quantity": "string",
-                           "limit_price": "string", "stop_price": "string",
-                           "time_in_force": "string", "account": "string"},
-        "values": {"side": {"buy": ["buy", "buy_to_open", "buy_to_cover"],
-                            "sell": ["sell", "sell_to_open", "sell_short"]},
-                   "order_type": {"limit": ["limit"], "market": ["market"]}}}
+    canonical_order = {
+        "symbol": "NVDA", "side": "buy", "order_type": "limit",
+        "quantity": 10, "limit_price": 118.40, "stop_price": 116.10,
+        "time_in_force": "gtc", "account": "463605220",
+    }
+    connector = {
+        **ROBINHOOD_CONNECTOR,
+        "id": "broker",
+        "url": "https://example.test/mcp",
+    }
 
-    # ---- platform: autopilot armed, a seeded signal, the signing key ----
+    # ---- platform: copilot mandate, a seeded signal, the signing key ----
     plat = tmp_path / "platform"
     (plat / "config").mkdir(parents=True)
     (plat / "config" / "scan.yaml").write_text(
@@ -807,55 +851,22 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
 
     mandate_db = Database.from_env()
     mandate_db.workspace_id("chris-nakag", "chris@nakag.ai")
-    # Autopilot stages orders, and the platform now refuses to persist a rung
-    # that stages orders for an account that is not Pro. Granted BEFORE the
-    # resolver on purpose: WorkspaceContext carries the plan it read at
-    # resolution time, so a grant after this line would leave the store
-    # holding a stale free context and the save below would still be refused.
+    # Candidate execution needs Pro. Grant it before resolving the context,
+    # because WorkspaceContext carries the plan it read at resolution time.
     mandate_db.grant_plan("chris@nakag.ai", plan="pro",
-                          reason="edge autopilot fixture",
+                          reason="edge candidate fixture",
                           granted_by="edge-tests")
     mandate_ctx = resolve_workspace_for_email(mandate_db, "chris@nakag.ai")
     mandate_store = MandateStore(plat, mandate_db, mandate_ctx)
     doc = mandate_store.load()
-    doc["preset"] = "autopilot"
-    # Not a loss-dial test: turned off explicitly so the on-by-default
-    # breaker doesn't decline this end-to-end grant on a missing equity
-    # report instead of proving the enqueue -> grant -> poll loop closes.
-    doc["overrides"] = {"rails": {"autopilot": {"daily_loss_pct_disarm": 0.0}}}
+    doc["preset"] = "copilot"
     mandate_store.save(doc)
-    # armed is runtime safety state with its own atomic setter; saving a
-    # document with autopilot_state.armed=True would silently not arm it.
-    mandate_store.set_armed(True)
-
-    # The auto-execute allowlist is per-workspace Postgres rows now, not
-    # config/watchlist.yaml. Same account as the mandate above, for the same
-    # reason: autoapprove resolves the fence off the approval record's owner
-    # email, so seeding a different workspace (or a file) leaves this one's
-    # fence empty, and the envelope's watchlist_only check declines the order
-    # as "not on your auto-execute allowlist". That reads as a pending order
-    # rather than an error, which is why the loop below would hang on
-    # `granted` with nothing obviously broken.
-    #
-    # It is NEVER seeded by the platform: an empty fence means autopilot
-    # trades nothing without a human, so a test that wants a grant has to say
-    # so explicitly.
-    from nakagai_platform.allowlist_store import AllowlistStore
-
-    AllowlistStore(plat, mandate_db, mandate_ctx).apply(
-        ["NVDA"], "seeded for the end-to-end autopilot loop")
 
     from nakagai_platform.api.connectors import ConnectorStore
 
     # Connector and signal setup share the same durable database the running
     # platform reads. A file registry is no longer an input to PlatformHub.
-    ConnectorStore(mandate_db).add({
-        "id": "broker", "kind": "mcp-http", "role": "broker",
-        "url": "https://example.test/mcp", "enabled": True,
-        "guardrails": {"allow_writes": True, "read_only_tools": ["get_*"],
-                       "approvals": {"require_for": ["place_*"], "ttl_s": 900}},
-        "capabilities": {"place_order": place_order},
-    })
+    ConnectorStore(mandate_db).add(connector)
     SignalStore(mandate_db).append([{
         "id": signal_id, "bar_ts": "2026-07-13T14:55:00+00:00",
         "detected_ts": "2026-07-13T14:55:00+00:00", "symbol": "NVDA",
@@ -872,11 +883,52 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
     paired = platform.post("/api/agents/pair", json={"code": code}).json()
     agent_id, token = paired["agent_id"], paired["token"]
 
+    store = CandidateStore(mandate_db)
+    from datetime import datetime, timedelta, timezone
+
+    candidate = store.create(
+        workspace_id=str(mandate_ctx.wid),
+        agent_id=agent_id,
+        signal_id=signal_id,
+        policy_version=1,
+        signal={
+            "id": signal_id, "play": "ict", "symbol": "NVDA",
+            "direction": "LONG", "timeframe": "15m",
+            "bar_ts": "2026-07-13T14:55:00+00:00",
+            "entry": 118.4, "stop": 116.1, "reward_to_risk": 2.4,
+            "confluence": 1, "independence": 1,
+            "stacked_timeframes": ["15m"], "provenance": "live",
+        },
+        score=10.0,
+        score_breakdown={
+            "confluence": 1.0, "stacked": 1.0, "rr": 1.0,
+            "proven_pf": 1.0, "proven": True,
+        },
+        play_title="ICT",
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+    )
+    reserved = store.reserve_accept(
+        candidate["id"], agent_id=agent_id,
+        rationale="The bounded setup is valid.",
+    )
+    connector_spec = ConnectorStore(mandate_db).specs()["broker"]
+    tool, broker_args = resolve(
+        "place_order", connector_spec.capabilities["place_order"],
+        canonical_order,
+    )
+    store.prepare(
+        candidate["id"], agent_id=agent_id,
+        preparation_token=reserved["preparation_token"],
+        connector_id="broker", account="463605220", tool=tool,
+        canonical_order=canonical_order, args=broker_args,
+        args_hash=args_hash(broker_args), compiler_version=1,
+    )
+
     # ---- edge: its state + a bundle carrying the platform's public key ----
     state = EdgeState(tmp_path / "edge")
     state.save_agent("https://api.test", agent_id, token)
     apply_bundle(state, {"bundle_version": "v1", "schema_version": BUNDLE_SCHEMA,
-                         "connectors": {"connectors": []},
+                         "connectors": {"connectors": [connector]},
                          "signing_public_key": public_key_for(priv)}, "v1")
 
     def forward(req):
@@ -898,28 +950,46 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
     # broker that was genuinely reachable and still took no order, rather than
     # at one that did not exist yet.
     placed: list = []
+    positions: list = []
     broker = MCPServer("broker")
 
     @broker.tool()
-    def place_equity_order(symbol: str, side: str, quantity: int,
-                           limit_price: float, stop_price: float = 0.0) -> str:
+    def place_equity_order(
+            symbol: str, side: str, type: str, quantity: str,
+            limit_price: str, stop_price: str, time_in_force: str,
+            account_number: str) -> dict:
         placed.append((symbol, side, quantity))
-        return f"PLACED {side} {quantity} {symbol} @ {limit_price}"
+        positions[:] = [{"symbol": symbol, "quantity": quantity}]
+        return {"order_id": "broker-order-1", "average_price": limit_price}
 
-    # The edge holds the broker credentials and executes. apply_bundle synced an
-    # empty registry into state.root/config; write the broker entry its hub dials.
-    (state.root / "config" / "connectors.yaml").write_text(_yaml.safe_dump({"connectors": [{
-        "id": "broker", "kind": "mcp-http", "role": "broker",
-        "url": "https://example.test/mcp", "enabled": True,
-        "guardrails": {"allow_writes": True, "read_only_tools": ["get_*"],
-                       "approvals": {"require_for": ["place_*"], "ttl_s": 900}}}]}))
+    @broker.tool()
+    def get_equity_positions(account_number: str) -> dict:
+        return {"data": {"positions": positions}}
+
     edge_hub = ConnectorHub(state.root, connect=connect_to(broker), approvals=queue)
     edge_hub.account_key = agent_id
 
-    # ---- half one: the platform declines to the owner, and nothing executes ----
-    rec = queue.enqueue(agent_id, "broker", "place_equity_order", order, ttl_s=900,
-                        signal_id=signal_id)
+    CandidateWakeScope(state).begin({
+        "seq": 1, "kind": "execution_candidate", "response_required": True,
+        "candidate_id": candidate["id"], "expires_at": time.time() + 300,
+    })
+    accepted = edge_client.accept_candidate(
+        candidate["id"], "The bounded setup is valid.")
+    prepared = _prepared_order(
+        candidate["id"], accepted, load_specs({"connectors": [connector]})["broker"],
+        "463605220",
+    )
+    submitted = await edge_hub.call(
+        prepared["connector_id"], prepared["tool"], prepared["args"],
+        account_key=agent_id, signal_id=prepared["signal_id"],
+        candidate_id=candidate["id"], intent_account=prepared["account_id"],
+        require_approval=True,
+    )
+    rec = queue.get(agent_id, submitted["approval_id"])
+    assert rec is not None
     assert rec.status == "pending"      # declined to a human tap, not auto-granted
+    assert rec.candidate_id == candidate["id"]
+    assert rec.signal_id == signal_id
 
     from nakagai_platform.api.db import require_installed_database
     from nakagai_platform.gateway import get_hub
@@ -949,8 +1019,27 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
 
     n = await poll_once(edge_hub, state, edge_client, EdgeAudit(state))
     assert n == 1
-    assert placed == [("NVDA", "buy", 10)]      # the trade really executed
-    assert intents(state) == {}                 # nothing left to re-execute
+    assert placed == [("NVDA", "buy", "10")]
+    assert intents(state)[rec.id]["broker_order_id"] == "broker-order-1"
+
+    matched = await reconcile_submitted_fills(
+        edge_hub, state, edge_client, EdgeAudit(state),
+        edge_hub.spec("broker"), "463605220",
+        [{"order_id": "broker-order-1", "symbol": "NVDA", "side": "buy",
+          "quantity": 10.0, "status": "filled", "fill_price": 118.4}],
+    )
+    assert matched == 1
+    assert intents(state) == {}
+    supervised = load_supervision(state)[rec.id]
+    assert supervised["signal_id"] == signal_id
+    assert supervised["state"] == "unguarded"
+
+    # Warrant minting follows the executed approval. Exercise the same renewal
+    # exchange as the resident sync loop, then require the position to be armed.
+    renewed = edge_client.renew_warrants(renewal_request(state))
+    apply_renewals(state, renewed["warrants"])
+    supervised = load_supervision(state)[rec.id]
+    assert supervised["state"] == "armed"
 
     # the platform's own record: decided by the owner, then executed by the edge.
     # assert_owner_action returns the X-User it validated, lowercased, and that
@@ -958,6 +1047,8 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
     plat_rec = hub.approvals.get(str(mandate_ctx.wid), rec.id)
     assert plat_rec.decided_by == "chris@nakag.ai"
     assert plat_rec.status == "executed"
+    assert plat_rec.candidate_id == candidate["id"]
+    assert plat_rec.signal_id == signal_id
     await edge_hub.aclose()
 
 

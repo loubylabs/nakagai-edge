@@ -31,7 +31,9 @@ TERMINAL_ORDER_STATUSES = ("cancelled", "rejected")
 log = logging.getLogger("nakagai.edge")
 
 
-def _verify(state: EdgeState, approval_id: str, intent: dict, artifact) -> str:
+def _verify(
+        state: EdgeState, approval_id: str, intent: dict,
+        record: dict, artifact) -> str:
     """Empty string when the artifact authorizes exactly this intent, else why not."""
     if not isinstance(artifact, dict):
         return "no artifact on a granted approval"
@@ -50,6 +52,9 @@ def _verify(state: EdgeState, approval_id: str, intent: dict, artifact) -> str:
         (artifact.get("args_hash") == intent["args_hash"], "args_hash mismatch"),
         (artifact.get("candidate_id", "") == intent.get("candidate_id", ""),
          "candidate_id mismatch"),
+        (not intent.get("candidate_id")
+         or record.get("signal_id") == intent.get("signal_id"),
+         "signal_id mismatch"),
         (not intent.get("account")
          or artifact.get("account") == intent["account"], "account mismatch"),
         (float(artifact.get("expires_at", 0)) > time.time(), "artifact expired"),
@@ -434,7 +439,8 @@ async def poll_once(hub, state: EdgeState, client: PlatformClient,
         if status != "granted":
             continue
 
-        why_not = _verify(state, approval_id, intent, record.get("artifact"))
+        why_not = _verify(
+            state, approval_id, intent, record, record.get("artifact"))
         if why_not:
             audit.record("error", intent["connector_id"], intent["tool"],
                          {"approval_id": approval_id,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import json
 import time
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from nakagai_edge.edge.candidate import CandidateWakeScope
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.hub import ConnectorHub
 from nakagai_edge.hub import GuardrailDenied
+from nakagai_edge.signing import args_hash
 from tests.fixtures.echo_mcp import mcp as echo_server
 from tests.fixtures.inproc import connect_to
 
@@ -180,6 +182,62 @@ def test_remote_queue_forwards_local_identity_without_authorizing_hosted_storage
     with pytest.raises(ValueError, match="account_key"):
         queue.get("", "approval-a")
     assert client.gets == ["approval-a"]
+
+
+@pytest.mark.parametrize("signal_id", ["", "   "])
+def test_candidate_remote_enqueue_requires_exact_signal_binding(
+        tmp_path, signal_id) -> None:
+    client = RemoteClient()
+    queue = RemoteApprovalQueue(client, EdgeState(tmp_path), "agent-a")
+
+    with pytest.raises(ValueError, match="signal_id"):
+        queue.enqueue(
+            "agent-a", "broker", "place_order", {"qty": 1}, ttl_s=60,
+            signal_id=signal_id, candidate_id="candidate-1",
+            intent_account="broker-account",
+        )
+
+    assert client.enqueues == []
+
+
+@pytest.mark.parametrize("account", ["", "   "])
+def test_candidate_remote_enqueue_requires_exact_account_binding(
+        tmp_path, account) -> None:
+    client = RemoteClient()
+    queue = RemoteApprovalQueue(client, EdgeState(tmp_path), "agent-a")
+
+    with pytest.raises(ValueError, match="account"):
+        queue.enqueue(
+            "agent-a", "broker", "place_order", {"qty": 1}, ttl_s=60,
+            signal_id="signal-1", candidate_id="candidate-1",
+            intent_account=account,
+        )
+
+    assert client.enqueues == []
+
+
+def test_candidate_remote_enqueue_persists_exact_signal_provenance(tmp_path) -> None:
+    client = RemoteClient()
+    state = EdgeState(tmp_path)
+    queue = RemoteApprovalQueue(client, state, "agent-a")
+
+    queue.enqueue(
+        "agent-a", "broker", "place_order", {"qty": 1}, ttl_s=60,
+        signal_id="signal-1", candidate_id="candidate-1",
+        intent_account="broker-account",
+    )
+
+    stored = json.loads(state.intents_path.read_text())["approval-a"]
+    assert stored == {
+        "connector_id": "broker",
+        "tool": "place_order",
+        "args": {"qty": 1},
+        "args_hash": args_hash({"qty": 1}),
+        "created_at": pytest.approx(time.time()),
+        "signal_id": "signal-1",
+        "candidate_id": "candidate-1",
+        "account": "broker-account",
+    }
 
 
 def test_runtime_uses_paired_agent_id_and_refuses_a_missing_identity(tmp_path) -> None:

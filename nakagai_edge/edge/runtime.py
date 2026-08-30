@@ -99,12 +99,28 @@ def _prepared_order(candidate_id: str, response: dict, evidence_spec,
     """
     if not isinstance(response, dict):
         raise ValueError("candidate acceptance returned no decision object")
+    expected_response = {
+        "candidate_id", "decision", "mechanical_status", "mechanical_reason",
+        "approval_id", "signal_id", "canonical_order", "prepared_order",
+    }
+    missing_response = expected_response - set(response)
+    if missing_response == {"signal_id"}:
+        raise ValueError("candidate acceptance signal_id must be a nonempty string")
+    if missing_response == {"canonical_order"}:
+        raise ValueError("candidate acceptance returned no canonical_order")
+    if set(response) != expected_response:
+        raise ValueError("candidate acceptance has missing or additional fields")
     if response.get("candidate_id") != candidate_id:
         raise ValueError("candidate acceptance returned a different candidate_id")
     if response.get("decision") != "accepted":
         raise ValueError("candidate acceptance did not return accepted")
-    if response.get("mechanical_status") == "blocked":
-        raise ValueError("blocked candidate response cannot carry a prepared order")
+    if response.get("mechanical_status") != "prepared":
+        if response.get("mechanical_status") == "blocked":
+            raise ValueError("blocked candidate response cannot carry a prepared order")
+        raise ValueError("candidate acceptance did not return a prepared order")
+    signal_id = response.get("signal_id")
+    if not isinstance(signal_id, str) or not signal_id.strip():
+        raise ValueError("candidate acceptance signal_id must be a nonempty string")
     canonical = response.get("canonical_order")
     if not isinstance(canonical, dict) or set(canonical) != set(OUTBOUND_ORDER_FIELDS):
         raise ValueError("accepted candidate returned no exact canonical_order")
@@ -143,7 +159,7 @@ def _prepared_order(candidate_id: str, response: dict, evidence_spec,
             or str(prepared["args"].get(account_arg) or "") != evidence_account):
         raise ValueError(
             "prepared_order order account does not match the broker evidence account")
-    return prepared
+    return {**prepared, "signal_id": signal_id}
 
 
 def _terminal_candidate(candidate_id: str, decision: str, response: dict) -> dict:
@@ -854,6 +870,7 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
                 }, default=str)
             submitted = await _guarded(
                 prepared["connector_id"], prepared["tool"], prepared["args"],
+                signal_id=prepared["signal_id"],
                 candidate_id=candidate_id,
                 intent_account=prepared["account_id"], require_approval=True)
             safe = _safe_candidate(response)
