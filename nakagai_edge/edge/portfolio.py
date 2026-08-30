@@ -80,15 +80,17 @@ def tiered_accounts(spec, listed: list[dict]) -> list[tuple[dict, str]]:
     configured account the broker did not list is still tried, so its refusal
     surfaces as that account's error instead of a silent hole.
     """
+    unknown = [a for a in listed if a.get("unknown") is True]
+    readable = [a for a in listed if a.get("unknown") is not True]
     g = spec.guardrails.accounts
     if not g.allow and not g.read:
-        return [(a, "full") for a in listed]
-    by_number = {str(a.get("account", "")): a for a in listed}
+        return [(a, "full") for a in readable + unknown]
+    by_number = {str(a.get("account", "")): a for a in readable}
     pairs = []
     for tier, numbers in (("full", g.allow), ("read", g.read)):
         for num in numbers:
             pairs.append((by_number.get(num, {"account": num}), tier))
-    return pairs
+    return pairs + [(a, "full") for a in unknown]
 
 
 async def connector_snapshot(hub, spec) -> dict:
@@ -127,21 +129,26 @@ async def connector_snapshot(hub, spec) -> dict:
             # about, and inventing one would ask about somebody else's account.
             # Saying so here beats sending the broker a blank account and
             # relaying whatever it makes of that.
-            row["error"] = ("this connector listed an account with no readable "
-                            "identifier, so its balances and positions cannot "
-                            "be fetched")
+            if account.get("unknown") is True:
+                row["unknown"] = True
+                row["error"] = "list_accounts unreadable"
+            else:
+                row["error"] = ("this connector listed an account with no readable "
+                                "identifier, so its balances and positions cannot "
+                                "be fetched")
             row["status"] = "unreadable"
             entry["accounts"].append(row)
             continue
         errors = []
-        try:
-            row["portfolio"] = await _figures(hub, spec, num)
-        except CapabilityError as e:
+        if "get_balance" not in spec.capabilities:
             row["status"] = _status(row["status"], "unsupported")
-            errors.append(_error("get_balance unsupported", e))
-        except Exception as e:  # noqa: BLE001 (per-account degradation, by design)
-            row["status"] = _status(row["status"], "unreadable")
-            errors.append(_error("get_balance unreadable", e))
+            errors.append("get_balance unsupported")
+        else:
+            try:
+                row["portfolio"] = await _figures(hub, spec, num)
+            except Exception as e:  # noqa: BLE001 (per-account degradation, by design)
+                row["status"] = _status(row["status"], "unreadable")
+                errors.append(_error("get_balance unreadable", e))
         position_status, positions, position_error = await _positions(hub, spec, num)
         order_status, orders, order_error = await _open_orders(hub, spec, num)
         row["positions"], row["open_orders"] = positions, orders
@@ -175,9 +182,14 @@ async def listed_accounts(hub, spec) -> list[dict]:
     )).get("data")
     rows = first(payload, cap.items) if cap.items else payload
     if not isinstance(rows, list):
-        return []
-    return [read_partial("list_accounts", cap, row)
-            for row in rows if isinstance(row, dict)]
+        return [{"unknown": True}]
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            out.append({"unknown": True})
+            continue
+        out.append(read_partial("list_accounts", cap, row))
+    return out
 
 
 async def _figures(hub, spec, account: str) -> dict:
@@ -207,7 +219,9 @@ async def _figures(hub, spec, account: str) -> dict:
         spec.id, tool, args, account_key=hub.account_key
     )).get("data")
     figures = first(payload, cap.items) if cap.items else payload
-    return figures if isinstance(figures, dict) else {}
+    if not isinstance(figures, dict):
+        raise ValueError("get_balance response is not the mapped object")
+    return figures
 
 
 async def balance_evidence(hub, spec, account: str) -> dict:

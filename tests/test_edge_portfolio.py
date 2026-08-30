@@ -270,6 +270,31 @@ async def test_a_dead_account_list_degrades_to_a_connector_level_error():
     assert entry["accounts"] == []
 
 
+async def test_a_nonlist_accounts_payload_is_explicit_unknown_connector_evidence():
+    """Changing this to `return []` would declare an unreadable broker
+    response to be an authoritative connector with no accounts."""
+    hub = _alien_hub(accounts_list={"accounts": "not-a-list"})
+
+    entry = await connector_snapshot(hub, _untiered_alien())
+
+    assert entry["status"] == "unreadable"
+    assert entry["accounts"][0]["unknown"] is True
+    assert entry["accounts"][0]["error"]
+
+
+async def test_a_malformed_account_row_stays_alongside_readable_accounts():
+    """Dropping the scalar row would allow the valid sibling to make the
+    connector look fully readable even though the broker response was not."""
+    hub = _alien_hub(accounts_list={"accounts": [
+        {"acct": "AL-1", "label": "Main"}, "unreadable-account"]})
+
+    entry = await connector_snapshot(hub, _untiered_alien())
+
+    assert entry["status"] == "unreadable"
+    assert entry["accounts"][0]["account_number"] == "AL-1"
+    assert entry["accounts"][1]["unknown"] is True
+
+
 def _alien_hub(**over):
     responses = {
         "accounts_list": {"accounts": [{"acct": "AL-1", "label": "Main",
@@ -391,7 +416,7 @@ async def test_the_tiered_path_is_unaffected_by_an_unreadable_account():
     assert entry["accounts"][0]["error"] == ""
 
 
-async def test_a_balance_payload_missing_the_mapped_root_is_no_figures():
+async def test_a_balance_payload_missing_the_mapped_root_is_unreadable():
     """The map says Robinhood's figures live under `data`. A payload without
     that node is not the shape the map describes, so the account reports no
     figures rather than handing the web whatever else the envelope held. Blank
@@ -407,7 +432,35 @@ async def test_a_balance_payload_missing_the_mapped_root_is_no_figures():
     row = (await connector_snapshot(hub, spec))["accounts"][0]
     assert row["account_number"] == "463605220"
     assert row["portfolio"] == {}
-    assert row["error"] == ""
+    assert row["status"] == "unreadable"
+    assert "get_balance unreadable" in row["error"]
+    assert row["positions"] == [] and row["open_orders"] == []
+
+
+async def test_a_declared_but_unresolvable_balance_capability_is_unreadable():
+    """Only an absent capability is unsupported. A declared map that cannot
+    resolve its account argument is malformed broker evidence."""
+    spec = _spec()
+    del spec.capability("get_balance").args["account"]
+
+    row = (await connector_snapshot(_hub_ok(), spec))["accounts"][0]
+
+    assert row["status"] == "unreadable"
+    assert "get_balance unreadable" in row["error"]
+    assert row["positions"][0]["symbol"] == "SPY"
+    assert row["open_orders"] == []
+
+
+async def test_an_absent_balance_capability_is_unsupported():
+    """Removing the capability is the one condition that labels its source
+    unsupported instead of obscuring an attempted but unreadable broker read."""
+    spec = _spec()
+    del spec.capabilities["get_balance"]
+
+    row = (await connector_snapshot(_hub_ok(), spec))["accounts"][0]
+
+    assert row["status"] == "unsupported"
+    assert "get_balance unsupported" in row["error"]
 
 
 # ---- the guarded marker ---------------------------------------------------
