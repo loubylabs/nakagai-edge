@@ -38,7 +38,8 @@ PG_RECORD_METHODS = (
 )
 
 
-def pg_row(*, account_key: str = "account-a", status: str = "pending") -> tuple:
+def pg_row(*, account_key: str = "account-a", status: str = "pending",
+           candidate_id="candidate-1") -> tuple:
     now = datetime.now(UTC)
     values = {
         "id": "approval-a",
@@ -63,7 +64,7 @@ def pg_row(*, account_key: str = "account-a", status: str = "pending") -> tuple:
         "notional": 100.0,
         "rationale": None,
         "cleared_at": None,
-        "candidate_id": "candidate-1",
+        "candidate_id": candidate_id,
     }
     return tuple(values[column] for column in PgApprovalQueue.COLUMNS)
 
@@ -240,6 +241,12 @@ def test_pg_candidate_id_round_trips_through_insert_and_row_mapping() -> None:
     assert "candidate_id" in insert[0]
     assert "candidate-1" in insert[1]
     assert created.candidate_id == "candidate-1"
+
+
+def test_pg_absent_candidate_id_maps_to_the_declared_empty_string() -> None:
+    approval = PgApprovalQueue._row(pg_row(candidate_id=None))
+
+    assert approval.candidate_id == ""
 
 
 @pytest.mark.parametrize(

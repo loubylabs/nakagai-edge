@@ -85,7 +85,8 @@ def _given(value) -> bool:
     return True
 
 
-def _prepared_order(candidate_id: str, response: dict) -> dict:
+def _prepared_order(candidate_id: str, response: dict, evidence_spec,
+                    evidence_account: str) -> dict:
     """Validate one frozen platform envelope without re-parsing the order.
 
     Connector maps and local guardrails own order validation. This boundary
@@ -111,6 +112,21 @@ def _prepared_order(candidate_id: str, response: dict) -> dict:
         raise ValueError("prepared_order args must be a nonempty object")
     if prepared["args_hash"] != args_hash(prepared["args"]):
         raise ValueError("prepared_order args hash mismatch")
+    if prepared["connector_id"] != evidence_spec.id:
+        raise ValueError(
+            "prepared_order connector does not match the broker evidence connector")
+    if prepared["account_id"] != evidence_account:
+        raise ValueError(
+            "prepared_order account does not match the broker evidence account")
+    order = evidence_spec.capability("place_order")
+    if prepared["tool"] != order.tool:
+        raise ValueError(
+            "prepared_order tool does not match the evidence connector place_order tool")
+    account_arg = order.args.get("account")
+    if (not account_arg
+            or str(prepared["args"].get(account_arg) or "") != evidence_account):
+        raise ValueError(
+            "prepared_order order account does not match the broker evidence account")
     return prepared
 
 
@@ -737,7 +753,7 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
             if (response.get("mechanical_status") == "blocked"
                     and response.get("prepared_order") is None):
                 return json.dumps(_safe_candidate(response), default=str)
-            prepared = _prepared_order(candidate_id, response)
+            prepared = _prepared_order(candidate_id, response, spec, account)
             submitted = await _guarded(
                 prepared["connector_id"], prepared["tool"], prepared["args"],
                 candidate_id=candidate_id,

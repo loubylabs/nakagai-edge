@@ -37,12 +37,15 @@ def _bundle():
 
 
 def _artifact(approval_id, *, args=ARGS, agent_id="ag1", expires_in=900,
-              candidate_id=""):
-    return sign_artifact(PRIV, build_payload(
+              candidate_id="", account=""):
+    payload = build_payload(
         approval_id=approval_id, agent_id=agent_id, connector_id="demo",
         tool="place_order", args=args,
         account_arg_names=["account_number"], ttl_s=expires_in,
-        candidate_id=candidate_id))
+        candidate_id=candidate_id)
+    if account:
+        payload["account"] = account
+    return sign_artifact(PRIV, payload)
 
 
 class FakeHub:
@@ -115,7 +118,7 @@ async def test_tampered_args_hash_never_executes(tmp_path):
     assert reports and reports[0]["ok"] is False
 
 
-async def test_candidate_grant_requires_the_same_candidate_and_frozen_account(tmp_path):
+async def test_candidate_grant_requires_the_same_candidate(tmp_path):
     artifact = _artifact("a1", candidate_id="candidate-other")
     state, client, queue, reports = _setup(tmp_path, artifact=artifact)
     queue.enqueue("ag1", "demo", "place_order", ARGS, ttl_s=900,
@@ -126,6 +129,34 @@ async def test_candidate_grant_requires_the_same_candidate_and_frozen_account(tm
 
     assert hub.calls == []
     assert reports and reports[0]["ok"] is False
+
+
+async def test_candidate_grant_requires_the_same_frozen_account(tmp_path):
+    artifact = _artifact("a1", candidate_id="candidate-1",
+                         account="other-account")
+    state, client, queue, reports = _setup(tmp_path, artifact=artifact)
+    queue.enqueue("ag1", "demo", "place_order", ARGS, ttl_s=900,
+                  candidate_id="candidate-1", intent_account="463605220")
+    hub = FakeHub()
+
+    await poll_once(hub, state, client, EdgeAudit(state))
+
+    assert hub.calls == []
+    assert reports and reports[0]["ok"] is False
+    assert "account mismatch" in reports[0]["error"]
+
+
+async def test_lost_candidate_approval_never_contacts_the_broker(tmp_path):
+    state, client, queue, reports = _setup(tmp_path, grant_status="denied")
+    queue.enqueue("ag1", "demo", "place_order", ARGS, ttl_s=900,
+                  candidate_id="candidate-1", intent_account="463605220")
+    hub = FakeHub()
+
+    await poll_once(hub, state, client, EdgeAudit(state))
+
+    assert hub.calls == []
+    assert reports == []
+    assert intents(state) == {}
 
 
 async def test_disarmed_brake_refuses_a_candidate_grant_before_broker_contact(tmp_path):

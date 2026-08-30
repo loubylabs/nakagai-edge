@@ -825,6 +825,7 @@ class PgApprovalQueue(BaseApprovalQueue):
     @staticmethod
     def _row(row) -> Approval:
         values = dict(zip(PgApprovalQueue.COLUMNS, row))
+        values["candidate_id"] = values.get("candidate_id") or ""
         for key in ("created_at", "expires_at", "decided_at", "cleared_at"):
             values[key] = values[key].timestamp() if values[key] is not None else 0.0
         return Approval(**values)

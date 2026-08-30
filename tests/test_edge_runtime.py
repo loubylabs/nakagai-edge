@@ -5,7 +5,6 @@ import contextlib
 import json
 import logging
 import time
-from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -17,7 +16,8 @@ from nakagai_edge.config import ConnectorSpec, load_specs
 from nakagai_edge.edge.audit import EdgeAudit
 from nakagai_edge.edge.brake import Brake
 from nakagai_edge.edge.client import PlatformClient
-from nakagai_edge.edge.runtime import build_hub, create_edge_mcp, freshness_error
+from nakagai_edge.edge.runtime import (_prepared_order, build_hub, create_edge_mcp,
+                                       freshness_error)
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.sync import BUNDLE_SCHEMA, apply_bundle, sync_once
 from tests.fixtures.alien_registry import ALIEN_CONNECTOR, ROBINHOOD_CONNECTOR
@@ -46,6 +46,23 @@ def _state(tmp_path):
                      "connectors": {"connectors": []},
                      "signing_public_key": "k"}, "v1")
     return s
+
+
+def _candidate_spec():
+    return load_specs({"connectors": [ROBINHOOD_CONNECTOR]})["robinhood-trading"]
+
+
+def _prepared_response(**overrides):
+    broker_args = {
+        "symbol": "AAPL", "side": "buy", "type": "limit", "quantity": "3",
+        "limit_price": "211.25", "stop_price": "207.0",
+        "time_in_force": "day", "account_number": "broker-account"}
+    prepared = {
+        "connector_id": "robinhood-trading", "account_id": "broker-account",
+        "tool": "place_equity_order", "args": broker_args,
+        "args_hash": args_hash(broker_args), **overrides}
+    return {"candidate_id": "candidate-1", "decision": "accepted",
+            "prepared_order": prepared}
 
 
 class _Reporter:
@@ -214,6 +231,65 @@ async def test_candidate_tools_publish_only_candidate_id_and_rationale(tmp_path)
             "candidate_id", "rationale"}
 
 
+@pytest.mark.parametrize("missing", [
+    "connector_id", "account_id", "tool", "args", "args_hash",
+])
+def test_prepared_order_rejects_each_missing_required_field(missing):
+    response = _prepared_response()
+    response["prepared_order"].pop(missing)
+
+    with pytest.raises(ValueError, match="missing or additional"):
+        _prepared_order("candidate-1", response, _candidate_spec(), "broker-account")
+
+
+def test_prepared_order_rejects_additional_fields():
+    response = _prepared_response(unreviewed=True)
+
+    with pytest.raises(ValueError, match="missing or additional"):
+        _prepared_order("candidate-1", response, _candidate_spec(), "broker-account")
+
+
+@pytest.mark.parametrize(("field", "value"), [
+    ("connector_id", 7), ("account_id", 7), ("tool", 7),
+    ("args", []), ("args_hash", 7),
+])
+def test_prepared_order_rejects_wrong_field_types(field, value):
+    response = _prepared_response(**{field: value})
+
+    with pytest.raises(ValueError):
+        _prepared_order("candidate-1", response, _candidate_spec(), "broker-account")
+
+
+@pytest.mark.parametrize(("field", "value", "message"), [
+    ("connector_id", "other-broker", "evidence connector"),
+    ("account_id", "other-account", "evidence account"),
+    ("tool", "alternate_approved_write", "place_order tool"),
+])
+def test_prepared_order_rejects_authority_substitution(field, value, message):
+    response = _prepared_response(**{field: value})
+
+    with pytest.raises(ValueError, match=message):
+        _prepared_order("candidate-1", response, _candidate_spec(), "broker-account")
+
+
+def test_prepared_order_rejects_account_substitution_inside_frozen_args():
+    response = _prepared_response()
+    response["prepared_order"]["args"] = {
+        **response["prepared_order"]["args"], "account_number": "other-account"}
+    response["prepared_order"]["args_hash"] = args_hash(
+        response["prepared_order"]["args"])
+
+    with pytest.raises(ValueError, match="order account"):
+        _prepared_order("candidate-1", response, _candidate_spec(), "broker-account")
+
+
+def test_prepared_order_rejects_args_hash_mismatch():
+    response = _prepared_response(args_hash="wrong")
+
+    with pytest.raises(ValueError, match="hash mismatch"):
+        _prepared_order("candidate-1", response, _candidate_spec(), "broker-account")
+
+
 async def test_accept_candidate_refreshes_broker_evidence_then_submits_exact_order(
         tmp_path, monkeypatch):
     from nakagai_edge.edge import runtime
@@ -232,7 +308,8 @@ async def test_accept_candidate_refreshes_broker_evidence_then_submits_exact_ord
             return httpx.Response(200, json={
                 "candidate_id": "candidate-1", "decision": "accepted",
                 "prepared_order": {
-                    "connector_id": "robinhood", "account_id": "broker-account",
+                    "connector_id": "robinhood-trading",
+                    "account_id": "broker-account",
                     "tool": "place_equity_order", "args": broker_args,
                     "args_hash": args_hash(broker_args),
                 },
@@ -259,9 +336,8 @@ async def test_accept_candidate_refreshes_broker_evidence_then_submits_exact_ord
             return {"connectors": []}
 
     state = _state(tmp_path)
-    spec = SimpleNamespace(id="robinhood", capabilities={"place_order": object()},
-                           guardrails=SimpleNamespace(
-                               accounts=SimpleNamespace(allow=["broker-account"])))
+    spec = _candidate_spec()
+    spec.guardrails.accounts.allow = ["broker-account"]
     monkeypatch.setattr(runtime, "broker_specs", lambda _root: [spec])
 
     async def evidence(_hub, _spec, account):
@@ -289,7 +365,7 @@ async def test_accept_candidate_refreshes_broker_evidence_then_submits_exact_ord
          {"rationale": "broker state is current"}),
     ]
     assert reporter.calls == 1
-    assert hub.calls == [("robinhood", "place_equity_order", broker_args, {
+    assert hub.calls == [("robinhood-trading", "place_equity_order", broker_args, {
         "account_key": "ag1", "signal_id": "", "candidate_id": "candidate-1",
         "intent_account": "broker-account", "require_approval": True})]
     assert doc == {"candidate_id": "candidate-1", "decision": "accepted",
@@ -308,7 +384,7 @@ async def test_accept_candidate_rejects_hash_mismatch_without_connector_contact(
             return httpx.Response(200, json={"ok": True})
         return httpx.Response(200, json={
             "candidate_id": "candidate-1", "decision": "accepted",
-            "prepared_order": {"connector_id": "robinhood",
+            "prepared_order": {"connector_id": "robinhood-trading",
                                "account_id": "broker-account",
                                "tool": "place_equity_order", "args": broker_args,
                                "args_hash": "wrong"}})
@@ -320,9 +396,8 @@ async def test_accept_candidate_rejects_hash_mismatch_without_connector_contact(
         async def call(self, *args, **kwargs):
             self.calls.append((args, kwargs))
 
-    spec = SimpleNamespace(id="robinhood", capabilities={"place_order": object()},
-                           guardrails=SimpleNamespace(
-                               accounts=SimpleNamespace(allow=["broker-account"])))
+    spec = _candidate_spec()
+    spec.guardrails.accounts.allow = ["broker-account"]
     monkeypatch.setattr(runtime, "broker_specs", lambda _root: [spec])
     monkeypatch.setattr(runtime, "balance_evidence", lambda *_args: None)
 
@@ -357,7 +432,7 @@ async def test_accept_candidate_stale_local_policy_creates_no_approval(
             return httpx.Response(200, json={"ok": True})
         return httpx.Response(200, json={
             "candidate_id": "candidate-1", "decision": "accepted",
-            "prepared_order": {"connector_id": "robinhood",
+            "prepared_order": {"connector_id": "robinhood-trading",
                                "account_id": "broker-account",
                                "tool": "place_equity_order", "args": broker_args,
                                "args_hash": args_hash(broker_args)}})
@@ -371,9 +446,8 @@ async def test_accept_candidate_stale_local_policy_creates_no_approval(
         async def call(self, *args, **kwargs):
             self.calls.append((args, kwargs))
 
-    spec = SimpleNamespace(id="robinhood", capabilities={"place_order": object()},
-                           guardrails=SimpleNamespace(
-                               accounts=SimpleNamespace(allow=["broker-account"])))
+    spec = _candidate_spec()
+    spec.guardrails.accounts.allow = ["broker-account"]
     monkeypatch.setattr(runtime, "broker_specs", lambda _root: [spec])
 
     async def evidence(*_args):
