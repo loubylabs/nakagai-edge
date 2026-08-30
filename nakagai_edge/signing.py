@@ -1,9 +1,9 @@
 """Ed25519-signed approval artifacts.
 
 The platform signs {approval_id, agent_id, connector_id, tool, args_hash,
-account, expires_at} when a human grants an edge agent's write intent. The
-edge verifies the signature (and that args_hash matches the intent it holds)
-before anything reaches a broker. An approval for order A can never
+account, candidate_id, expires_at} when a human grants an edge agent's write
+intent. The edge verifies the signature and its bindings against the intent it
+holds before anything reaches a broker. An approval for order A can never
 authorize order B, and a forged or expired artifact executes nothing.
 
 Keys are raw Ed25519, urlsafe-base64. The private seed lives only in the
@@ -83,10 +83,12 @@ def extract_account(args: dict, arg_names: list[str]) -> str:
 
 def build_payload(*, approval_id: str, agent_id: str, connector_id: str,
                   tool: str, args: dict, account_arg_names: list[str],
-                  ttl_s: int, now: float | None = None) -> dict:
+                  ttl_s: int, now: float | None = None,
+                  candidate_id: str = "") -> dict:
     now = time.time() if now is None else now
     return {"approval_id": approval_id, "agent_id": agent_id,
             "connector_id": connector_id, "tool": tool,
             "args_hash": args_hash(args),
             "account": extract_account(args, account_arg_names),
-            "expires_at": now + ttl_s}
+            "expires_at": now + ttl_s,
+            "candidate_id": candidate_id}

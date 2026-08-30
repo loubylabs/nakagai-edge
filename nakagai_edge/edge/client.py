@@ -12,6 +12,8 @@ from nakagai_edge.identity import package_version
 
 CHAT_PROTOCOL_VERSION = "2"
 CHAT_PROTOCOL_HEADER = "X-Nakagai-Chat-Protocol"
+CANDIDATE_PROTOCOL_VERSION = "1"
+CANDIDATE_PROTOCOL_HEADER = "X-Nakagai-Candidate-Protocol"
 
 
 class EdgeClientError(Exception):
@@ -122,14 +124,14 @@ class PlatformClient:
         return resp.headers.get("etag", body.get("bundle_version", "")), body
 
     def enqueue_approval(self, connector_id: str, tool: str, args: dict,
-                         signal_id: str = "") -> dict:
+                         signal_id: str = "", candidate_id: str = "") -> dict:
         # signal_id is what the platform resolves to a frozen signal + notional
         # and checks against the autopilot envelope: an order citing a signal
         # Nakagai emitted, inside the owner's caps, comes back `granted` (signed)
         # for the edge to execute. The platform decides; the edge never does.
         return self._check(self._client.post("/api/agent/approvals", json={
             "connector_id": connector_id, "tool": tool, "args": args,
-            "signal_id": signal_id}))
+            "signal_id": signal_id, "candidate_id": candidate_id}))
 
     def get_approval(self, approval_id: str) -> dict:
         return self._check(self._client.get(f"/api/agent/approvals/{approval_id}"))
@@ -168,8 +170,19 @@ class PlatformClient:
         # hold would surface as a transport error.
         return self._chat_result(self._client.get(
             "/api/agent/events", params={"after": after, "timeout_s": timeout_s},
-            headers=self._chat_headers(),
+            headers={**self._chat_headers(),
+                     CANDIDATE_PROTOCOL_HEADER: CANDIDATE_PROTOCOL_VERSION},
             timeout=httpx.Timeout(15.0, read=float(timeout_s) + 10.0)))
+
+    def accept_candidate(self, candidate_id: str, rationale: str) -> dict:
+        return self._check(self._client.post(
+            f"/api/agent/candidates/{candidate_id}/accept",
+            json={"rationale": rationale}))
+
+    def abstain_candidate(self, candidate_id: str, rationale: str) -> dict:
+        return self._check(self._client.post(
+            f"/api/agent/candidates/{candidate_id}/abstain",
+            json={"rationale": rationale}))
 
     def list_peers(self) -> dict:
         return self._chat_result(self._client.get(

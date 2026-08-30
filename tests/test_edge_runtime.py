@@ -5,6 +5,7 @@ import contextlib
 import json
 import logging
 import time
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -20,6 +21,7 @@ from nakagai_edge.edge.runtime import build_hub, create_edge_mcp, freshness_erro
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.sync import BUNDLE_SCHEMA, apply_bundle, sync_once
 from tests.fixtures.alien_registry import ALIEN_CONNECTOR, ROBINHOOD_CONNECTOR
+from nakagai_edge.signing import args_hash
 
 
 class _NoFills:
@@ -192,6 +194,241 @@ async def test_agent_checkin_platform_error_returns_is_error_json(tmp_path):
 
     assert doc["is_error"] is True
     assert "revoked" in doc["error"]
+
+
+async def test_candidate_tools_publish_only_candidate_id_and_rationale(tmp_path):
+    state = _state(tmp_path)
+    client = PlatformClient("https://api.test", "t",
+                            transport=httpx.MockTransport(lambda r: httpx.Response(500)))
+    hub = build_hub(state, client)
+    audit = EdgeAudit(state)
+    mcp = create_edge_mcp(state, hub, client, audit, _Reporter(),
+                          Brake(state, hub, client, audit))
+
+    tools = {tool.name: tool for tool in await mcp.list_tools()}
+
+    for name in ("accept_candidate", "abstain_candidate"):
+        assert set(tools[name].input_schema["properties"]) == {
+            "candidate_id", "rationale"}
+        assert set(tools[name].input_schema["required"]) == {
+            "candidate_id", "rationale"}
+
+
+async def test_accept_candidate_refreshes_broker_evidence_then_submits_exact_order(
+        tmp_path, monkeypatch):
+    from nakagai_edge.edge import runtime
+
+    calls = []
+    broker_args = {"symbol": "AAPL", "side": "buy", "type": "limit",
+                   "quantity": "3", "limit_price": "211.25",
+                   "stop_price": "207.0", "time_in_force": "day",
+                   "account_number": "broker-account"}
+
+    def handler(req):
+        calls.append((req.url.path, json.loads(req.content) if req.content else None))
+        if req.url.path == "/api/agent/checkin":
+            return httpx.Response(200, json={"ok": True})
+        if req.url.path.endswith("/accept"):
+            return httpx.Response(200, json={
+                "candidate_id": "candidate-1", "decision": "accepted",
+                "prepared_order": {
+                    "connector_id": "robinhood", "account_id": "broker-account",
+                    "tool": "place_equity_order", "args": broker_args,
+                    "args_hash": args_hash(broker_args),
+                },
+            })
+        raise AssertionError(req.url.path)
+
+    class Hub:
+        account_key = "ag1"
+
+        def __init__(self):
+            self.calls = []
+
+        async def call(self, connector_id, tool, args, **kwargs):
+            self.calls.append((connector_id, tool, args, kwargs))
+            return {"approval_required": True, "approval_id": "approval-1",
+                    "status": "pending", "expires_at": 123.0, "is_write": True}
+
+    class Reporter:
+        def __init__(self):
+            self.calls = 0
+
+        async def snapshot_and_push(self):
+            self.calls += 1
+            return {"connectors": []}
+
+    state = _state(tmp_path)
+    spec = SimpleNamespace(id="robinhood", capabilities={"place_order": object()},
+                           guardrails=SimpleNamespace(
+                               accounts=SimpleNamespace(allow=["broker-account"])))
+    monkeypatch.setattr(runtime, "broker_specs", lambda _root: [spec])
+
+    async def evidence(_hub, _spec, account):
+        assert account == "broker-account"
+        return {"status": "ok", "equity": 100_000.0, "day_pnl": -250.5}
+
+    monkeypatch.setattr(runtime, "balance_evidence", evidence)
+    client = PlatformClient("https://api.test", "t",
+                            transport=httpx.MockTransport(handler))
+    hub, reporter = Hub(), Reporter()
+    audit = EdgeAudit(state)
+    mcp = create_edge_mcp(state, hub, client, audit, reporter,
+                          Brake(state, hub, client, audit))
+
+    result = await mcp.call_tool("accept_candidate", {
+        "candidate_id": "candidate-1", "rationale": "broker state is current"})
+    doc = json.loads(result.content[0].text)
+
+    assert calls == [
+        ("/api/agent/checkin", {"status": "research",
+                                "note": "candidate broker evidence refreshed",
+                                "account_equity": 100_000.0,
+                                "day_pnl": -250.5}),
+        ("/api/agent/candidates/candidate-1/accept",
+         {"rationale": "broker state is current"}),
+    ]
+    assert reporter.calls == 1
+    assert hub.calls == [("robinhood", "place_equity_order", broker_args, {
+        "account_key": "ag1", "signal_id": "", "candidate_id": "candidate-1",
+        "intent_account": "broker-account", "require_approval": True})]
+    assert doc == {"candidate_id": "candidate-1", "decision": "accepted",
+                   "approval_id": "approval-1", "status": "pending"}
+    assert "prepared_order" not in doc
+
+
+async def test_accept_candidate_rejects_hash_mismatch_without_connector_contact(
+        tmp_path, monkeypatch):
+    from nakagai_edge.edge import runtime
+
+    broker_args = {"symbol": "AAPL"}
+
+    def handler(req):
+        if req.url.path == "/api/agent/checkin":
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(200, json={
+            "candidate_id": "candidate-1", "decision": "accepted",
+            "prepared_order": {"connector_id": "robinhood",
+                               "account_id": "broker-account",
+                               "tool": "place_equity_order", "args": broker_args,
+                               "args_hash": "wrong"}})
+
+    class Hub:
+        account_key = "ag1"
+        calls = []
+
+        async def call(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+
+    spec = SimpleNamespace(id="robinhood", capabilities={"place_order": object()},
+                           guardrails=SimpleNamespace(
+                               accounts=SimpleNamespace(allow=["broker-account"])))
+    monkeypatch.setattr(runtime, "broker_specs", lambda _root: [spec])
+    monkeypatch.setattr(runtime, "balance_evidence", lambda *_args: None)
+
+    async def evidence(*_args):
+        return {"status": "ok", "equity": 10.0, "day_pnl": 0.0}
+
+    monkeypatch.setattr(runtime, "balance_evidence", evidence)
+    state = _state(tmp_path)
+    client = PlatformClient("https://api.test", "t",
+                            transport=httpx.MockTransport(handler))
+    hub = Hub()
+    mcp = create_edge_mcp(state, hub, client, EdgeAudit(state), _Reporter(),
+                          Brake(state, hub, client, EdgeAudit(state)))
+
+    result = await mcp.call_tool("accept_candidate", {
+        "candidate_id": "candidate-1", "rationale": "accept"})
+    doc = json.loads(result.content[0].text)
+
+    assert doc["is_error"] is True
+    assert "hash" in doc["error"]
+    assert hub.calls == []
+
+
+async def test_accept_candidate_stale_local_policy_creates_no_approval(
+        tmp_path, monkeypatch):
+    from nakagai_edge.edge import runtime
+
+    broker_args = {"account_number": "broker-account", "quantity": "3"}
+
+    def handler(req):
+        if req.url.path == "/api/agent/checkin":
+            return httpx.Response(200, json={"ok": True})
+        return httpx.Response(200, json={
+            "candidate_id": "candidate-1", "decision": "accepted",
+            "prepared_order": {"connector_id": "robinhood",
+                               "account_id": "broker-account",
+                               "tool": "place_equity_order", "args": broker_args,
+                               "args_hash": args_hash(broker_args)}})
+
+    class Hub:
+        account_key = "ag1"
+
+        def __init__(self):
+            self.calls = []
+
+        async def call(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+
+    spec = SimpleNamespace(id="robinhood", capabilities={"place_order": object()},
+                           guardrails=SimpleNamespace(
+                               accounts=SimpleNamespace(allow=["broker-account"])))
+    monkeypatch.setattr(runtime, "broker_specs", lambda _root: [spec])
+
+    async def evidence(*_args):
+        return {"status": "ok", "equity": 10.0, "day_pnl": 0.0}
+
+    monkeypatch.setattr(runtime, "balance_evidence", evidence)
+    state = _state(tmp_path)
+    client = PlatformClient("https://api.test", "t",
+                            transport=httpx.MockTransport(handler))
+    hub = Hub()
+    audit = EdgeAudit(state)
+    mcp = create_edge_mcp(state, hub, client, audit, _Reporter(),
+                          Brake(state, hub, client, audit))
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: real() + 1000)
+
+    result = await mcp.call_tool("accept_candidate", {
+        "candidate_id": "candidate-1", "rationale": "accept"})
+    doc = json.loads(result.content[0].text)
+
+    assert doc["is_error"] is True
+    assert "policy stale" in doc["error"]
+    assert hub.calls == []
+
+
+async def test_abstain_candidate_never_contacts_a_connector(tmp_path):
+    requests = []
+
+    def handler(req):
+        requests.append((req.url.path, json.loads(req.content)))
+        return httpx.Response(200, json={"candidate_id": "candidate-1",
+                                         "decision": "abstained"})
+
+    class Hub:
+        account_key = "ag1"
+        calls = []
+
+        async def call(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+
+    state = _state(tmp_path)
+    client = PlatformClient("https://api.test", "t",
+                            transport=httpx.MockTransport(handler))
+    hub = Hub()
+    mcp = create_edge_mcp(state, hub, client, EdgeAudit(state), _Reporter(),
+                          Brake(state, hub, client, EdgeAudit(state)))
+
+    result = await mcp.call_tool("abstain_candidate", {
+        "candidate_id": "candidate-1", "rationale": "evidence conflicts"})
+
+    assert json.loads(result.content[0].text) == {
+        "candidate_id": "candidate-1", "decision": "abstained"}
+    assert requests == [("/api/agent/candidates/candidate-1/abstain",
+                         {"rationale": "evidence conflicts"})]
+    assert hub.calls == []
 
 
 async def test_local_chat_tools_are_available_while_policy_is_stale(

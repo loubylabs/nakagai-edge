@@ -428,7 +428,9 @@ class ConnectorHub:
 
     async def call(self, connector_id: str, tool: str, args: dict, *,
                    account_key: str, requested_by: str = "",
-                   approved: bool = False, signal_id: str = "") -> dict:
+                   approved: bool = False, signal_id: str = "",
+                   candidate_id: str = "", intent_account: str = "",
+                   require_approval: bool = False) -> dict:
         """Proxy one downstream tool call, after the guardrails clear it.
 
         `approved=True` is the post-human-decision path: the guardrails run again
@@ -457,6 +459,10 @@ class ConnectorHub:
         verdict = evaluate(spec, tool, args, read_only_hint=self._hint_for(conn, tool))
         if verdict.decision == "deny":
             raise GuardrailDenied(verdict.reason)
+        if require_approval and verdict.decision != "approve":
+            raise GuardrailDenied(
+                "candidate orders require this exact connector tool to use the "
+                "existing approval policy")
         if verdict.decision == "approve" and not approved:
             queue = self.approvals
             if queue is None:
@@ -464,11 +470,19 @@ class ConnectorHub:
                     f"{verdict.reason}; no approval queue is configured. "
                     f"Remove this tool from approvals.require_for to allow it")
             signal, notional = self.provenance(spec, args, signal_id)
+            found_account = next(
+                (str(args[name]) for name in spec.guardrails.accounts.arg_names
+                 if args.get(name)), "")
+            if intent_account and found_account != intent_account:
+                raise GuardrailDenied(
+                    "prepared candidate account does not match the guarded "
+                    "connector arguments")
             record = queue.enqueue(account_key, connector_id, tool, args,
                                    ttl_s=spec.guardrails.approvals.ttl_s,
                                    requested_by=requested_by,
                                    signal_id=signal_id, signal=signal,
-                                   notional=notional)
+                                   notional=notional, candidate_id=candidate_id,
+                                   intent_account=found_account)
 
             # The mandate gets to decide before a human is asked. Inline, not a
             # background sweeper: a sweeper would put a polling interval between
@@ -529,4 +543,3 @@ class ConnectorHub:
             else:
                 out.append(Connection(spec=spec).to_dict(with_tools=with_tools))
         return {"connectors": out}
-

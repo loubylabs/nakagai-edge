@@ -76,8 +76,8 @@ class RemoteClient:
         self.enqueues = []
         self.gets = []
 
-    def enqueue_approval(self, connector_id, tool, args, signal_id):
-        self.enqueues.append((connector_id, tool, args, signal_id))
+    def enqueue_approval(self, connector_id, tool, args, signal_id, candidate_id):
+        self.enqueues.append((connector_id, tool, args, signal_id, candidate_id))
         return {"approval_id": "approval-a", "status": "pending", "expires_at": 100.0}
 
     def get_approval(self, approval_id):
@@ -95,7 +95,7 @@ def test_remote_queue_forwards_local_identity_without_authorizing_hosted_storage
     record = queue.enqueue("agent-a", "broker", "place_order", {}, ttl_s=60)
 
     assert record.account_key == "agent-a"
-    assert client.enqueues == [("broker", "place_order", {}, "")]
+    assert client.enqueues == [("broker", "place_order", {}, "", "")]
     fetched = queue.get("agent-a", "approval-a")
     assert fetched is not None and fetched.account_key == "agent-a"
     assert client.gets == ["approval-a"]

@@ -24,7 +24,8 @@ from nakagai_edge.edge.brake import BRAKE_INTERVAL_S, Brake, normalize_quote
 from nakagai_edge.edge.client import EdgeClientError, PlatformClient
 from nakagai_edge.edge.executor import poll_once
 from nakagai_edge.edge.fills import FILLS_INTERVAL_S, FillsReporter
-from nakagai_edge.edge.portfolio import PORTFOLIO_INTERVAL_S, PortfolioReporter
+from nakagai_edge.edge.portfolio import (PORTFOLIO_INTERVAL_S, PortfolioReporter,
+                                         balance_evidence, broker_specs)
 from nakagai_edge.edge.remote import RemoteApprovalQueue
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.supervision import (
@@ -33,6 +34,7 @@ from nakagai_edge.edge.supervision import (
 )
 from nakagai_edge.edge.sync import (POLICY_TTL_S, SYNC_INTERVAL_S, policy_fresh,
                                     schema_error, sync_once)
+from nakagai_edge.signing import args_hash
 
 EXECUTOR_INTERVAL_S = 5
 AUDIT_SHIP_INTERVAL_S = 30
@@ -45,6 +47,7 @@ PLATFORM_CONNECTOR = "nakagai-mcp"
 # is the only event reader and the linked tools carry the wire contract.
 RESERVED_PLATFORM_TOOLS = {
     "await_events", "list_peers", "claim_message", "send_message", "request_peer",
+    "accept_candidate", "abstain_candidate",
 }
 
 
@@ -82,6 +85,69 @@ def _given(value) -> bool:
     return True
 
 
+def _prepared_order(candidate_id: str, response: dict) -> dict:
+    """Validate one frozen platform envelope without re-parsing the order.
+
+    Connector maps and local guardrails own order validation. This boundary
+    checks the generic authority fields and the hash over the exact arguments
+    that will be stored and submitted.
+    """
+    if not isinstance(response, dict):
+        raise ValueError("candidate acceptance returned no decision object")
+    if response.get("candidate_id") != candidate_id:
+        raise ValueError("candidate acceptance returned a different candidate_id")
+    if response.get("decision") != "accepted":
+        raise ValueError("candidate acceptance did not return accepted")
+    prepared = response.get("prepared_order")
+    if not isinstance(prepared, dict):
+        raise ValueError("accepted candidate returned no prepared_order")
+    expected = {"connector_id", "account_id", "tool", "args", "args_hash"}
+    if set(prepared) != expected:
+        raise ValueError("prepared_order has missing or additional fields")
+    for field in ("connector_id", "account_id", "tool", "args_hash"):
+        if not isinstance(prepared[field], str) or not prepared[field].strip():
+            raise ValueError(f"prepared_order {field} must be a nonempty string")
+    if not isinstance(prepared["args"], dict) or not prepared["args"]:
+        raise ValueError("prepared_order args must be a nonempty object")
+    if prepared["args_hash"] != args_hash(prepared["args"]):
+        raise ValueError("prepared_order args hash mismatch")
+    return prepared
+
+
+def _terminal_candidate(candidate_id: str, decision: str, response: dict) -> dict:
+    """Require a decision response to name the request it settles."""
+    if not isinstance(response, dict):
+        raise ValueError("candidate decision returned no decision object")
+    if response.get("candidate_id") != candidate_id:
+        raise ValueError("candidate decision returned a different candidate_id")
+    if response.get("decision") != decision:
+        raise ValueError(f"candidate decision did not return {decision}")
+    return response
+
+
+def _safe_candidate(response: dict) -> dict:
+    """Server decision metadata safe to return to the model."""
+    fields = ("candidate_id", "decision", "mechanical_status",
+              "mechanical_reason", "approval_id", "status")
+    return {field: response[field] for field in fields if field in response}
+
+
+def _candidate_broker_account(state: EdgeState):
+    """The sole locally write-tiered candidate connector and account."""
+    candidates = []
+    for spec in broker_specs(state.root):
+        if "place_order" not in spec.capabilities:
+            continue
+        allowed = list(spec.guardrails.accounts.allow)
+        if len(allowed) == 1:
+            candidates.append((spec, allowed[0]))
+    if len(candidates) != 1:
+        raise ValueError(
+            "candidate acceptance requires exactly one order-capable broker "
+            "with exactly one full-access account")
+    return candidates[0]
+
+
 def build_hub(state: EdgeState, client: PlatformClient):
     from nakagai_edge.hub import ConnectorHub
 
@@ -112,7 +178,9 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         return None if policy_fresh(state, POLICY_TTL_S) else freshness_error()
 
     async def _guarded(connector_id: str, tool: str, args: dict, *,
-                       signal_id: str = "", capability: str = "") -> dict:
+                       signal_id: str = "", capability: str = "",
+                       candidate_id: str = "", intent_account: str = "",
+                       require_approval: bool = False) -> dict:
         """The one door every connector call goes through, semantic or raw.
 
         `capability` is the name the semantic tools came in under. It is
@@ -133,6 +201,9 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
                 connector_id, tool, args,
                 account_key=hub.account_key,
                 signal_id=signal_id,
+                candidate_id=candidate_id,
+                intent_account=intent_account,
+                require_approval=require_approval,
             )
             kind = "call" if not out.get("approval_required") else "intent"
             audit.record(kind, connector_id, tool,
@@ -640,6 +711,60 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
             return json.dumps(out, default=str)
         except (EdgeClientError, httpx.HTTPError) as e:
             return json.dumps({"is_error": True, "error": str(e)})
+
+    @mcp.tool()
+    async def accept_candidate(candidate_id: str, rationale: str) -> str:
+        """Accept one platform candidate. The platform owns every order field.
+
+        This tool refreshes broker evidence, relays broker-authored equity and
+        signed day profit and loss, validates the frozen response, and submits
+        its exact connector call through local guardrails and approvals.
+        """
+        try:
+            await reporter.snapshot_and_push()
+            spec, account = _candidate_broker_account(state)
+            evidence = await balance_evidence(hub, spec, account)
+            if evidence.get("status") != "ok":
+                raise ValueError(
+                    "candidate acceptance requires readable broker equity and day P&L")
+            checked = client.agent_checkin(
+                "research", "candidate broker evidence refreshed",
+                evidence["equity"], evidence["day_pnl"])
+            if checked.get("ok") is not True:
+                raise ValueError("platform did not accept fresh broker evidence")
+            response = client.accept_candidate(candidate_id, rationale)
+            _terminal_candidate(candidate_id, "accepted", response)
+            if (response.get("mechanical_status") == "blocked"
+                    and response.get("prepared_order") is None):
+                return json.dumps(_safe_candidate(response), default=str)
+            prepared = _prepared_order(candidate_id, response)
+            submitted = await _guarded(
+                prepared["connector_id"], prepared["tool"], prepared["args"],
+                candidate_id=candidate_id,
+                intent_account=prepared["account_id"], require_approval=True)
+            safe = _safe_candidate(response)
+            if submitted.get("is_error"):
+                return json.dumps({**safe, "is_error": True,
+                                   "error": submitted.get("error", "local refusal")},
+                                  default=str)
+            for field in ("approval_id", "status"):
+                if field in submitted:
+                    safe[field] = submitted[field]
+            return json.dumps(safe, default=str)
+        except (EdgeClientError, httpx.HTTPError, ValueError) as error:
+            return json.dumps({"is_error": True, "error": str(error)})
+
+    @mcp.tool()
+    async def abstain_candidate(candidate_id: str, rationale: str) -> str:
+        """Abstain from one platform candidate without contacting a broker."""
+        try:
+            response = client.abstain_candidate(candidate_id, rationale)
+            _terminal_candidate(candidate_id, "abstained", response)
+            return json.dumps(
+                _safe_candidate(response),
+                default=str)
+        except (EdgeClientError, httpx.HTTPError, ValueError) as error:
+            return json.dumps({"is_error": True, "error": str(error)})
 
     @mcp.tool()
     async def list_peers() -> str:

@@ -98,6 +98,23 @@ def _market_event(seq, **body):
             "created_at": "2026-07-31T14:15:02+00:00"}
 
 
+def _candidate(seq, **body):
+    return {
+        "seq": seq, "kind": "execution_candidate",
+        "created_at": "2026-08-30T16:00:00Z",
+        "response_required": True, "claim_required": False,
+        "room_id": "agent:ag1", "recipient_agent_ids": ["ag1"],
+        "body": {
+            "candidate_id": "candidate-1", "signal_id": "signal-1",
+            "symbol": "AAPL", "direction": "LONG", "timeframe": "15m",
+            "play_title": "Breakout", "entry": 211.25, "stop": 207.0,
+            "reward_to_risk": 2.4, "corroboration": 3, "score": 8.5,
+            "created_at": "2026-08-30T16:00:00Z",
+            "expires_at": "2026-08-30T16:05:00Z", **body,
+        },
+    }
+
+
 def _payload(events, cursor, **extra):
     return {"ok": True, "events": events, "cursor": cursor,
             "has_more": False, **extra}
@@ -376,6 +393,33 @@ def test_a_market_event_never_asks_for_a_reply(tmp_path):
     emitted = []
     _listener(tmp_path, client, emitted).run(should_continue=_stop_after(2))
     assert [e["response_required"] for e in emitted] == [True, False]
+
+
+def test_execution_candidate_copies_only_safe_summary_and_envelope_response(tmp_path):
+    event = _candidate(
+        10, connector_id="robinhood", account="secret-account",
+        tool="place_equity_order", quantity=1000, response_required=False,
+        recipient_agent_ids=["attacker"], room_id="spoofed")
+    client = FakeClient([_payload([], 0), _payload([event], 10)])
+    emitted = []
+    _listener(tmp_path, client, emitted).run(should_continue=_stop_after(2))
+
+    assert len(emitted) == 1
+    rendered = emitted[0]
+    assert {field: rendered[field] for field in (
+        "candidate_id", "signal_id", "symbol", "direction", "timeframe",
+        "play_title", "entry", "stop", "reward_to_risk", "corroboration",
+        "score", "created_at", "expires_at")} == {
+        "candidate_id": "candidate-1", "signal_id": "signal-1",
+        "symbol": "AAPL", "direction": "LONG", "timeframe": "15m",
+        "play_title": "Breakout", "entry": 211.25, "stop": 207.0,
+        "reward_to_risk": 2.4, "corroboration": 3, "score": 8.5,
+        "created_at": "2026-08-30T16:00:00Z",
+        "expires_at": "2026-08-30T16:05:00Z"}
+    assert rendered["response_required"] is True
+    assert rendered["room_id"] == "agent:ag1"
+    assert rendered["recipient_agent_ids"] == ["ag1"]
+    assert not ({"connector_id", "account", "tool", "quantity"} & rendered.keys())
 
 
 def test_admitting_market_event_admits_that_name_and_no_family(tmp_path):

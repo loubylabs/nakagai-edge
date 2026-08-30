@@ -35,7 +35,14 @@ def _verify(state: EdgeState, approval_id: str, intent: dict, artifact) -> str:
     checks = (
         (artifact.get("approval_id") == approval_id, "approval_id mismatch"),
         (artifact.get("agent_id") == agent.get("agent_id"), "agent_id mismatch"),
+        (artifact.get("connector_id") == intent["connector_id"],
+         "connector_id mismatch"),
+        (artifact.get("tool") == intent["tool"], "tool mismatch"),
         (artifact.get("args_hash") == intent["args_hash"], "args_hash mismatch"),
+        (artifact.get("candidate_id", "") == intent.get("candidate_id", ""),
+         "candidate_id mismatch"),
+        (not intent.get("account")
+         or artifact.get("account") == intent["account"], "account mismatch"),
         (float(artifact.get("expires_at", 0)) > time.time(), "artifact expired"),
     )
     for ok, why in checks:
@@ -227,6 +234,24 @@ async def poll_once(hub, state: EdgeState, client: PlatformClient,
             except Exception:  # noqa: BLE001 (journal is best-effort here)
                 pass
             continue
+
+        if intent.get("candidate_id"):
+            from nakagai_edge.edge.brake import armed
+            if not armed(state):
+                error = "local brake is disarmed; candidate grant refused"
+                try:
+                    audit.record("denial", intent["connector_id"], intent["tool"],
+                                 {"approval_id": approval_id, "error": error,
+                                  "candidate_id": intent["candidate_id"]})
+                except Exception:  # noqa: BLE001 (journal is best-effort here)
+                    pass
+                try:
+                    client.report_execution(approval_id, ok=False, error=error)
+                except Exception:  # noqa: BLE001 (the broker was never contacted)
+                    pass
+                drop_intent(state, approval_id)
+                resolved += 1
+                continue
 
         try:
             result = await hub.call(intent["connector_id"], intent["tool"],

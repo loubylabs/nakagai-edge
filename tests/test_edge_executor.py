@@ -36,11 +36,13 @@ def _bundle():
             "signing_public_key": PUB}
 
 
-def _artifact(approval_id, *, args=ARGS, agent_id="ag1", expires_in=900):
+def _artifact(approval_id, *, args=ARGS, agent_id="ag1", expires_in=900,
+              candidate_id=""):
     return sign_artifact(PRIV, build_payload(
         approval_id=approval_id, agent_id=agent_id, connector_id="demo",
         tool="place_order", args=args,
-        account_arg_names=["account_number"], ttl_s=expires_in))
+        account_arg_names=["account_number"], ttl_s=expires_in,
+        candidate_id=candidate_id))
 
 
 class FakeHub:
@@ -111,6 +113,36 @@ async def test_tampered_args_hash_never_executes(tmp_path):
     await poll_once(hub, state, client, EdgeAudit(state))
     assert hub.calls == []
     assert reports and reports[0]["ok"] is False
+
+
+async def test_candidate_grant_requires_the_same_candidate_and_frozen_account(tmp_path):
+    artifact = _artifact("a1", candidate_id="candidate-other")
+    state, client, queue, reports = _setup(tmp_path, artifact=artifact)
+    queue.enqueue("ag1", "demo", "place_order", ARGS, ttl_s=900,
+                  candidate_id="candidate-1", intent_account="463605220")
+    hub = FakeHub()
+
+    await poll_once(hub, state, client, EdgeAudit(state))
+
+    assert hub.calls == []
+    assert reports and reports[0]["ok"] is False
+
+
+async def test_disarmed_brake_refuses_a_candidate_grant_before_broker_contact(tmp_path):
+    from nakagai_edge.edge.brake import set_local_disarm
+
+    artifact = _artifact("a1", candidate_id="candidate-1")
+    state, client, queue, reports = _setup(tmp_path, artifact=artifact)
+    queue.enqueue("ag1", "demo", "place_order", ARGS, ttl_s=900,
+                  candidate_id="candidate-1", intent_account="463605220")
+    set_local_disarm(state, all_positions=True)
+    hub = FakeHub()
+
+    await poll_once(hub, state, client, EdgeAudit(state))
+
+    assert hub.calls == []
+    assert reports and reports[0]["ok"] is False
+    assert "brake" in reports[0]["error"]
 
 
 async def test_expired_artifact_never_executes(tmp_path):
