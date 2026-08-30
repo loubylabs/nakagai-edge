@@ -241,6 +241,11 @@ def _accounts(portfolio_doc: dict):
         for account in entry.get("accounts") or []:
             if account.get("error"):
                 continue
+            if account.get("status", "ok") != "ok":
+                # A non-ok source has not authoritatively said that its empty
+                # positions list is flat. Releasing a brake record on it would
+                # turn unreadable broker evidence into a live unguarded book.
+                continue
             number = str(account.get("account_number", ""))
             if not number:
                 continue

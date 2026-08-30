@@ -60,7 +60,8 @@ class _Reporter:
 
     async def snapshot_and_push(self):
         self.pushes += 1
-        return {"connectors": [{"id": "robinhood-trading", "error": "",
+        return {"connectors": [{"id": "robinhood-trading", "status": "ok",
+                                "observed_at": 1_725_000_000.0, "error": "",
                                 "accounts": []}]}
 
 
@@ -110,6 +111,8 @@ async def test_refresh_portfolio_tool_pokes_the_reporter_and_returns_the_doc(tmp
     result = await mcp.call_tool("refresh_portfolio", {})
     body = json.loads(result.content[0].text)
     assert body["connectors"][0]["id"] == "robinhood-trading"
+    assert body["connectors"][0]["status"] == "ok"
+    assert body["connectors"][0]["observed_at"] == 1_725_000_000.0
     assert reporter.pushes == 1
 
 

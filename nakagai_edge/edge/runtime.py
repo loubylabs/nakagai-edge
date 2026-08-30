@@ -684,11 +684,13 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
 
     @mcp.tool()
     async def refresh_portfolio() -> str:
-        """Fetch fresh portfolio figures (totals + positions) from every
-        broker with this edge's own credentials, push them to the owner's
-        Portfolio page, and return the same document. You never supply
-        numbers; this tool makes the edge go look for itself. Rate-limited:
-        within 15s of the last sweep you get that snapshot back unchanged."""
+        """Fetch fresh broker portfolio evidence, push it to the owner's
+        Portfolio page, and return the same document. Connector and account
+        rows include an observation time and `ok`, `unreadable`, or
+        `unsupported` status. Positions and open orders are authoritative only
+        when their containing row is `ok`. You never supply numbers; this tool
+        makes the edge go look for itself. Rate-limited: within 15s of the last
+        sweep you get that snapshot back unchanged."""
         if (stale := _gate()) is not None:
             return stale
         try:

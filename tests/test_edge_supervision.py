@@ -192,6 +192,20 @@ def test_a_failed_connector_snapshot_never_releases_a_position(tmp_path):
     assert row["confirmed_qty"] == 100.0
 
 
+def test_an_unreadable_exposure_status_never_releases_a_position(tmp_path):
+    """The new portfolio contract uses status to tell an empty list from a
+    failed source. Ignoring it would release an armed record on malformed
+    positions evidence."""
+    state = EdgeState(tmp_path)
+    record(state, _rec())
+    reconcile(state, {"connectors": [{"id": "demo", "error": "", "accounts": [
+        {"account_number": "463605220", "error": "", "status": "unreadable",
+         "positions": []}]}]})
+    row = load(state)["ap_1"]
+    assert row["state"] == "armed"
+    assert row["confirmed_qty"] == 100.0
+
+
 def test_a_fired_position_is_not_reconciled_back_to_armed(tmp_path):
     state = EdgeState(tmp_path)
     record(state, _rec(state="fired"))

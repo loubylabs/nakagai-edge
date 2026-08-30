@@ -13,17 +13,48 @@ never does arithmetic on them.
 
 import asyncio
 import logging
+import math
 import time
 from pathlib import Path
 
 import yaml
 
-from nakagai_edge.capability import first, read_partial, resolve
+from nakagai_edge.capability import CapabilityError, first, read_partial, resolve
 
 PORTFOLIO_INTERVAL_S = 300      # the timer loop's cadence
 REFRESH_MIN_INTERVAL_S = 15     # a poke inside this window is not a sweep
 
 log = logging.getLogger("nakagai.edge")
+
+def _status(*statuses: str) -> str:
+    """One conservative status for a connector or account read.
+
+    An unreadable source dominates an unsupported one: both block autonomous
+    entry, but unreadable says the edge attempted a read and cannot describe
+    what the broker holds. Empty arrays are authoritative only under `ok`.
+    """
+    if "unreadable" in statuses:
+        return "unreadable"
+    if "unsupported" in statuses:
+        return "unsupported"
+    return "ok"
+
+
+def _error(label: str, error: Exception | str) -> str:
+    detail = str(error)
+    return f"{label}: {detail}" if detail else label
+
+
+def _finite(value, *, positive: bool = False) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or (positive and number <= 0):
+        return None
+    return number
 
 
 def broker_specs(root) -> list:
@@ -70,7 +101,9 @@ async def connector_snapshot(hub, spec) -> dict:
     web's contract, so `account_number`, `nickname` and `type` keep their
     spelling here while their values now arrive through `list_accounts`.
     """
-    entry: dict = {"id": spec.id, "error": "", "accounts": []}
+    observed_at = time.time()
+    entry: dict = {"id": spec.id, "status": "ok", "observed_at": observed_at,
+                   "error": "", "accounts": []}
     try:
         listed = await listed_accounts(hub, spec)
     except Exception as e:  # noqa: BLE001 (per-connector degradation, by design)
@@ -78,13 +111,16 @@ async def connector_snapshot(hub, spec) -> dict:
         # list_accounts says so in its own entry and contributes no accounts,
         # rather than taking the other brokers' sweep down with it.
         entry["error"] = f"{type(e).__name__}: {e}"
+        entry["status"] = ("unsupported" if isinstance(e, CapabilityError)
+                           else "unreadable")
         return entry
     for account, tier in tiered_accounts(spec, listed):
         num = str(account.get("account", ""))
-        row = {"account_number": num,
+        row = {"account_number": num, "status": "ok", "observed_at": observed_at,
                "nickname": account.get("nickname") or "",
                "type": account.get("type") or "",
-               "tier": tier, "error": "", "portfolio": {}, "positions": []}
+               "tier": tier, "error": "", "portfolio": {}, "positions": [],
+               "open_orders": []}
         if not num:
             # Listed by the broker, but with nothing readable to name it by.
             # The row is kept and not dialed: there is no identifier to ask
@@ -94,14 +130,26 @@ async def connector_snapshot(hub, spec) -> dict:
             row["error"] = ("this connector listed an account with no readable "
                             "identifier, so its balances and positions cannot "
                             "be fetched")
+            row["status"] = "unreadable"
             entry["accounts"].append(row)
             continue
+        errors = []
         try:
             row["portfolio"] = await _figures(hub, spec, num)
-            row["positions"] = await _positions(hub, spec, num)
+        except CapabilityError as e:
+            row["status"] = _status(row["status"], "unsupported")
+            errors.append(_error("get_balance unsupported", e))
         except Exception as e:  # noqa: BLE001 (per-account degradation, by design)
-            row["error"] = f"{type(e).__name__}: {e}"
+            row["status"] = _status(row["status"], "unreadable")
+            errors.append(_error("get_balance unreadable", e))
+        position_status, positions, position_error = await _positions(hub, spec, num)
+        order_status, orders, order_error = await _open_orders(hub, spec, num)
+        row["positions"], row["open_orders"] = positions, orders
+        row["status"] = _status(row["status"], position_status, order_status)
+        errors.extend(e for e in (position_error, order_error) if e)
+        row["error"] = "; ".join(errors)
         entry["accounts"].append(row)
+    entry["status"] = _status(*(a["status"] for a in entry["accounts"]))
     return entry
 
 
@@ -162,7 +210,39 @@ async def _figures(hub, spec, account: str) -> dict:
     return figures if isinstance(figures, dict) else {}
 
 
-async def _positions(hub, spec, account: str) -> list:
+async def balance_evidence(hub, spec, account: str) -> dict:
+    """Canonical broker equity and signed day P&L for the existing check-in.
+
+    This helper is deliberately separate from the display snapshot. Task 3
+    calls it immediately before candidate acceptance and relays its two values
+    through `agent_checkin`, preserving that endpoint as the platform's one
+    equity authority. `ok` requires finite positive equity and finite signed
+    day P&L. A connector that does not declare get_balance is unsupported; a
+    missing map field or unusable broker value is unreadable.
+    """
+    try:
+        cap = spec.capability("get_balance")
+    except CapabilityError:
+        return {"status": "unsupported", "equity": None, "day_pnl": None}
+    try:
+        tool, args = resolve("get_balance", cap, {"account": account})
+        payload = (await hub.call(
+            spec.id, tool, args, account_key=hub.account_key
+        )).get("data")
+        figures = first(payload, cap.items) if cap.items else payload
+    except Exception:  # noqa: BLE001 (the caller needs a bounded readiness fact)
+        return {"status": "unreadable", "equity": None, "day_pnl": None}
+    if not isinstance(figures, dict):
+        return {"status": "unreadable", "equity": None, "day_pnl": None}
+    values = read_partial("get_balance", cap, figures)
+    equity = _finite(values.get("equity"), positive=True)
+    day_pnl = _finite(values.get("day_pnl"))
+    if equity is None or day_pnl is None:
+        return {"status": "unreadable", "equity": None, "day_pnl": None}
+    return {"status": "ok", "equity": equity, "day_pnl": day_pnl}
+
+
+async def _positions(hub, spec, account: str) -> tuple[str, list, str]:
     """Raw position rows carrying normalized `symbol` and `quantity`.
 
     Both keys deliberately overwrite whatever the broker called them, because
@@ -182,16 +262,53 @@ async def _positions(hub, spec, account: str) -> list:
     live without a stop. That is exactly the mistake supervision.unreadable()
     exists to prevent.
     """
-    cap = spec.capability("list_positions")
-    tool, args = resolve("list_positions", cap, {"account": account})
-    payload = (await hub.call(
-        spec.id, tool, args, account_key=hub.account_key
-    )).get("data")
+    try:
+        cap = spec.capability("list_positions")
+    except CapabilityError as e:
+        return "unsupported", [], _error("list_positions unsupported", e)
+    try:
+        tool, args = resolve("list_positions", cap, {"account": account})
+        payload = (await hub.call(
+            spec.id, tool, args, account_key=hub.account_key
+        )).get("data")
+    except Exception as e:  # noqa: BLE001 (per-account degradation, by design)
+        return "unreadable", [{"unknown": True}], _error("list_positions unreadable", e)
     rows = first(payload, cap.items) if cap.items else payload
     if not isinstance(rows, list):
-        return []
-    return [{**row, **read_partial("list_positions", cap, row)}
-            for row in rows if isinstance(row, dict)]
+        return "unreadable", [{"unknown": True}], "list_positions unreadable"
+    out, unknown = [], False
+    required = ("symbol", "quantity")
+    for row in rows:
+        if not isinstance(row, dict):
+            out.append({"unknown": True})
+            unknown = True
+            continue
+        normalized = read_partial("list_positions", cap, row)
+        unreadable = any(field not in normalized for field in required)
+        out.append({**row, **normalized, **({"unknown": True} if unreadable else {})})
+        unknown = unknown or unreadable
+    return ("unreadable" if unknown else "ok", out,
+            "list_positions unreadable" if unknown else "")
+
+
+async def _open_orders(hub, spec, account: str) -> tuple[str, list, str]:
+    """Open-order evidence through fills.py's sole connector parser."""
+    # fills.py imports broker discovery from this module, so this stays local
+    # rather than turning two read-only helpers into an import cycle.
+    from nakagai_edge.edge.fills import open_order_rows
+    try:
+        spec.capability("list_orders")
+    except CapabilityError as e:
+        return "unsupported", [], _error("list_orders unsupported", e)
+    try:
+        rows = await open_order_rows(hub, spec, account)
+    except Exception as e:  # noqa: BLE001 (per-account degradation, by design)
+        return "unreadable", [{"unknown": True}], _error("list_orders unreadable", e)
+    if rows is None:
+        return "unreadable", [{"unknown": True}], "list_orders unreadable"
+    if any(row.get("unknown") is True for row in rows):
+        return "unreadable", rows, "list_orders unreadable"
+    return "ok", rows, ""
 
 
 def mark_guarded(state, connectors: list[dict], *, brake_armed: bool = True,

@@ -29,7 +29,7 @@ VERBATIM, FLOAT, UPPER_STR, SIDE = "verbatim", "float", "upper_str", "side"
 COERCIONS = {
     "symbol": UPPER_STR,
     "side": SIDE,
-    "quantity": FLOAT, "price": FLOAT, "stop": FLOAT,
+    "quantity": FLOAT, "price": FLOAT, "stop": FLOAT, "day_pnl": FLOAT,
     "bid": FLOAT, "ask": FLOAT, "avg_price": FLOAT, "fill_price": FLOAT,
     "notional": FLOAT,
 }
@@ -87,7 +87,7 @@ CAPABILITIES: dict[str, CapabilitySpec] = {
         is_list=True, is_write=False),
     "get_balance": CapabilitySpec(
         args=("account",), required=("equity",),
-        optional=("cash", "buying_power", "currency"),
+        optional=("cash", "buying_power", "currency", "day_pnl"),
         is_list=False, is_write=False),
     "list_positions": CapabilitySpec(
         args=("account",), required=("symbol", "quantity"),

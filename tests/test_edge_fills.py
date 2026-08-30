@@ -13,7 +13,7 @@ import pytest
 
 from nakagai_edge.config import load_specs
 from nakagai_edge.edge.fills import (Anchor, FillsReporter, account_rows,
-                                     filled_status, key)
+                                     filled_status, key, open_order_rows)
 from nakagai_edge.edge.state import EdgeState
 from tests.fixtures.alien_registry import ALIEN_CONNECTOR, ROBINHOOD_CONNECTOR
 
@@ -110,6 +110,40 @@ async def test_status_is_relayed_verbatim_not_canonicalized():
         {"ref": "x-9", "tkr": "spy", "stage": "partially_filled"}]}})
     rows = await account_rows(hub, spec, "AL-1")
     assert rows[0]["status"] == "partially_filled"
+
+
+async def test_open_orders_share_the_canonical_list_orders_reader():
+    """Changing the shared parser to skip side, quantity, or status must fail
+    this test and the fill-journal test above together.
+
+    The portfolio report asks for the broker's default open set, while the
+    journal asks for its declared filled spelling. Both must still normalize
+    one broker payload through one parser.
+    """
+    spec = SPECS["robinhood-trading"]
+    queued = {**ORDER, "state": "queued"}
+    hub = _rh_hub([queued])
+
+    rows = await open_order_rows(hub, spec, "463605220")
+
+    assert rows == [{"order_id": "ord-1", "symbol": "NVDA", "side": "buy",
+                     "quantity": 60.0, "status": "queued",
+                     "fill_price": 112.40,
+                     "filled_at": "2026-08-05T14:31:00Z"}]
+    assert "state" not in hub.calls[0][2]
+
+
+async def test_a_malformed_open_order_is_explicit_unknown_evidence():
+    """Dropping this row would turn an unreadable broker answer into an empty
+    working-order book, which is the unsafe direction for a new entry."""
+    spec = SPECS["robinhood-trading"]
+
+    rows = await open_order_rows(
+        _rh_hub([{"symbol": "aapl", "side": "buy", "state": "queued"}]),
+        spec, "463605220")
+
+    assert rows == [{"symbol": "AAPL", "side": "buy", "status": "queued",
+                     "unknown": True}]
 
 
 # ---- asking for filled orders --------------------------------------------
