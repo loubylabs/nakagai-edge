@@ -1,7 +1,7 @@
 """The fill journal: what the broker's order history says, recorded locally,
 reconciled against submitted candidates, and shipped to the platform.
 
-This is the one path that declares an order filled. A submitted candidate must
+This is the one path that declares an order filled. A submitted entry must
 match its exact broker order id here before supervision starts. An order id no
 approval claims remains an owner-placed trade when the rows reach the platform.
 
@@ -249,8 +249,8 @@ class FillsReporter:
                                 "are not journaled this cycle: %s", spec.id, error)
                     continue
                 for account, rows in accounts:
-                    from nakagai_edge.edge.executor import reconcile_candidate_fills
-                    await reconcile_candidate_fills(
+                    from nakagai_edge.edge.executor import reconcile_submitted_fills
+                    await reconcile_submitted_fills(
                         self._hub, self._state, self._client,
                         EdgeAudit(self._state), spec, account, rows)
                     journaled.extend(self._absorb(spec.id, account, rows))

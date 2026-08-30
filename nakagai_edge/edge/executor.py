@@ -196,7 +196,7 @@ def supervise(hub, state: EdgeState, approval_id: str, intent: dict,
         return None
 
 
-async def _verify_candidate_supervision(
+async def _verify_supervision(
         hub, state: EdgeState, approval_id: str, intent: dict,
         record_doc: dict, fill: dict) -> None:
     spec = hub.spec(intent["connector_id"])
@@ -272,16 +272,15 @@ def _matching_fill(spec, intent: dict, row: dict) -> str:
     return ""
 
 
-async def reconcile_candidate_fills(
+async def reconcile_submitted_fills(
         hub, state: EdgeState, client: PlatformClient, audit: EdgeAudit,
         spec, account: str, rows: list[dict]) -> int:
-    """Complete submitted candidates only from exact broker fill rows."""
+    """Supervise submitted entries only from their exact broker fill rows."""
     matched = 0
     for approval_id, intent in list(intents(state).items()):
         if (not isinstance(intent, dict) or intent.get("phase") != "submitted"
                 or intent.get("connector_id") != spec.id
-                or intent.get("account") != account
-                or not intent.get("candidate_id")):
+                or intent.get("account") != account):
             continue
         fill = next((row for row in rows
                      if isinstance(row, dict)
@@ -295,20 +294,21 @@ async def reconcile_candidate_fills(
         try:
             if reason:
                 raise ValueError(reason)
-            await _verify_candidate_supervision(
+            await _verify_supervision(
                 hub, state, approval_id, intent,
                 intent.get("approval") or {}, fill)
         except Exception as error:  # noqa: BLE001 (a matched fill now exists)
             reason = reason or (
-                "candidate supervision failed after reconciled broker fill: "
+                "supervision failed after reconciled broker fill: "
                 f"{type(error).__name__}: {error}")
-            disarm_candidate_entries(
-                state, candidate_id=intent["candidate_id"],
-                approval_id=approval_id, reason=reason)
-            _candidate_outcome(
-                state, client, intent["candidate_id"],
-                mechanical_status="blocked", reason=reason,
-                approval_id=approval_id, urgent=True, outcome_unknown=True)
+            if intent.get("candidate_id"):
+                disarm_candidate_entries(
+                    state, candidate_id=intent["candidate_id"],
+                    approval_id=approval_id, reason=reason)
+                _candidate_outcome(
+                    state, client, intent["candidate_id"],
+                    mechanical_status="blocked", reason=reason,
+                    approval_id=approval_id, urgent=True, outcome_unknown=True)
             _alert_candidate(client, reason)
             try:
                 audit.record(
@@ -325,11 +325,12 @@ async def reconcile_candidate_fills(
                      "order_id": intent["broker_order_id"], "filled": True})
             except Exception:  # noqa: BLE001 (journal is best effort)
                 pass
-            _candidate_outcome(
-                state, client, intent["candidate_id"],
-                mechanical_status="submitted",
-                reason="broker fill reconciled and supervision verified",
-                approval_id=approval_id)
+            if intent.get("candidate_id"):
+                _candidate_outcome(
+                    state, client, intent["candidate_id"],
+                    mechanical_status="submitted",
+                    reason="broker fill reconciled and supervision verified",
+                    approval_id=approval_id)
         drop_intent(state, approval_id)
     return matched
 
@@ -562,16 +563,33 @@ async def poll_once(hub, state: EdgeState, client: PlatformClient,
                         except Exception:  # noqa: BLE001 (journal is best-effort here)
                             pass
             else:
+                order_id = placed_order_id(hub, intent, result)
+                if order_id:
+                    try:
+                        mark_submitted(
+                            state, approval_id, order_id=order_id,
+                            approval=record, result=result)
+                    except Exception as error:  # noqa: BLE001 (the broker accepted)
+                        try:
+                            audit.record(
+                                "error", intent["connector_id"], intent["tool"],
+                                {"approval_id": approval_id,
+                                 "error": ("submission could not be persisted: "
+                                           f"{type(error).__name__}: {error}"),
+                                 "outcome_unknown": True})
+                        except Exception:  # noqa: BLE001 (journal is best effort)
+                            pass
                 try:
                     audit.record(
                         "execution", intent["connector_id"], intent["tool"],
-                        {"approval_id": approval_id, "ok": True})
+                        {"approval_id": approval_id, "ok": True,
+                         "order_id": order_id, "submitted": True})
                 except Exception:  # noqa: BLE001 (journal is best-effort here)
                     pass
                 try:
                     client.report_execution(
                         approval_id, ok=True, result=result,
-                        order_id=placed_order_id(hub, intent, result))
+                        order_id=order_id)
                 except Exception:  # noqa: BLE001 (never re-arm an executed intent)
                     pass
         current = intents(state).get(approval_id)

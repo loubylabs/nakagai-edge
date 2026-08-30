@@ -12,7 +12,7 @@ pytest.importorskip("cryptography")
 from nakagai_edge.edge.audit import EdgeAudit
 from nakagai_edge.edge.client import PlatformClient
 from nakagai_edge.edge.candidate import candidate_entries_armed
-from nakagai_edge.edge.executor import poll_once, reconcile_candidate_fills
+from nakagai_edge.edge.executor import poll_once, reconcile_submitted_fills
 from nakagai_edge.edge.remote import RemoteApprovalQueue, intents
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.sync import BUNDLE_SCHEMA, apply_bundle
@@ -330,7 +330,7 @@ async def test_later_matching_fill_establishes_supervision_and_completes_candida
     hub = CandidateHub(positions=[{"symbol": "AAPL", "quantity": "3"}])
     await poll_once(hub, state, client, EdgeAudit(state))
 
-    matched = await reconcile_candidate_fills(
+    matched = await reconcile_submitted_fills(
         hub, state, client, EdgeAudit(state), hub.spec("demo"), "463605220",
         [{"order_id": "42", "symbol": "AAPL", "side": "buy",
           "quantity": 3.0, "status": "filled", "fill_price": 211.31}],
@@ -346,6 +346,41 @@ async def test_later_matching_fill_establishes_supervision_and_completes_candida
         "mechanical_reason": "broker fill reconciled and supervision verified",
         "approval_id": "a1", "urgent": False, "outcome_unknown": False,
     }]
+
+
+async def test_ordinary_approved_entry_uses_the_same_exact_fill_supervision_path(
+        tmp_path):
+    artifact = _artifact("a1", args=CANDIDATE_ARGS, account="463605220")
+    state, client, queue, _reports = _setup(
+        tmp_path, artifact=artifact,
+        record_overrides={
+            "args": CANDIDATE_ARGS, "signal_id": "signal-1",
+            "exit_warrant": {
+                "expires_at": time.time() + 3600, "signature": "warrant"},
+        },
+    )
+    queue.enqueue(
+        "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
+        intent_account="463605220",
+    )
+    hub = CandidateHub()
+
+    await poll_once(hub, state, client, EdgeAudit(state))
+
+    assert load_supervision(state) == {}
+    assert intents(state)["a1"]["phase"] == "submitted"
+    assert intents(state)["a1"]["broker_order_id"] == "42"
+
+    matched = await reconcile_submitted_fills(
+        hub, state, client, EdgeAudit(state), hub.spec("demo"), "463605220",
+        [{"order_id": "42", "symbol": "AAPL", "side": "buy",
+          "quantity": 3.0, "status": "filled", "fill_price": 211.31}],
+    )
+
+    assert matched == 1
+    assert load_supervision(state)["a1"]["state"] == "armed"
+    assert intents(state) == {}
+    assert client.candidate_outcomes == []
 
 
 async def test_mismatched_fill_order_id_cannot_complete_candidate(tmp_path):
@@ -367,7 +402,7 @@ async def test_mismatched_fill_order_id_cannot_complete_candidate(tmp_path):
     hub = CandidateHub()
     await poll_once(hub, state, client, EdgeAudit(state))
 
-    matched = await reconcile_candidate_fills(
+    matched = await reconcile_submitted_fills(
         hub, state, client, EdgeAudit(state), hub.spec("demo"), "463605220",
         [{"order_id": "other-order", "symbol": "AAPL", "side": "buy",
           "quantity": 3.0, "status": "filled", "fill_price": 211.31}],
@@ -402,7 +437,7 @@ async def test_supervision_failure_after_actual_fill_disarms_and_alerts_owner(
     assert await poll_once(hub, state, client, EdgeAudit(state)) == 1
     assert reports[0]["ok"] is True
 
-    matched = await reconcile_candidate_fills(
+    matched = await reconcile_submitted_fills(
         hub, state, client, EdgeAudit(state), hub.spec("demo"), "463605220",
         [{"order_id": "42", "symbol": "AAPL", "side": "buy",
           "quantity": 3.0, "status": "filled", "fill_price": 211.31}],
