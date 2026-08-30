@@ -164,3 +164,7 @@ def disarm_candidate_entries(
         "reason": str(reason).strip()[:1000],
         "at": time.time(),
     })
+
+
+def rearm_candidate_entries(state: EdgeState) -> None:
+    state.candidate_entries_off_path.unlink(missing_ok=True)

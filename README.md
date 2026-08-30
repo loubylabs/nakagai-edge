@@ -476,8 +476,13 @@ knowing:
 nakagai-edge brake status              # what is watched, and its risk in R
 nakagai-edge brake off                 # disarm, locally, with no network
 nakagai-edge brake off --position <id> # release one position
-nakagai-edge brake on                  # re-arm
+nakagai-edge brake on                  # re-arm stops and candidate entries
 ```
+
+An urgent candidate supervision failure leaves `candidate_entries_armed`
+false in `brake status` while existing warrant exits remain armed. Inspect the
+reported position and broker outcome first. `brake on` clears that local entry
+lockout when the owner is ready to permit another candidate.
 
 The brake does not promise the level. A gap opens a position under its stop and
 the exit goes off at the market, below it. That is what a stop is.
