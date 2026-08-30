@@ -141,6 +141,10 @@ RENDERERS = {
     # (_envelope's own fields win), and the detector name would vanish.
     "market_event": _named("symbol", "detector", "bar_ts", "timeframe",
                            "magnitude"),
+    "execution_candidate": _named(
+        "candidate_id", "signal_id", "symbol", "direction", "timeframe",
+        "play_title", "entry", "stop", "reward_to_risk", "corroboration",
+        "score", "created_at", "expires_at"),
     # This account's watchlist folded across a week: which tickers have a
     # multi-day shape. Every value in it is platform-computed, a ticker from
     # the security master, a shape from a closed vocabulary, or an integer, so
@@ -173,7 +177,8 @@ RENDERERS = {
 EVENT_META = (
     "room_id", "reply_to_seq", "sender_agent_id", "dispatch_mode",
     "response_required", "claim_required", "claim_expires_at", "retry_at",
-    "recipient_status", "recipient_count", "source_seq", "hop_count",
+    "recipient_status", "recipient_count", "recipient_agent_ids", "source_seq",
+    "hop_count",
 )
 
 # A malformed response is a data error, not a transport one: httpx.HTTPError

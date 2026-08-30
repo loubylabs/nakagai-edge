@@ -5,11 +5,17 @@ the only place a broker credential is ever written to disk. Your agent talks to
 exactly one MCP endpoint, the edge, and never sees a token. The platform never
 sees one either.
 
-Version 0.4.5 is the current release. Since 0.4.4, semantic `place_order` is
-the only order entry: a raw `call_connector` request whose tool exactly matches
-the selected connector's declared `capabilities.place_order.tool` is refused
-before dispatch with `canonical_order_required`. Other raw connector operations
-remain available.
+Version 0.5.0 is the current release. An agent woken for one execution
+candidate can inspect that candidate, accept or abstain with a rationale, then
+stop. A listener-owned local scope enforces that boundary for the wake. The
+same candidate decision tools and read-only inspection remain available, while
+every other write is refused until the wake ends or expires. The agent cannot
+alter a prepared order field. The platform compiles the order, and local policy
+or the brake can still refuse execution. Semantic
+`place_order` remains the only owner-mediated order entry: a raw
+`call_connector` request whose tool exactly matches the selected connector's
+declared `capabilities.place_order.tool` is refused before dispatch with
+`canonical_order_required`. Other raw connector operations remain available.
 
 Every local approval queue operation still requires an explicit `account_key`.
 A paired edge uses its stable `agent_id` for that key. The key stays local; the
@@ -97,7 +103,7 @@ uvx nakagai-edge connect
 The one client recognized today is Claude Code, detected by `claude` being on
 your PATH. It gets an MCP entry added with
 `claude mcp add --scope user nakagai --transport http <url>`, at user scope
-because a project-scoped entry needs a per-project approval, and the eight skills
+because a project-scoped entry needs a per-project approval, and the nine skills
 below are copied into `~/.claude/skills/`. A client that is not detected is not
 an obstacle: the snippet below is the whole contract.
 
@@ -151,7 +157,7 @@ because a name that fails legibly beats a set of tools that silently vanish.
 
 ## Skills
 
-Eight skills ship inside the wheel:
+Nine skills ship inside the wheel:
 
 - **`connect-edge`**: connect a local edge to a hosted platform, and diagnose
   the known failure modes.
@@ -169,6 +175,9 @@ Eight skills ship inside the wheel:
   messages as they arrive.
 - **`verify`**: launch an isolated local platform and verify web, API, and MCP
   changes end to end.
+- **`candidate-trader`**: inspect one execution candidate, choose accept or
+  abstain with a rationale, then stop. Accepting cannot change a prepared
+  field, and local policy or the brake can still refuse execution.
 
 A client that reads skills as files gets them installed by `connect` (Claude
 Code: `~/.claude/skills/`). Any MCP client can read exactly the same text off
@@ -243,6 +252,11 @@ Notes that matter:
   This starts bounded non-interactive Codex turns. It cannot inject a message
   into an already-open Codex app conversation, and non-actionable context does
   not start a turn.
+* **Candidate wakes are one decision.** An `execution_candidate` is an
+  addressed, response-required event. Use `candidate-trader`: inspect one
+  candidate, choose accept or abstain, provide a concise rationale, and stop.
+  An acceptance leaves every prepared field under platform control. Local
+  policy and the brake retain their authority to refuse execution.
 * **Claim first when required.** If `claim_required` is true, call
   `claim_message(seq)` before reasoning or using another tool. A `409` is an
   ordinary coordination outcome. `already_claimed`, `claim_lost`, and
@@ -283,7 +297,7 @@ for a position's quantity. When those names live in the edge, a second broker
 is not a config change, and the failure is not a loud one. The brake stops
 seeing positions while every display goes on reporting them as guarded.
 
-So the edge knows seven things a broker can be asked to do, and nothing about
+So the generic broker surface knows seven things a broker can be asked to do, and nothing about
 how any particular broker spells them: `list_accounts`, `get_balance`,
 `list_positions`, `get_quote`, `list_orders`, `place_order`, `cancel_order`.
 
@@ -323,25 +337,46 @@ package:
       args:
         symbol: ticker
         side: action
+        order_type: kind
         quantity: qty
-        price: limit
-        stop: trigger
+        limit_price: limit
+        stop_price: trigger
+        time_in_force: tif
         account: acct
+      outbound_types:
+        symbol: string
+        side: string
+        order_type: string
+        quantity: string
+        limit_price: string
+        stop_price: string
+        time_in_force: string
+        account: string
       values:
         side:
           buy: [BUY]
           sell: [SELL]
-      market_args: {kind: MARKET}
+        order_type:
+          limit: [LIMIT]
+          market: [MARKET]
 ```
 
-**A `place_order` map has to name all five order keys**: symbol, side,
-quantity, price and stop. The edge reads an executed entry back through them to
+**A `place_order` map has to name every canonical outbound field**: symbol,
+side, order_type, quantity, limit_price, stop_price, time_in_force, and
+account. The edge reads an executed entry back through symbol, side, quantity,
+limit_price, and stop_price to
 build the ledger record the brake watches, so a map missing one places real
 orders that are then supervised by nothing, absent from `get_open_risk` while
 the Portfolio page still lists them. A connector declaring an incomplete
 `place_order` is refused when the registry is parsed, by name and by which keys
 are missing, rather than found later by a position that had no stop watching
 it. A connector that places no orders at all simply declares no `place_order`.
+
+The model-facing `place_order` tool creates limit entries only. Quantity must
+be a positive whole-share count, and both the limit and protective stop must
+be positive. Market orders carrying either priced field are refused. The only
+market orders the edge constructs are reduce-only warrant exits, and those
+payloads omit both priced fields.
 
 **The order inside `values.side` is load-bearing.** The list is every spelling
 this connector recognizes when it reads a side back off an order, and the first
@@ -351,7 +386,12 @@ order opens or closes. A broker with separate verbs mapped as
 `buy: [BUY_TO_OPEN, BUY_TO_COVER]` sends `BUY_TO_OPEN` for every buy, including
 the one meant to cover a short.
 
-The agent gets seven named tools it learns once and uses against any broker.
+The generic broker surface exposes seven named tools that work against any
+broker. The shared MCP surface remains present during an execution-candidate
+wake. Read-only inspection remains allowed. The edge enforces
+`accept_candidate` and `abstain_candidate` as the only write actions for the
+same candidate during that wake. Connector writes and order construction are
+refused in code until the wake ends or expires.
 `connector_id` is optional only while exactly one enabled broker declares the
 capability. Enable a second and the edge stops filling it in: the call comes
 back naming both candidates and the agent has to say which brokerage it meant.
@@ -436,17 +476,21 @@ knowing:
 nakagai-edge brake status              # what is watched, and its risk in R
 nakagai-edge brake off                 # disarm, locally, with no network
 nakagai-edge brake off --position <id> # release one position
-nakagai-edge brake on                  # re-arm
+nakagai-edge brake on                  # re-arm stops and candidate entries
 ```
+
+An urgent candidate supervision failure leaves `candidate_entries_armed`
+false in `brake status` while existing warrant exits remain armed. Inspect the
+reported position and broker outcome first. `brake on` clears that local entry
+lockout when the owner is ready to permit another candidate.
 
 The brake does not promise the level. A gap opens a position under its stop and
 the exit goes off at the market, below it. That is what a stop is.
 
-A connector must declare a `place_order` capability with `market_args` before
-its positions can be supervised, and the two halves of that fail differently.
-A connector that declares `place_order` but no `market_args` still gets a
-ledger record: there is no exit order to build, so the position is recorded
-unguarded, listed that way by `get_open_risk`, and shown that way on the
+A connector must declare a complete `place_order` capability before its
+positions can be supervised. The canonical market exit uses the same resolver
+as an entry, with `order_type: market`. A connector that cannot express it gets
+a ledger record marked unguarded and shown that way by `get_open_risk` and the
 Portfolio page. A connector that declares no `place_order` at all leaves no
 ledger record to make, so its positions are absent from `get_open_risk`
 entirely; the Portfolio page still shows them unguarded, because a position
@@ -461,7 +505,7 @@ did, so they are on the Portfolio page like any other. What they lack is
 everything downstream of the supervision ledger. There is no approval behind
 them, so there is no ledger record, no stop, no exit warrant, and nothing that
 will exit them. They are absent from `get_open_risk` and contribute nothing to
-portfolio heat, exactly like an agent order placed without a stop.
+portfolio heat, like any broker position with no supervision record.
 
 The fill journal is what tells the platform they were yours. Every
 `FILLS_INTERVAL_S` (300s) the edge reads each broker's order history through

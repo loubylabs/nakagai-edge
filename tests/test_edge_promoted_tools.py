@@ -38,7 +38,8 @@ PLATFORM = "nakagai-mcp"
 # prefixed, never both. Verified against nakagai_platform/mcp_server.py.
 COLLIDE = {"agent_checkin", "call_connector", "get_approval",
            "get_connector_status", "list_connector_tools", "list_peers",
-           "claim_message", "send_message", "request_peer"}
+           "claim_message", "send_message", "request_peer",
+           "accept_candidate", "abstain_candidate"}
 
 # The shipped registry entry, guardrails included: this is what
 # config/connectors.yaml in the platform repo actually sends down the bundle,
@@ -144,10 +145,10 @@ async def test_platform_tools_are_promoted(edge):
     names = set(await edge.names())
     assert {"get_signals", "get_runs", "run_backtest"} <= names
     assert "await_events" not in names
-    # Sixteen: the platform's twenty-six minus the nine local collisions and
+    # Sixteen: the platform's twenty-eight minus the eleven local collisions and
     # the event reader. A number, so that a promotion that quietly dropped
     # half of them is a failure rather than a smaller success.
-    assert len(names) == 19 + 16, sorted(names)
+    assert len(names) == 21 + 16, sorted(names)
 
 
 async def test_a_promoted_tool_publishes_the_platforms_own_argument_schema(edge):

@@ -13,7 +13,7 @@ import pytest
 
 from nakagai_edge.config import load_specs
 from nakagai_edge.edge.fills import (Anchor, FillsReporter, account_rows,
-                                     filled_status, key)
+                                     filled_status, key, open_order_rows)
 from nakagai_edge.edge.state import EdgeState
 from tests.fixtures.alien_registry import ALIEN_CONNECTOR, ROBINHOOD_CONNECTOR
 
@@ -34,6 +34,9 @@ class EnvelopeHub:
     def __init__(self, responses):
         self.account_key = "ag1"
         self.responses, self.calls = responses, []
+
+    def spec(self, connector_id):
+        return SPECS[connector_id]
 
     async def call(self, connector_id, tool, args, **kw):
         self.calls.append((connector_id, tool, dict(args)))
@@ -112,6 +115,40 @@ async def test_status_is_relayed_verbatim_not_canonicalized():
     assert rows[0]["status"] == "partially_filled"
 
 
+async def test_open_orders_share_the_canonical_list_orders_reader():
+    """Changing the shared parser to skip side, quantity, or status must fail
+    this test and the fill-journal test above together.
+
+    The portfolio report asks for the broker's default open set, while the
+    journal asks for its declared filled spelling. Both must still normalize
+    one broker payload through one parser.
+    """
+    spec = SPECS["robinhood-trading"]
+    queued = {**ORDER, "state": "queued"}
+    hub = _rh_hub([queued])
+
+    rows = await open_order_rows(hub, spec, "463605220")
+
+    assert rows == [{"order_id": "ord-1", "symbol": "NVDA", "side": "buy",
+                     "quantity": 60.0, "status": "queued",
+                     "fill_price": 112.40,
+                     "filled_at": "2026-08-05T14:31:00Z"}]
+    assert "state" not in hub.calls[0][2]
+
+
+async def test_a_malformed_open_order_is_explicit_unknown_evidence():
+    """Dropping this row would turn an unreadable broker answer into an empty
+    working-order book, which is the unsafe direction for a new entry."""
+    spec = SPECS["robinhood-trading"]
+
+    rows = await open_order_rows(
+        _rh_hub([{"symbol": "aapl", "side": "buy", "state": "queued"}]),
+        spec, "463605220")
+
+    assert rows == [{"symbol": "AAPL", "side": "buy", "status": "queued",
+                     "unknown": True}]
+
+
 # ---- asking for filled orders --------------------------------------------
 
 async def test_a_declared_filled_status_is_sent_in_the_brokers_own_spelling():
@@ -169,12 +206,20 @@ def test_an_unreadable_anchor_file_does_not_raise(tmp_path):
 
 class Client:
     def __init__(self, fail=False):
-        self.batches, self.fail = [], fail
+        self.batches, self.outcomes, self.alerts, self.fail = [], [], [], fail
 
     def report_fills(self, fills):
         if self.fail:
             raise RuntimeError("platform down")
         self.batches.append(fills)
+        return {"ok": True}
+
+    def report_candidate_outcome(self, candidate_id, **payload):
+        self.outcomes.append((candidate_id, payload))
+        return {"ok": True}
+
+    def agent_checkin(self, status, note, **payload):
+        self.alerts.append((status, note, payload))
         return {"ok": True}
 
 
@@ -196,6 +241,95 @@ async def test_the_first_sweep_anchors_and_ships_nothing(tmp_path):
     r = FillsReporter(_rh_only(tmp_path), _rh_hub([ORDER]), client)
     assert await r.sweep() == []
     assert client.batches == []
+
+
+async def test_fill_sweep_completes_exact_submitted_candidate_before_anchoring(
+        tmp_path):
+    state = _rh_only(tmp_path)
+    state._write_private(state.intents_path, {
+        "approval-1": {
+            "connector_id": "robinhood-trading",
+            "tool": "place_equity_order",
+            "args": {
+                "account_number": "463605220", "symbol": "NVDA",
+                "side": "buy", "type": "limit", "quantity": "60",
+                "limit_price": "112.35", "stop_price": "109.50",
+                "time_in_force": "day",
+            },
+            "args_hash": "frozen", "candidate_id": "candidate-1",
+            "account": "463605220", "phase": "submitted",
+            "broker_order_id": "ord-1",
+            "approval": {
+                "signal_id": "signal-1",
+                "exit_warrant": {
+                    "expires_at": 4_102_444_800.0, "signature": "warrant"},
+            },
+            "broker_result": {"data": {"order_id": "ord-1"}},
+        },
+    })
+    hub = EnvelopeHub({
+        "get_accounts": {"accounts": [{"account_number": "463605220"}]},
+        "get_equity_orders": {"orders": [ORDER]},
+        "get_equity_positions": {"positions": [
+            {"symbol": "NVDA", "quantity": "60"}]},
+    })
+    client = Client()
+
+    await FillsReporter(state, hub, client).sweep()
+
+    from nakagai_edge.edge.remote import intents
+    from nakagai_edge.edge.supervision import load
+    assert intents(state) == {}
+    assert load(state)["approval-1"]["state"] == "armed"
+    assert client.outcomes[0][0] == "candidate-1"
+    assert client.outcomes[0][1]["mechanical_status"] == "submitted"
+
+
+async def test_fill_sweep_queries_declared_terminal_states_for_submitted_order(
+        tmp_path):
+    state = _state(tmp_path, [ROBINHOOD_CONNECTOR])
+    state._write_private(state.intents_path, {
+        "approval-1": {
+            "connector_id": "robinhood-trading",
+            "tool": "place_equity_order",
+            "args": {
+                "account_number": "463605220", "symbol": "NVDA",
+                "side": "buy", "type": "limit", "quantity": "60",
+                "limit_price": "112.35", "stop_price": "109.50",
+                "time_in_force": "day",
+            },
+            "args_hash": "frozen", "candidate_id": "candidate-1",
+            "account": "463605220", "phase": "submitted",
+            "broker_order_id": "ord-1", "approval": {},
+            "broker_result": {"data": {"order_id": "ord-1"}},
+        },
+    })
+
+    class TerminalHub(EnvelopeHub):
+        async def call(self, connector_id, tool, args, **kw):
+            self.calls.append((connector_id, tool, dict(args)))
+            if tool == "get_accounts":
+                out = {"accounts": [{"account_number": "463605220"}]}
+            elif args.get("state") == "cancelled":
+                out = {"orders": [{
+                    "id": "ord-1", "symbol": "NVDA", "side": "buy",
+                    "quantity": "60", "state": "cancelled",
+                }]}
+            else:
+                out = {"orders": []}
+            return {"data": {"data": out, "guide": "ignore me"}}
+
+    hub = TerminalHub({})
+    client = Client()
+
+    await FillsReporter(state, hub, client).sweep()
+
+    from nakagai_edge.edge.remote import intents
+    assert intents(state) == {}
+    assert client.outcomes[0][1]["mechanical_status"] == "blocked"
+    queried = [args.get("state") for _connector, tool, args in hub.calls
+               if tool == "get_equity_orders"]
+    assert queried == ["filled", "cancelled"]
 
 
 async def test_only_what_appears_after_the_anchor_is_journaled(tmp_path):

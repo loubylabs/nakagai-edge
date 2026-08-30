@@ -115,10 +115,7 @@ def load(state: EdgeState) -> dict:
 
 
 def save(state: EdgeState, doc: dict) -> None:
-    state.supervised_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = state.supervised_path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(doc, indent=2, default=str))
-    tmp.replace(state.supervised_path)
+    state._write_private(state.supervised_path, doc)
 
 
 def record(state: EdgeState, rec: dict) -> None:
@@ -240,6 +237,11 @@ def _accounts(portfolio_doc: dict):
         cid = entry.get("id", "")
         for account in entry.get("accounts") or []:
             if account.get("error"):
+                continue
+            if account.get("status", "ok") != "ok":
+                # A non-ok source has not authoritatively said that its empty
+                # positions list is flat. Releasing a brake record on it would
+                # turn unreadable broker evidence into a live unguarded book.
                 continue
             number = str(account.get("account_number", ""))
             if not number:

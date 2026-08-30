@@ -77,3 +77,15 @@ def test_new_file_records_require_nonempty_account_key(tmp_path, account_key: st
 
     with pytest.raises(ValueError, match="account_key"):
         queue.enqueue(account_key, "broker", "place_order", {}, ttl_s=60)
+
+
+def test_candidate_id_survives_file_approval_persistence(tmp_path) -> None:
+    path = tmp_path / "approvals.jsonl"
+    queue = ApprovalQueue(path)
+    created = queue.enqueue("account-a", "broker", "place_order", {"qty": 1},
+                            ttl_s=60, candidate_id="candidate-1")
+
+    loaded = ApprovalQueue(path).get("account-a", created.id)
+
+    assert loaded is not None
+    assert loaded.candidate_id == "candidate-1"

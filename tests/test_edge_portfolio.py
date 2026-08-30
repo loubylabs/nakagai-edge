@@ -18,7 +18,8 @@ from nakagai_edge.config import ConnectorSpec, load_specs
 from nakagai_edge.edge.client import PlatformClient
 from nakagai_edge.edge.portfolio import (
     PORTFOLIO_INTERVAL_S, REFRESH_MIN_INTERVAL_S, PortfolioReporter,
-    broker_specs, connector_snapshot, mark_guarded, tiered_accounts)
+    balance_evidence, broker_specs, connector_snapshot, mark_guarded,
+    tiered_accounts)
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.supervision import record
 from tests.fixtures.alien_registry import ALIEN_CONNECTOR, ROBINHOOD_CONNECTOR
@@ -54,6 +55,7 @@ ACCOUNTS = {"accounts": [
 LISTED = [{"account": "5QU41901", "type": "margin"},
           {"account": "463605220", "type": "cash", "nickname": "Agentic"}]
 PORTFOLIO = {"total_value": "1000", "cash": "1000", "currency": "USD",
+             "day_pnl": "-12.50",
              "buying_power": {"buying_power": "1000.0000"}}
 POSITIONS = {"positions": [{"symbol": "SPY", "quantity": "10",
                             "average_buy_price": "500.00", "type": "equity"}]}
@@ -102,8 +104,11 @@ def _hub_ok():
         ("get_accounts", ""): ACCOUNTS,
         ("get_portfolio", "463605220"): PORTFOLIO,
         ("get_equity_positions", "463605220"): POSITIONS,
-        ("get_portfolio", "5QU41901"): {"total_value": "2500", "cash": "100"},
+        ("get_equity_orders", "463605220"): {"orders": []},
+        ("get_portfolio", "5QU41901"): {"total_value": "2500", "cash": "100",
+                                           "day_pnl": "25"},
         ("get_equity_positions", "5QU41901"): {"positions": []},
+        ("get_equity_orders", "5QU41901"): {"orders": []},
     })
 
 
@@ -144,6 +149,108 @@ async def test_connector_snapshot_carries_totals_positions_and_tiers():
     assert margin["positions"] == []
 
 
+async def test_snapshot_reports_authoritative_exposure_with_observation_time(
+        monkeypatch):
+    """A future adapter must be able to trust the empty arrays only because
+    the source says `ok`, and must receive the time the edge observed them."""
+    monkeypatch.setattr("nakagai_edge.edge.portfolio.time.time",
+                        lambda: 1_725_000_000.0)
+
+    entry = await connector_snapshot(_hub_ok(), _spec())
+    full, read = entry["accounts"]
+
+    assert entry["status"] == "ok"
+    assert entry["observed_at"] == 1_725_000_000.0
+    assert full["status"] == "ok"
+    assert full["observed_at"] == 1_725_000_000.0
+    assert full["open_orders"] == []
+    assert read["positions"] == [] and read["open_orders"] == []
+
+
+async def test_balance_evidence_keeps_platform_equity_authority_on_checkin():
+    """Task 3 must receive canonical broker numbers but portfolio storage must
+    not gain a second equity authority. Removing either validation makes an
+    unreadable number look ready to relay through `agent_checkin`."""
+    spec = _spec()
+
+    evidence = await balance_evidence(_hub_ok(), spec, "463605220")
+
+    assert evidence == {"status": "ok", "equity": 1000.0, "day_pnl": -12.5}
+
+
+async def test_balance_evidence_refuses_missing_or_nonpositive_numbers():
+    """A missing signed day P&L or zero equity must fail readiness rather than
+    let a caller build an autonomous order around an invented baseline."""
+    spec = _spec()
+    spec.capability("get_balance").fields["day_pnl"] = ["day_pnl"]
+    hub = _hub_ok()
+    hub.responses[("get_portfolio", "463605220")] = {
+        "total_value": "0", "day_pnl": "not-a-number"}
+
+    evidence = await balance_evidence(hub, spec, "463605220")
+
+    assert evidence == {"status": "unreadable", "equity": None,
+                        "day_pnl": None}
+
+
+async def test_an_unknown_position_stays_explicit_in_the_exposure_report():
+    """Removing the unknown marker would let the later risk adapter read a
+    broker-held but unparseable position as no exposure at all."""
+    hub = _alien_hub(holdings={"holdings": [{"ticker": "spy"}]},
+                     orders={"working": []})
+
+    row = (await connector_snapshot(hub, SPECS["alien-broker"])
+           )["accounts"][0]
+
+    assert row["status"] == "unreadable"
+    assert row["positions"] == [{"ticker": "spy", "symbol": "SPY",
+                                  "unknown": True}]
+
+
+async def test_an_unreadable_positions_payload_is_not_an_authoritative_empty_list():
+    """If the source became `ok`, a malformed broker response would release
+    risk as though the account had answered flat."""
+    hub = _alien_hub(holdings={"holdings": "not-a-list"},
+                     orders={"working": []})
+
+    row = (await connector_snapshot(hub, SPECS["alien-broker"])
+           )["accounts"][0]
+
+    assert row["status"] == "unreadable"
+    assert row["positions"] == [{"unknown": True}]
+    assert row["open_orders"] == []
+
+
+async def test_a_missing_orders_capability_is_reported_as_unsupported_not_empty():
+    """A connector that cannot list orders has not said the account has none."""
+    spec = SPECS["alien-broker"].model_copy(deep=True)
+    del spec.capabilities["list_orders"]
+    spec.capability("get_balance").fields["day_pnl"] = ["day_pnl"]
+    hub = _alien_hub(balances={"net_liq": "100", "day_pnl": "0"},
+                     holdings={"holdings": []})
+
+    row = (await connector_snapshot(hub, spec))["accounts"][0]
+
+    assert row["status"] == "unsupported"
+    assert row["positions"] == []
+    assert row["open_orders"] == []
+
+
+async def test_an_orders_failure_keeps_the_readable_position_as_risk_evidence():
+    """A broad account exception would erase SPY along with the broken orders
+    read, which would understate the account exactly when its broker changed."""
+    hub = _alien_hub(holdings={"holdings": [{"ticker": "spy", "qty": "4"}]},
+                     orders=RuntimeError("orders down"))
+
+    row = (await connector_snapshot(hub, SPECS["alien-broker"])
+           )["accounts"][0]
+
+    assert row["status"] == "unreadable"
+    assert row["positions"] == [{"ticker": "spy", "qty": "4",
+                                  "symbol": "SPY", "quantity": 4.0}]
+    assert row["open_orders"] == [{"unknown": True}]
+
+
 async def test_one_accounts_failure_does_not_blank_its_siblings():
     hub = _hub_ok()
     hub.responses[("get_portfolio", "5QU41901")] = RuntimeError("broker hiccup")
@@ -162,13 +269,39 @@ async def test_a_dead_account_list_degrades_to_a_connector_level_error():
     assert entry["accounts"] == []
 
 
+async def test_a_nonlist_accounts_payload_is_explicit_unknown_connector_evidence():
+    """Changing this to `return []` would declare an unreadable broker
+    response to be an authoritative connector with no accounts."""
+    hub = _alien_hub(accounts_list={"accounts": "not-a-list"})
+
+    entry = await connector_snapshot(hub, _untiered_alien())
+
+    assert entry["status"] == "unreadable"
+    assert entry["accounts"][0]["unknown"] is True
+    assert entry["accounts"][0]["error"]
+
+
+async def test_a_malformed_account_row_stays_alongside_readable_accounts():
+    """Dropping the scalar row would allow the valid sibling to make the
+    connector look fully readable even though the broker response was not."""
+    hub = _alien_hub(accounts_list={"accounts": [
+        {"acct": "AL-1", "label": "Main"}, "unreadable-account"]})
+
+    entry = await connector_snapshot(hub, _untiered_alien())
+
+    assert entry["status"] == "unreadable"
+    assert entry["accounts"][0]["account_number"] == "AL-1"
+    assert entry["accounts"][1]["unknown"] is True
+
+
 def _alien_hub(**over):
     responses = {
         "accounts_list": {"accounts": [{"acct": "AL-1", "label": "Main",
                                         "kind": "margin"}]},
         "balances": {"net_liq": "104238.55"},
         "holdings": {"holdings": [{"ticker": "aapl", "qty": "25",
-                                   "cost": "187.20"}]}}
+                                   "cost": "187.20"}]},
+        "orders": {"working": []}}
     responses.update(over)
     return FlatHub(responses)
 
@@ -176,7 +309,8 @@ def _alien_hub(**over):
 async def test_snapshot_dials_the_alien_brokers_own_tool_names():
     hub = _alien_hub()
     entry = await connector_snapshot(hub, SPECS["alien-broker"])
-    assert [c[1] for c in hub.calls] == ["accounts_list", "balances", "holdings"]
+    assert [c[1] for c in hub.calls] == ["accounts_list", "balances", "holdings",
+                                         "orders"]
     assert entry["accounts"][0]["account_number"] == "AL-1"
     assert entry["accounts"][0]["nickname"] == "Main"
 
@@ -263,7 +397,8 @@ async def test_an_account_whose_identifier_will_not_read_stays_visible():
     assert main["account_number"] == "AL-1" and main["error"] == ""
     # The ghost is never dialed. There is nothing to ask about, and a made-up
     # identifier would be asking about somebody else's account.
-    assert [c[1] for c in hub.calls] == ["accounts_list", "balances", "holdings"]
+    assert [c[1] for c in hub.calls] == ["accounts_list", "balances", "holdings",
+                                         "orders"]
 
 
 async def test_the_tiered_path_is_unaffected_by_an_unreadable_account():
@@ -280,7 +415,7 @@ async def test_the_tiered_path_is_unaffected_by_an_unreadable_account():
     assert entry["accounts"][0]["error"] == ""
 
 
-async def test_a_balance_payload_missing_the_mapped_root_is_no_figures():
+async def test_a_balance_payload_missing_the_mapped_root_is_unreadable():
     """The map says Robinhood's figures live under `data`. A payload without
     that node is not the shape the map describes, so the account reports no
     figures rather than handing the web whatever else the envelope held. Blank
@@ -289,13 +424,42 @@ async def test_a_balance_payload_missing_the_mapped_root_is_no_figures():
     hub = FlatHub({
         "get_accounts": {"data": {"accounts": [{"account_number": "463605220"}]}},
         "get_portfolio": {"guide": "the figures are elsewhere today"},
-        "get_equity_positions": {"data": {"positions": []}}})
+        "get_equity_positions": {"data": {"positions": []}},
+        "get_equity_orders": {"data": {"orders": []}}})
     spec = _spec(guardrails={"tools": {"allow": ["get_*"]},
                              "read_only_tools": ["get_*"]})
     row = (await connector_snapshot(hub, spec))["accounts"][0]
     assert row["account_number"] == "463605220"
     assert row["portfolio"] == {}
-    assert row["error"] == ""
+    assert row["status"] == "unreadable"
+    assert "get_balance unreadable" in row["error"]
+    assert row["positions"] == [] and row["open_orders"] == []
+
+
+async def test_a_declared_but_unresolvable_balance_capability_is_unreadable():
+    """Only an absent capability is unsupported. A declared map that cannot
+    resolve its account argument is malformed broker evidence."""
+    spec = _spec()
+    del spec.capability("get_balance").args["account"]
+
+    row = (await connector_snapshot(_hub_ok(), spec))["accounts"][0]
+
+    assert row["status"] == "unreadable"
+    assert "get_balance unreadable" in row["error"]
+    assert row["positions"][0]["symbol"] == "SPY"
+    assert row["open_orders"] == []
+
+
+async def test_an_absent_balance_capability_is_unsupported():
+    """Removing the capability is the one condition that labels its source
+    unsupported instead of obscuring an attempted but unreadable broker read."""
+    spec = _spec()
+    del spec.capabilities["get_balance"]
+
+    row = (await connector_snapshot(_hub_ok(), spec))["accounts"][0]
+
+    assert row["status"] == "unsupported"
+    assert "get_balance unsupported" in row["error"]
 
 
 # ---- the guarded marker ---------------------------------------------------
@@ -446,6 +610,28 @@ async def test_two_pokes_inside_the_window_are_one_broker_sweep(tmp_path):
     second = await reporter.snapshot_and_push()
     assert len(hub.calls) == calls_after_first   # no second sweep
     assert second == first                        # the fresh-enough snapshot back
+
+
+async def test_forced_snapshot_bypasses_the_agent_refresh_cache(tmp_path):
+    hub = _hub_ok()
+    reporter = _reporter(tmp_path, hub,
+                         lambda r: httpx.Response(200, json={"ok": True}))
+    await reporter.snapshot_and_push()
+    calls_after_first = len(hub.calls)
+
+    await reporter.snapshot_and_push(force=True, require_ack=True)
+
+    assert len(hub.calls) > calls_after_first
+
+
+async def test_required_portfolio_ack_does_not_swallow_report_failure(tmp_path):
+    reporter = _reporter(
+        tmp_path, _hub_ok(),
+        lambda r: httpx.Response(503, json={"detail": "down"}),
+    )
+
+    with pytest.raises(Exception, match="503"):
+        await reporter.snapshot_and_push(force=True, require_ack=True)
 
 
 async def test_a_down_platform_does_not_lose_the_snapshot(tmp_path):

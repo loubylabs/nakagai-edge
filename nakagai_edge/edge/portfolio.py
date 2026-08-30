@@ -13,17 +13,48 @@ never does arithmetic on them.
 
 import asyncio
 import logging
+import math
 import time
 from pathlib import Path
 
 import yaml
 
-from nakagai_edge.capability import first, read_partial, resolve
+from nakagai_edge.capability import CapabilityError, first, read_partial, resolve
 
 PORTFOLIO_INTERVAL_S = 300      # the timer loop's cadence
 REFRESH_MIN_INTERVAL_S = 15     # a poke inside this window is not a sweep
 
 log = logging.getLogger("nakagai.edge")
+
+def _status(*statuses: str) -> str:
+    """One conservative status for a connector or account read.
+
+    An unreadable source dominates an unsupported one: both block autonomous
+    entry, but unreadable says the edge attempted a read and cannot describe
+    what the broker holds. Empty arrays are authoritative only under `ok`.
+    """
+    if "unreadable" in statuses:
+        return "unreadable"
+    if "unsupported" in statuses:
+        return "unsupported"
+    return "ok"
+
+
+def _error(label: str, error: Exception | str) -> str:
+    detail = str(error)
+    return f"{label}: {detail}" if detail else label
+
+
+def _finite(value, *, positive: bool = False) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or (positive and number <= 0):
+        return None
+    return number
 
 
 def broker_specs(root) -> list:
@@ -49,15 +80,17 @@ def tiered_accounts(spec, listed: list[dict]) -> list[tuple[dict, str]]:
     configured account the broker did not list is still tried, so its refusal
     surfaces as that account's error instead of a silent hole.
     """
+    unknown = [a for a in listed if a.get("unknown") is True]
+    readable = [a for a in listed if a.get("unknown") is not True]
     g = spec.guardrails.accounts
     if not g.allow and not g.read:
-        return [(a, "full") for a in listed]
-    by_number = {str(a.get("account", "")): a for a in listed}
+        return [(a, "full") for a in readable + unknown]
+    by_number = {str(a.get("account", "")): a for a in readable}
     pairs = []
     for tier, numbers in (("full", g.allow), ("read", g.read)):
         for num in numbers:
             pairs.append((by_number.get(num, {"account": num}), tier))
-    return pairs
+    return pairs + [(a, "full") for a in unknown]
 
 
 async def connector_snapshot(hub, spec) -> dict:
@@ -70,7 +103,9 @@ async def connector_snapshot(hub, spec) -> dict:
     web's contract, so `account_number`, `nickname` and `type` keep their
     spelling here while their values now arrive through `list_accounts`.
     """
-    entry: dict = {"id": spec.id, "error": "", "accounts": []}
+    observed_at = time.time()
+    entry: dict = {"id": spec.id, "status": "ok", "observed_at": observed_at,
+                   "error": "", "accounts": []}
     try:
         listed = await listed_accounts(hub, spec)
     except Exception as e:  # noqa: BLE001 (per-connector degradation, by design)
@@ -78,31 +113,64 @@ async def connector_snapshot(hub, spec) -> dict:
         # list_accounts says so in its own entry and contributes no accounts,
         # rather than taking the other brokers' sweep down with it.
         entry["error"] = f"{type(e).__name__}: {e}"
+        entry["status"] = ("unsupported" if isinstance(e, CapabilityError)
+                           else "unreadable")
         return entry
     for account, tier in tiered_accounts(spec, listed):
         num = str(account.get("account", ""))
-        row = {"account_number": num,
+        row = {"account_number": num, "status": "ok", "observed_at": observed_at,
                "nickname": account.get("nickname") or "",
                "type": account.get("type") or "",
-               "tier": tier, "error": "", "portfolio": {}, "positions": []}
+               "tier": tier, "error": "", "portfolio": {}, "positions": [],
+               "open_orders": []}
         if not num:
             # Listed by the broker, but with nothing readable to name it by.
             # The row is kept and not dialed: there is no identifier to ask
             # about, and inventing one would ask about somebody else's account.
             # Saying so here beats sending the broker a blank account and
             # relaying whatever it makes of that.
-            row["error"] = ("this connector listed an account with no readable "
-                            "identifier, so its balances and positions cannot "
-                            "be fetched")
+            if account.get("unknown") is True:
+                row["unknown"] = True
+                row["error"] = "list_accounts unreadable"
+            else:
+                row["error"] = ("this connector listed an account with no readable "
+                                "identifier, so its balances and positions cannot "
+                                "be fetched")
+            row["status"] = "unreadable"
             entry["accounts"].append(row)
             continue
-        try:
-            row["portfolio"] = await _figures(hub, spec, num)
-            row["positions"] = await _positions(hub, spec, num)
-        except Exception as e:  # noqa: BLE001 (per-account degradation, by design)
-            row["error"] = f"{type(e).__name__}: {e}"
+        errors = []
+        if "get_balance" not in spec.capabilities:
+            row["status"] = _status(row["status"], "unsupported")
+            errors.append("get_balance unsupported")
+        else:
+            try:
+                row["portfolio"] = await _figures(hub, spec, num)
+            except Exception as e:  # noqa: BLE001 (per-account degradation, by design)
+                row["status"] = _status(row["status"], "unreadable")
+                errors.append(_error("get_balance unreadable", e))
+        position_status, positions, position_error = await position_rows(hub, spec, num)
+        order_status, orders, order_error = await _open_orders(hub, spec, num)
+        row["positions"], row["open_orders"] = positions, orders
+        row["status"] = _status(row["status"], position_status, order_status)
+        errors.extend(e for e in (position_error, order_error) if e)
+        row["error"] = "; ".join(errors)
         entry["accounts"].append(row)
+    entry["status"] = _status(*(a["status"] for a in entry["accounts"]))
     return entry
+
+
+def account_snapshot_readable(
+        doc: dict, connector_id: str, account: str) -> bool:
+    """Whether one freshly assembled portfolio account is authoritative."""
+    for connector in doc.get("connectors") or []:
+        if connector.get("id") != connector_id or connector.get("status") != "ok":
+            continue
+        for row in connector.get("accounts") or []:
+            if (str(row.get("account_number") or "") == account
+                    and row.get("status") == "ok"):
+                return True
+    return False
 
 
 async def listed_accounts(hub, spec) -> list[dict]:
@@ -127,9 +195,14 @@ async def listed_accounts(hub, spec) -> list[dict]:
     )).get("data")
     rows = first(payload, cap.items) if cap.items else payload
     if not isinstance(rows, list):
-        return []
-    return [read_partial("list_accounts", cap, row)
-            for row in rows if isinstance(row, dict)]
+        return [{"unknown": True}]
+    out = []
+    for row in rows:
+        if not isinstance(row, dict):
+            out.append({"unknown": True})
+            continue
+        out.append(read_partial("list_accounts", cap, row))
+    return out
 
 
 async def _figures(hub, spec, account: str) -> dict:
@@ -159,10 +232,44 @@ async def _figures(hub, spec, account: str) -> dict:
         spec.id, tool, args, account_key=hub.account_key
     )).get("data")
     figures = first(payload, cap.items) if cap.items else payload
-    return figures if isinstance(figures, dict) else {}
+    if not isinstance(figures, dict):
+        raise ValueError("get_balance response is not the mapped object")
+    return figures
 
 
-async def _positions(hub, spec, account: str) -> list:
+async def balance_evidence(hub, spec, account: str) -> dict:
+    """Canonical broker equity and signed day P&L for the existing check-in.
+
+    This helper is deliberately separate from the display snapshot. Task 3
+    calls it immediately before candidate acceptance and relays its two values
+    through `agent_checkin`, preserving that endpoint as the platform's one
+    equity authority. `ok` requires finite positive equity and finite signed
+    day P&L. A connector that does not declare get_balance is unsupported; a
+    missing map field or unusable broker value is unreadable.
+    """
+    try:
+        cap = spec.capability("get_balance")
+    except CapabilityError:
+        return {"status": "unsupported", "equity": None, "day_pnl": None}
+    try:
+        tool, args = resolve("get_balance", cap, {"account": account})
+        payload = (await hub.call(
+            spec.id, tool, args, account_key=hub.account_key
+        )).get("data")
+        figures = first(payload, cap.items) if cap.items else payload
+    except Exception:  # noqa: BLE001 (the caller needs a bounded readiness fact)
+        return {"status": "unreadable", "equity": None, "day_pnl": None}
+    if not isinstance(figures, dict):
+        return {"status": "unreadable", "equity": None, "day_pnl": None}
+    values = read_partial("get_balance", cap, figures)
+    equity = _finite(values.get("equity"), positive=True)
+    day_pnl = _finite(values.get("day_pnl"))
+    if equity is None or day_pnl is None:
+        return {"status": "unreadable", "equity": None, "day_pnl": None}
+    return {"status": "ok", "equity": equity, "day_pnl": day_pnl}
+
+
+async def position_rows(hub, spec, account: str) -> tuple[str, list, str]:
     """Raw position rows carrying normalized `symbol` and `quantity`.
 
     Both keys deliberately overwrite whatever the broker called them, because
@@ -182,16 +289,53 @@ async def _positions(hub, spec, account: str) -> list:
     live without a stop. That is exactly the mistake supervision.unreadable()
     exists to prevent.
     """
-    cap = spec.capability("list_positions")
-    tool, args = resolve("list_positions", cap, {"account": account})
-    payload = (await hub.call(
-        spec.id, tool, args, account_key=hub.account_key
-    )).get("data")
+    try:
+        cap = spec.capability("list_positions")
+    except CapabilityError as e:
+        return "unsupported", [], _error("list_positions unsupported", e)
+    try:
+        tool, args = resolve("list_positions", cap, {"account": account})
+        payload = (await hub.call(
+            spec.id, tool, args, account_key=hub.account_key
+        )).get("data")
+    except Exception as e:  # noqa: BLE001 (per-account degradation, by design)
+        return "unreadable", [{"unknown": True}], _error("list_positions unreadable", e)
     rows = first(payload, cap.items) if cap.items else payload
     if not isinstance(rows, list):
-        return []
-    return [{**row, **read_partial("list_positions", cap, row)}
-            for row in rows if isinstance(row, dict)]
+        return "unreadable", [{"unknown": True}], "list_positions unreadable"
+    out, unknown = [], False
+    required = ("symbol", "quantity")
+    for row in rows:
+        if not isinstance(row, dict):
+            out.append({"unknown": True})
+            unknown = True
+            continue
+        normalized = read_partial("list_positions", cap, row)
+        unreadable = any(field not in normalized for field in required)
+        out.append({**row, **normalized, **({"unknown": True} if unreadable else {})})
+        unknown = unknown or unreadable
+    return ("unreadable" if unknown else "ok", out,
+            "list_positions unreadable" if unknown else "")
+
+
+async def _open_orders(hub, spec, account: str) -> tuple[str, list, str]:
+    """Open-order evidence through fills.py's sole connector parser."""
+    # fills.py imports broker discovery from this module, so this stays local
+    # rather than turning two read-only helpers into an import cycle.
+    from nakagai_edge.edge.fills import open_order_rows
+    try:
+        spec.capability("list_orders")
+    except CapabilityError as e:
+        return "unsupported", [], _error("list_orders unsupported", e)
+    try:
+        rows = await open_order_rows(hub, spec, account)
+    except Exception as e:  # noqa: BLE001 (per-account degradation, by design)
+        return "unreadable", [{"unknown": True}], _error("list_orders unreadable", e)
+    if rows is None:
+        return "unreadable", [{"unknown": True}], "list_orders unreadable"
+    if any(row.get("unknown") is True for row in rows):
+        return "unreadable", rows, "list_orders unreadable"
+    return "ok", rows, ""
 
 
 def mark_guarded(state, connectors: list[dict], *, brake_armed: bool = True,
@@ -236,7 +380,8 @@ class PortfolioReporter:
         self._last_doc: dict | None = None
         self._lock = asyncio.Lock()
 
-    async def snapshot_and_push(self) -> dict:
+    async def snapshot_and_push(self, *, force: bool = False,
+                                require_ack: bool = False) -> dict:
         # Imported here, not at module scope: brake.py is the one place the
         # disarm switches actually live, and snapshot_and_push is the one
         # portfolio caller close enough to the loop to read them fresh each
@@ -244,7 +389,7 @@ class PortfolioReporter:
         from nakagai_edge.edge.brake import armed, disarmed_positions
         async with self._lock:
             now = time.time()
-            if (self._last_doc is not None
+            if (not force and self._last_doc is not None
                     and now - self._last_run < REFRESH_MIN_INTERVAL_S):
                 return self._last_doc
             doc = {"connectors": mark_guarded(
@@ -255,9 +400,13 @@ class PortfolioReporter:
             self._last_run = time.time()
             self._last_doc = doc
             try:
-                await asyncio.to_thread(
+                acknowledged = await asyncio.to_thread(
                     self._client.report_portfolio, doc["connectors"])
+                if require_ack and acknowledged.get("ok") is not True:
+                    raise ValueError("platform did not acknowledge fresh portfolio evidence")
             except Exception as e:  # noqa: BLE001 (a down platform must not hurt the edge)
+                if require_ack:
+                    raise
                 log.warning("portfolio snapshot not reported to the platform "
                             "this cycle: %s", e)
             return doc

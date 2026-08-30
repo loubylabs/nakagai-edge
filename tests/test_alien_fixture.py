@@ -38,15 +38,18 @@ def test_the_two_connectors_extract_the_same_positions_from_different_shapes():
 
 
 def test_the_two_connectors_spell_a_buy_differently():
+    order = {"symbol": "AAPL", "side": "buy", "order_type": "limit",
+             "quantity": 1, "limit_price": 190.0, "stop_price": 180.0,
+             "time_in_force": "day", "account": "X"}
     _, alien = resolve("place_order",
                        SPECS["alien-broker"].capability("place_order"),
-                       {"side": "buy"})
+                       order)
     _, rh = resolve("place_order",
                     SPECS["robinhood-trading"].capability("place_order"),
-                    {"side": "buy"})
+                    order)
     # The first alias each connector lists, in the broker's own key.
-    assert alien == {"action": "BUY"}
-    assert rh == {"side": "buy"}
+    assert alien["action"] == "BUY"
+    assert rh["side"] == "buy"
 
 
 def test_the_two_connectors_extract_the_same_orders_from_different_shapes():

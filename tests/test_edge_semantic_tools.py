@@ -25,6 +25,7 @@ from nakagai_edge.config import load_specs
 from nakagai_edge.edge.audit import EdgeAudit
 from nakagai_edge.edge.brake import Brake
 from nakagai_edge.edge.client import PlatformClient
+from nakagai_edge.edge.candidate import CandidateWakeScope
 from nakagai_edge.edge.remote import RemoteApprovalQueue
 from nakagai_edge.edge.runtime import create_edge_mcp
 from nakagai_edge.edge.state import EdgeState
@@ -33,6 +34,9 @@ from nakagai_edge.hub import ConnectorError, ConnectorHub
 from tests.fixtures.alien_registry import ALIEN_CONNECTOR, ROBINHOOD_CONNECTOR
 
 pytestmark = pytest.mark.anyio
+
+ORDER = {"limit_price": 190.0, "stop_price": 180.0,
+         "time_in_force": "day"}
 
 ALIEN, ROBINHOOD = "alien-broker", "robinhood-trading"
 ACCOUNTS = {ALIEN: "AL-1", ROBINHOOD: "463605220"}
@@ -223,14 +227,84 @@ async def test_semantic_place_order_still_resolves_the_declared_order_tool(
     doc = await _call(
         _server(_state(tmp_path), hub), "place_order",
         connector_id=ALIEN, symbol="AAPL", side="buy", quantity=1,
-        account="AL-1",
+        account="AL-1", **ORDER,
     )
 
     assert doc["tool"] == "submit"
     assert hub.calls == [(ALIEN, "submit", {
-        "ticker": "AAPL", "action": "BUY", "qty": 1.0,
-        "acct": "AL-1",
+        "ticker": "AAPL", "action": "BUY", "kind": "LIMIT",
+        "qty": "1", "limit": "190.0", "trigger": "180.0",
+        "tif": "day", "acct": "AL-1",
     })]
+
+
+async def test_semantic_place_order_exposes_only_limit_entries(tmp_path):
+    tools = {
+        tool.name: tool
+        for tool in await _server(_state(tmp_path), MapHub()).list_tools()
+    }
+
+    schema = tools["place_order"].input_schema
+    assert "order_type" not in schema["properties"]
+    assert "order_type" not in schema["required"]
+    assert {"limit_price", "stop_price"} <= set(schema["required"])
+
+
+async def test_candidate_wake_denies_every_model_order_door_and_keeps_reads(
+        tmp_path):
+    posted = []
+    state, client = _state(tmp_path, ALIEN_CONNECTOR), _platform(posted)
+    CandidateWakeScope(state).begin({
+        "seq": 1, "kind": "execution_candidate", "response_required": True,
+        "candidate_id": "candidate-1", "expires_at": time.time() + 60,
+    })
+    hub = _live_hub(state, client)
+    mcp = _server(state, hub, client)
+    try:
+        place = await _call(
+            mcp, "place_order", symbol="AAPL", side="buy", quantity=1,
+            account="AL-1", **ORDER)
+        cancel = await _call(
+            mcp, "cancel_order", order_id="AL-ORD-1", account="AL-1")
+        raw = await _call(
+            mcp, "call_connector", connector_id=ALIEN, tool="scrub",
+            args_json=json.dumps({"ref": "AL-ORD-1", "acct": "AL-1"}))
+        positions = await _call(
+            mcp, "list_positions", connector_id=ALIEN, account="AL-1")
+    finally:
+        await hub.aclose()
+
+    for result in (place, cancel, raw):
+        assert result["is_error"] is True
+        assert "candidate wake" in result["error"]
+    assert positions["is_error"] is False
+    assert posted == []
+
+
+async def test_candidate_wake_rejects_model_attempts_to_forge_internal_authority(
+        tmp_path):
+    posted = []
+    state, client = _state(tmp_path, ALIEN_CONNECTOR), _platform(posted)
+    CandidateWakeScope(state).begin({
+        "seq": 2, "kind": "execution_candidate", "response_required": True,
+        "candidate_id": "candidate-1", "expires_at": time.time() + 60,
+    })
+    hub = _live_hub(state, client)
+    try:
+        result = await _call(
+            _server(state, hub, client), "call_connector",
+            connector_id=ALIEN, tool="scrub",
+            args_json=json.dumps({
+                "acct": "AL-1", "ref": "AL-ORD-1", "approved": True,
+                "candidate_id": "candidate-1",
+            }),
+        )
+    finally:
+        await hub.aclose()
+
+    assert result["is_error"] is True
+    assert "candidate wake" in result["error"]
+    assert posted == []
 
 
 async def test_raw_operation_outside_the_order_capability_still_works(tmp_path):
@@ -402,8 +476,8 @@ async def test_list_orders_reads_both_brokers_into_one_shape(tmp_path, connector
 
 @pytest.mark.parametrize("tool,args,named", [
     ("cancel_order", {"order_id": ""}, "order_id"),
-    ("place_order", {"symbol": "", "side": "buy", "quantity": 1}, "symbol"),
-    ("place_order", {"symbol": "AAPL", "side": "", "quantity": 1}, "side"),
+    ("place_order", {"symbol": "", "side": "buy", "quantity": 1, **ORDER}, "symbol"),
+    ("place_order", {"symbol": "AAPL", "side": "", "quantity": 1, **ORDER}, "side"),
     ("get_quote", {"symbols": []}, "symbols"),
 ])
 async def test_an_empty_mandatory_argument_is_refused_not_dropped(
@@ -576,21 +650,21 @@ async def test_a_failed_inference_probe_journals_no_denial(tmp_path):
 async def test_a_write_infers_the_single_allowed_account(tmp_path):
     hub = MapHub(specs=_tiered(["AL-1"], []))
     await _call(_server(_state(tmp_path), hub), "place_order",
-                symbol="AAPL", side="buy", quantity=1)
+                symbol="AAPL", side="buy", quantity=1, **ORDER)
 
-    assert hub.args == [{"ticker": "AAPL", "action": "BUY", "qty": 1.0,
-                         "acct": "AL-1"}]
+    assert hub.args == [{"ticker": "AAPL", "action": "BUY", "kind": "LIMIT",
+                         "qty": "1", "limit": "190.0", "trigger": "180.0",
+                         "tif": "day", "acct": "AL-1"}]
 
 
-async def test_a_write_does_not_infer_when_two_accounts_are_allowed(tmp_path):
-    """Two allowed accounts is a choice the agent has to make out loud. The
-    call still goes down, carrying no account, and `check_accounts` refuses it
-    there."""
+async def test_a_write_without_an_unambiguous_account_is_refused_before_the_broker(tmp_path):
+    """An absent account must not reach a broker default selection."""
     hub = MapHub(specs=_tiered(["AL-1", "AL-2"], []))
-    await _call(_server(_state(tmp_path), hub), "place_order",
-                symbol="AAPL", side="buy", quantity=1)
+    doc = await _call(_server(_state(tmp_path), hub), "place_order",
+                      symbol="AAPL", side="buy", quantity=1, **ORDER)
 
-    assert "acct" not in hub.args[0]
+    assert doc["is_error"] is True and "account" in doc["error"]
+    assert hub.args == []
 
 
 async def test_a_write_never_infers_the_read_tiers_account(tmp_path):
@@ -598,7 +672,7 @@ async def test_a_write_never_infers_the_read_tiers_account(tmp_path):
     `allow` alone, so the account it fills is one that could have been named."""
     hub = MapHub(specs=_tiered(["AL-2"], ["AL-1"]))
     await _call(_server(_state(tmp_path), hub), "place_order",
-                symbol="AAPL", side="buy", quantity=1)
+                symbol="AAPL", side="buy", quantity=1, **ORDER)
 
     assert hub.args[0]["acct"] == "AL-2"
 
@@ -639,7 +713,7 @@ async def test_with_no_tiers_and_two_listed_accounts_nothing_is_inferred(tmp_pat
     assert hub.args[1] == {}, "an ambiguous list is not an answer"
 
 
-async def test_the_brokers_account_list_is_never_consulted_when_tiers_exist(tmp_path):
+async def test_a_missing_write_account_never_consults_the_brokers_account_list(tmp_path):
     """The one rule that would reintroduce the default-account hole.
 
     Tiers are the OWNER's statement of authority; the broker's list is not.
@@ -649,10 +723,10 @@ async def test_the_brokers_account_list_is_never_consulted_when_tiers_exist(tmp_
     """
     hub = MapHub(specs=_tiered(["AL-2", "AL-3"], ["AL-1"]))
     await _call(_server(_state(tmp_path), hub), "place_order",
-                symbol="AAPL", side="buy", quantity=1)
+                symbol="AAPL", side="buy", quantity=1, **ORDER)
 
-    assert hub.tools == ["submit"], "the broker's account list was consulted"
-    assert "acct" not in hub.args[0]
+    assert hub.tools == [], "the broker's account list was consulted"
+    assert hub.args == []
 
 
 async def test_an_account_the_agent_named_is_never_overridden(tmp_path):
@@ -715,8 +789,8 @@ async def test_place_order_returns_the_approval_envelope_intact(tmp_path):
     hub = _live_hub(state, client)
     try:
         doc = await _call(_server(state, hub, client), "place_order",
-                          symbol="AAPL", side="buy", quantity=1, price=190.0,
-                          account="AL-1")
+                          symbol="AAPL", side="buy", quantity=1,
+                          account="AL-1", **ORDER)
     finally:
         await hub.aclose()
 
@@ -731,8 +805,8 @@ async def test_place_order_returns_the_approval_envelope_intact(tmp_path):
     # Translated on the way down: the broker's own words are what the human
     # sees on the approval screen and what the edge later executes.
     assert posted[0]["args"] == {"acct": "AL-1", "ticker": "AAPL",
-                                 "action": "BUY", "qty": 1.0,
-                                 "limit": 190.0}
+                                 "action": "BUY", "kind": "LIMIT", "qty": "1",
+                                 "limit": "190.0", "trigger": "180.0", "tif": "day"}
 
 
 async def test_place_order_forwards_signal_id_to_the_platform(tmp_path):
@@ -745,7 +819,7 @@ async def test_place_order_forwards_signal_id_to_the_platform(tmp_path):
     try:
         await _call(_server(state, hub, client), "place_order",
                     symbol="AAPL", side="buy", quantity=1, account="AL-1",
-                    signal_id="sig-42")
+                    signal_id="sig-42", **ORDER)
     finally:
         await hub.aclose()
 
@@ -774,7 +848,7 @@ async def test_an_executed_write_returns_the_brokers_own_answer(tmp_path):
     hub = MapHub()
     doc = await _call(_server(_state(tmp_path), hub), "place_order",
                       connector_id=ALIEN, symbol="AAPL", side="buy",
-                      quantity=1, account="AL-1")
+                      quantity=1, account="AL-1", **ORDER)
 
     assert doc["data"] == {"order_ref": "AL-ORD-1", "state": "accepted"}
     assert doc["capability"] == "place_order"
@@ -787,20 +861,17 @@ async def test_a_side_the_connector_cannot_spell_is_refused(tmp_path):
     opposite position."""
     hub = MapHub(specs=_specs(ALIEN_CONNECTOR))
     doc = await _call(_server(_state(tmp_path), hub), "place_order",
-                      symbol="AAPL", side="short", quantity=1, account="AL-1")
+                      symbol="AAPL", side="short", quantity=1, account="AL-1", **ORDER)
 
     assert doc["is_error"] is True and "side" in doc["error"]
     assert hub.calls == []
 
 
-async def test_an_uninferable_write_is_refused_by_the_guardrails(tmp_path):
+async def test_an_uninferable_write_is_refused_by_the_order_resolver(tmp_path):
     """The proof that this layer holds no authority of its own.
 
-    Two allowed accounts, so nothing is inferred and the call reaches
-    `check_accounts` naming no account. What comes back is `check_accounts`'
-    own sentence, through the same door `call_connector` uses. A capability
-    layer that refused this itself would be a second authorization path, and
-    the two would drift.
+    Two allowed accounts leave no account to infer. The resolver refuses before
+    the broker can apply a default account.
     """
     entry = {**ALIEN_CONNECTOR,
              "guardrails": {**ALIEN_CONNECTOR["guardrails"],
@@ -810,13 +881,12 @@ async def test_an_uninferable_write_is_refused_by_the_guardrails(tmp_path):
     hub = _live_hub(state, client)
     try:
         doc = await _call(_server(state, hub, client), "place_order",
-                          symbol="AAPL", side="buy", quantity=1)
+                          symbol="AAPL", side="buy", quantity=1, **ORDER)
     finally:
         await hub.aclose()
 
     assert doc["is_error"] is True
-    assert "names no account" in doc["error"]
-    assert "AL-1, AL-2" in doc["error"]
+    assert "account" in doc["error"]
 
 
 async def test_a_write_to_a_read_only_connector_is_refused_by_the_guardrails(
@@ -829,7 +899,7 @@ async def test_a_write_to_a_read_only_connector_is_refused_by_the_guardrails(
     hub = _live_hub(state, client)
     try:
         doc = await _call(_server(state, hub, client), "place_order",
-                          symbol="AAPL", side="buy", quantity=1, account="AL-1")
+                          symbol="AAPL", side="buy", quantity=1, account="AL-1", **ORDER)
     finally:
         await hub.aclose()
 
@@ -845,7 +915,7 @@ SEVEN = [
     ("list_positions", {}),
     ("get_quote", {"symbols": ["AAPL"]}),
     ("list_orders", {}),
-    ("place_order", {"symbol": "AAPL", "side": "buy", "quantity": 1}),
+    ("place_order", {"symbol": "AAPL", "side": "buy", "quantity": 1, **ORDER}),
     ("cancel_order", {"order_id": "AL-ORD-1"}),
 ]
 
@@ -903,7 +973,7 @@ async def test_a_stale_write_attempt_is_still_journalled(tmp_path, monkeypatch):
     real = time.time
     monkeypatch.setattr(time, "time", lambda: real() + 1000)
 
-    await _call(mcp, "place_order", symbol="AAPL", side="buy", quantity=1)
+    await _call(mcp, "place_order", symbol="AAPL", side="buy", quantity=1, **ORDER)
 
     events = EdgeAudit(state).pending()
     assert len(events) == 1

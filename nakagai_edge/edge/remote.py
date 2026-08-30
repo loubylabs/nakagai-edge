@@ -3,8 +3,8 @@
 ConnectorHub calls `queue.enqueue(...)` when a guardrail verdict is `approve`;
 here that posts the intent to the platform (where a human sees it) and records
 it locally with its args_hash. The executor later verifies the platform's
-signed artifact against OUR copy of the args, so neither side can substitute
-an order after the human read it."""
+signed artifact against OUR copy of the args, then retains a broker-accepted
+candidate until the fill journal matches its exact order id."""
 
 import json
 import time
@@ -25,13 +25,31 @@ def intents(state: EdgeState) -> dict:
 
 
 def _write_intents(state: EdgeState, doc: dict) -> None:
-    state.intents_path.parent.mkdir(parents=True, exist_ok=True)
-    state.intents_path.write_text(json.dumps(doc, indent=2))
+    state._write_private(state.intents_path, doc)
 
 
 def drop_intent(state: EdgeState, approval_id: str) -> None:
     doc = intents(state)
     doc.pop(approval_id, None)
+    _write_intents(state, doc)
+
+
+def mark_submitted(
+        state: EdgeState, approval_id: str, *, order_id: str,
+        approval: dict, result: dict) -> None:
+    """Freeze a broker-accepted intent until its exact order id fills."""
+    doc = intents(state)
+    intent = doc.get(approval_id)
+    if not isinstance(intent, dict):
+        raise ValueError(f"local intent {approval_id!r} disappeared before submission")
+    doc[approval_id] = {
+        **intent,
+        "phase": "submitted",
+        "broker_order_id": order_id,
+        "approval": approval,
+        "broker_result": result,
+        "submitted_at": time.time(),
+    }
     _write_intents(state, doc)
 
 
@@ -51,7 +69,8 @@ class RemoteApprovalQueue:
     def enqueue(self, account_key: str, connector_id: str, tool: str, args: dict, *,
                 ttl_s: int, requested_by: str = "",
                 signal_id: str = "", signal: dict | None = None,
-                notional: float = 0.0) -> Approval:
+                notional: float = 0.0, candidate_id: str = "",
+                intent_account: str = "") -> Approval:
         # Forward `signal_id` to the platform: it is what the platform resolves
         # to a frozen signal + notional and checks against the autopilot
         # envelope. What it decides is the platform's business, and today it
@@ -64,18 +83,20 @@ class RemoteApprovalQueue:
         # does. `signal_id` is also carried onto the local record below so it is
         # honest about what the agent claimed.
         _require_account_key(account_key)
-        out = self.client.enqueue_approval(connector_id, tool, args, signal_id)
+        out = self.client.enqueue_approval(
+            connector_id, tool, args, signal_id, candidate_id)
         doc = intents(self.state)
         doc[out["approval_id"]] = {
             "connector_id": connector_id, "tool": tool, "args": args,
-            "args_hash": args_hash(args), "created_at": time.time()}
+            "args_hash": args_hash(args), "created_at": time.time(),
+            "candidate_id": candidate_id, "account": intent_account}
         _write_intents(self.state, doc)
         return Approval(id=out["approval_id"], account_key=account_key,
                         connector_id=connector_id,
                         tool=tool, args=args, status=out["status"],
                         agent_id=self.agent_id, requested_by=requested_by,
                         created_at=time.time(), expires_at=out["expires_at"],
-                        signal_id=signal_id)
+                        signal_id=signal_id, candidate_id=candidate_id)
 
     def get(self, account_key: str, approval_id: str) -> Approval | None:
         from nakagai_edge.edge.client import EdgeClientError

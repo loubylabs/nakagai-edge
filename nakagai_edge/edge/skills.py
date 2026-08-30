@@ -14,6 +14,17 @@ path that can vanish under its holder.
 from importlib import resources
 
 _PACKAGE = "nakagai_edge.skills"
+SKILL_NAMES = (
+    "candidate-trader",
+    "check-the-evidence",
+    "connect-edge",
+    "daily-brief",
+    "halt",
+    "nakagai-chat",
+    "pair-agent",
+    "verify",
+    "verify-edge",
+)
 
 
 def _root():
@@ -21,10 +32,17 @@ def _root():
 
 
 def list_skills() -> list[str]:
-    """Every packaged skill name, sorted."""
-    return sorted(
+    """Every packaged skill name, with source and wheel contents kept equal."""
+    packaged = {
         entry.name for entry in _root().iterdir()
-        if entry.is_dir() and (entry / "SKILL.md").is_file())
+        if entry.is_dir() and (entry / "SKILL.md").is_file()
+    }
+    expected = set(SKILL_NAMES)
+    if packaged != expected:
+        raise RuntimeError(
+            f"packaged skill inventory drift: missing={sorted(expected - packaged)}, "
+            f"unexpected={sorted(packaged - expected)}")
+    return list(SKILL_NAMES)
 
 
 def read_skill(name: str) -> str:

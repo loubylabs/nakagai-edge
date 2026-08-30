@@ -51,11 +51,17 @@ ALIEN_CONNECTOR = {
         # model the practice rather than the trap.
         "place_order": {
             "tool": "submit",
-            "args": {"symbol": "ticker", "side": "action", "quantity": "qty",
-                     "price": "limit", "stop": "trigger", "account": "acct"},
+            "args": {"symbol": "ticker", "side": "action", "order_type": "kind",
+                     "quantity": "qty", "limit_price": "limit",
+                     "stop_price": "trigger", "time_in_force": "tif",
+                     "account": "acct"},
+            "outbound_types": {"symbol": "string", "side": "string",
+                               "order_type": "string", "quantity": "string",
+                               "limit_price": "string", "stop_price": "string",
+                               "time_in_force": "string", "account": "string"},
             "values": {"side": {"buy": ["BUY", "BUY_TO_OPEN", "BUY_TO_COVER"],
-                                "sell": ["SELL", "SELL_TO_CLOSE", "SELL_SHORT"]}},
-            "market_args": {"kind": "MARKET"}},
+                                "sell": ["SELL", "SELL_TO_CLOSE", "SELL_SHORT"]},
+                       "order_type": {"limit": ["LIMIT"], "market": ["MARKET"]}}},
         "list_orders": {
             "tool": "orders",
             "args": {"account": "acct", "status": "state"},
@@ -101,7 +107,8 @@ ROBINHOOD_CONNECTOR = {
                        "cash": ["cash"],
                        "buying_power": ["buying_power.buying_power",
                                         "buying_power"],
-                       "currency": ["currency"]}},
+                       "currency": ["currency"],
+                       "day_pnl": ["day_pnl"]}},
         "list_positions": {
             "tool": "get_equity_positions",
             "args": {"account": "account_number"},
@@ -116,12 +123,19 @@ ROBINHOOD_CONNECTOR = {
                        "price": ["last_trade_price", "mark_price"]}},
         "place_order": {
             "tool": "place_equity_order",
-            "args": {"symbol": "symbol", "side": "side", "quantity": "quantity",
-                     "price": "limit_price", "stop": "stop_price",
+            "args": {"symbol": "symbol", "side": "side", "order_type": "type",
+                     "quantity": "quantity", "limit_price": "limit_price",
+                     "stop_price": "stop_price", "time_in_force": "time_in_force",
                      "account": "account_number"},
+            "outbound_types": {"symbol": "string", "side": "string",
+                               "order_type": "string", "quantity": "string",
+                               "limit_price": "string", "stop_price": "string",
+                               "time_in_force": "string", "account": "string"},
             "values": {"side": {"buy": ["buy", "buy_to_open", "buy_to_cover"],
-                                "sell": ["sell", "sell_to_open", "sell_short"]}},
-            "market_args": {"type": "market", "time_in_force": "gfd"}},
+                                "sell": ["sell", "sell_to_open", "sell_short"]},
+                       "order_type": {"limit": ["limit"], "market": ["market"]}},
+            "fields": {"order_id": ["order_id"],
+                       "fill_price": ["average_price"]}},
         # The broker that declares everything the fill journal can use: both
         # enrichment fields, and a word for `filled` so the sweep can ask for
         # filled orders instead of taking the default. The alien fixture above
@@ -154,7 +168,9 @@ ROBINHOOD_CONNECTOR = {
                        "filled_at": ["last_transaction_at"]},
             "values": {"side": {"buy": ["buy", "buy_to_open", "buy_to_cover"],
                                 "sell": ["sell", "sell_to_open", "sell_short"]},
-                       "status": {"filled": ["filled"]}}},
+                       "status": {"filled": ["filled"],
+                                  "cancelled": ["cancelled"],
+                                  "rejected": ["rejected"]}}},
         "cancel_order": {
             "tool": "cancel_order",
             "args": {"order_id": "order_id", "account": "account_number"}},

@@ -11,11 +11,15 @@ pytest.importorskip("cryptography")
 
 from nakagai_edge.edge.audit import EdgeAudit
 from nakagai_edge.edge.client import PlatformClient
-from nakagai_edge.edge.executor import poll_once
+from nakagai_edge.edge.candidate import candidate_entries_armed
+from nakagai_edge.edge.executor import poll_once, reconcile_submitted_fills
 from nakagai_edge.edge.remote import RemoteApprovalQueue, intents
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.sync import BUNDLE_SCHEMA, apply_bundle
+from nakagai_edge.edge.supervision import load as load_supervision
+from nakagai_edge.config import load_specs
 from nakagai_edge.signing import build_payload, generate_keypair, sign_artifact
+from tests.fixtures.alien_registry import ROBINHOOD_CONNECTOR
 
 pytestmark = pytest.mark.anyio
 
@@ -27,6 +31,11 @@ def anyio_backend():
 
 PRIV, PUB = generate_keypair()
 ARGS = {"account_number": "463605220", "qty": 1}
+CANDIDATE_ARGS = {
+    "account_number": "463605220", "symbol": "AAPL", "side": "buy",
+    "type": "limit", "quantity": "3", "limit_price": "211.25",
+    "stop_price": "207.0", "time_in_force": "day",
+}
 
 
 def _bundle():
@@ -36,11 +45,16 @@ def _bundle():
             "signing_public_key": PUB}
 
 
-def _artifact(approval_id, *, args=ARGS, agent_id="ag1", expires_in=900):
-    return sign_artifact(PRIV, build_payload(
+def _artifact(approval_id, *, args=ARGS, agent_id="ag1", expires_in=900,
+              candidate_id="", account=""):
+    payload = build_payload(
         approval_id=approval_id, agent_id=agent_id, connector_id="demo",
         tool="place_order", args=args,
-        account_arg_names=["account_number"], ttl_s=expires_in))
+        account_arg_names=["account_number"], ttl_s=expires_in,
+        candidate_id=candidate_id)
+    if account:
+        payload["account"] = account
+    return sign_artifact(PRIV, payload)
 
 
 class FakeHub:
@@ -54,11 +68,11 @@ class FakeHub:
 
 
 def _setup(tmp_path, grant_status="granted", artifact=None,
-           broken_execution=False):
+           broken_execution=False, record_overrides=None):
     state = EdgeState(tmp_path)
     state.save_agent("https://api.test", "ag1", "nk_agent_t")
     apply_bundle(state, _bundle(), "v1")
-    reports = []
+    reports, outcomes, alerts = [], [], []
 
     def handler(req):
         if req.url.path == "/api/agent/approvals" and req.method == "POST":
@@ -66,15 +80,22 @@ def _setup(tmp_path, grant_status="granted", artifact=None,
                                              "status": "pending",
                                              "expires_at": time.time() + 900})
         if req.url.path == "/api/agent/approvals/a1" and req.method == "GET":
-            return httpx.Response(200, json={
+            return httpx.Response(200, json={**{
                 "id": "a1", "status": grant_status, "connector_id": "demo",
                 "tool": "place_order", "args": ARGS, "agent_id": "ag1",
-                "artifact": artifact, "expires_at": time.time() + 900})
+                "artifact": artifact, "expires_at": time.time() + 900},
+                **(record_overrides or {})})
         if req.url.path.endswith("/execution"):
             reports.append(json.loads(req.content))
             if broken_execution:
                 return httpx.Response(200, text="<html>proxy</html>")
             return httpx.Response(200, json={"ok": True, "status": "executed"})
+        if req.url.path.endswith("/outcome"):
+            outcomes.append(json.loads(req.content))
+            return httpx.Response(200, json={"ok": True})
+        if req.url.path == "/api/agent/checkin":
+            alerts.append(json.loads(req.content))
+            return httpx.Response(200, json={"ok": True})
         if req.url.path == "/api/agent/audit":
             return httpx.Response(200, json={"ok": True, "accepted": 1})
         return httpx.Response(404, json={"detail": "?"})
@@ -82,7 +103,41 @@ def _setup(tmp_path, grant_status="granted", artifact=None,
     client = PlatformClient("https://api.test", "nk_agent_t",
                             transport=httpx.MockTransport(handler))
     queue = RemoteApprovalQueue(client, state, "ag1")
+    client.candidate_outcomes = outcomes
+    client.candidate_alerts = alerts
     return state, client, queue, reports
+
+
+class CandidateHub(FakeHub):
+    def __init__(self, *, positions=None, position_error=None, trace=None):
+        super().__init__()
+        entry = {**ROBINHOOD_CONNECTOR, "id": "demo"}
+        entry["capabilities"] = {
+            name: dict(value) for name, value in ROBINHOOD_CONNECTOR["capabilities"].items()
+        }
+        entry["capabilities"]["place_order"] = {
+            **entry["capabilities"]["place_order"], "tool": "place_order"}
+        self._spec = load_specs({"connectors": [entry]})["demo"]
+        self.positions = ([{"symbol": "AAPL", "quantity": "3"}]
+                          if positions is None else positions)
+        self.position_error = position_error
+        self.trace = trace if trace is not None else []
+
+    def spec(self, connector_id):
+        assert connector_id == "demo"
+        return self._spec
+
+    async def call(self, connector_id, tool, args, **kw):
+        if kw.get("approved"):
+            self.calls.append((connector_id, tool, args, kw))
+            self.trace.append("broker")
+            return {"is_error": False, "data": {"order_id": "42"}}
+        assert tool == "get_equity_positions"
+        self.trace.append("positions")
+        if self.position_error is not None:
+            raise self.position_error
+        return {"is_error": False, "data": {
+            "data": {"positions": self.positions}}}
 
 
 async def test_enqueue_records_local_intent(tmp_path):
@@ -111,6 +166,391 @@ async def test_tampered_args_hash_never_executes(tmp_path):
     await poll_once(hub, state, client, EdgeAudit(state))
     assert hub.calls == []
     assert reports and reports[0]["ok"] is False
+
+
+async def test_candidate_grant_requires_the_same_candidate(tmp_path):
+    artifact = _artifact("a1", candidate_id="candidate-other")
+    state, client, queue, reports = _setup(tmp_path, artifact=artifact)
+    queue.enqueue("ag1", "demo", "place_order", ARGS, ttl_s=900,
+                  candidate_id="candidate-1", intent_account="463605220")
+    hub = FakeHub()
+
+    await poll_once(hub, state, client, EdgeAudit(state))
+
+    assert hub.calls == []
+    assert reports and reports[0]["ok"] is False
+    assert client.candidate_outcomes[0]["mechanical_status"] == "blocked"
+    assert "candidate_id mismatch" in client.candidate_outcomes[0]["mechanical_reason"]
+
+
+async def test_candidate_grant_requires_the_same_frozen_account(tmp_path):
+    artifact = _artifact("a1", candidate_id="candidate-1",
+                         account="other-account")
+    state, client, queue, reports = _setup(tmp_path, artifact=artifact)
+    queue.enqueue("ag1", "demo", "place_order", ARGS, ttl_s=900,
+                  candidate_id="candidate-1", intent_account="463605220")
+    hub = FakeHub()
+
+    await poll_once(hub, state, client, EdgeAudit(state))
+
+    assert hub.calls == []
+    assert reports and reports[0]["ok"] is False
+    assert "account mismatch" in reports[0]["error"]
+    assert client.candidate_outcomes[0]["mechanical_status"] == "blocked"
+    assert "account mismatch" in client.candidate_outcomes[0]["mechanical_reason"]
+
+
+async def test_lost_candidate_approval_never_contacts_the_broker(tmp_path):
+    state, client, queue, reports = _setup(tmp_path, grant_status="denied")
+    queue.enqueue("ag1", "demo", "place_order", ARGS, ttl_s=900,
+                  candidate_id="candidate-1", intent_account="463605220")
+    hub = FakeHub()
+
+    await poll_once(hub, state, client, EdgeAudit(state))
+
+    assert hub.calls == []
+    assert reports == []
+    assert intents(state) == {}
+
+
+async def test_disarmed_brake_refuses_a_candidate_grant_before_broker_contact(tmp_path):
+    from nakagai_edge.edge.brake import set_local_disarm
+
+    artifact = _artifact("a1", candidate_id="candidate-1")
+    state, client, queue, reports = _setup(tmp_path, artifact=artifact)
+    queue.enqueue("ag1", "demo", "place_order", ARGS, ttl_s=900,
+                  candidate_id="candidate-1", intent_account="463605220")
+    set_local_disarm(state, all_positions=True)
+    hub = FakeHub()
+
+    await poll_once(hub, state, client, EdgeAudit(state))
+
+    assert hub.calls == []
+    assert reports and reports[0]["ok"] is False
+    assert "brake" in reports[0]["error"]
+    assert client.candidate_outcomes[0]["mechanical_status"] == "blocked"
+    assert "brake" in client.candidate_outcomes[0]["mechanical_reason"]
+
+
+async def test_preexisting_position_does_not_turn_resting_candidate_limit_into_fill(
+        tmp_path):
+    trace = []
+    artifact = _artifact(
+        "a1", args=CANDIDATE_ARGS, candidate_id="candidate-1",
+        account="463605220")
+    warrant = {"expires_at": time.time() + 3600, "signature": "warrant"}
+    state, client, queue, reports = _setup(
+        tmp_path, artifact=artifact,
+        record_overrides={
+            "args": CANDIDATE_ARGS,
+            "signal_id": "signal-1",
+            "exit_warrant": warrant,
+        },
+    )
+    queue.enqueue(
+        "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
+        candidate_id="candidate-1", intent_account="463605220",
+    )
+    hub = CandidateHub(trace=trace)
+    original_report = client.report_execution
+
+    def report(*args, **kwargs):
+        trace.append("execution")
+        return original_report(*args, **kwargs)
+
+    original_outcome = client.report_candidate_outcome
+
+    def outcome(*args, **kwargs):
+        trace.append("outcome")
+        return original_outcome(*args, **kwargs)
+
+    client.report_execution = report
+    client.report_candidate_outcome = outcome
+
+    assert await poll_once(hub, state, client, EdgeAudit(state)) == 1
+
+    assert trace == ["broker", "execution"]
+    assert reports == [{
+        "ok": True, "result": {"is_error": False, "data": {"order_id": "42"}},
+        "error": "", "outcome_unknown": False, "order_id": "42",
+    }]
+    assert load_supervision(state) == {}
+    assert client.candidate_outcomes == []
+    assert intents(state)["a1"]["phase"] == "submitted"
+    assert intents(state)["a1"]["broker_order_id"] == "42"
+    assert candidate_entries_armed(state) is True
+
+
+async def test_candidate_execution_report_failure_keeps_submission_and_disarms(
+        tmp_path):
+    artifact = _artifact(
+        "a1", args=CANDIDATE_ARGS, candidate_id="candidate-1",
+        account="463605220")
+    state, client, queue, reports = _setup(
+        tmp_path, artifact=artifact, broken_execution=True,
+        record_overrides={
+            "args": CANDIDATE_ARGS, "signal_id": "signal-1",
+            "exit_warrant": {
+                "expires_at": time.time() + 3600, "signature": "warrant"},
+        },
+    )
+    queue.enqueue(
+        "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
+        candidate_id="candidate-1", intent_account="463605220",
+    )
+
+    await poll_once(CandidateHub(), state, client, EdgeAudit(state))
+
+    assert reports and reports[0]["ok"] is True
+    assert intents(state)["a1"]["phase"] == "submitted"
+    assert intents(state)["a1"]["broker_order_id"] == "42"
+    assert candidate_entries_armed(state) is False
+    assert client.candidate_outcomes[0]["mechanical_status"] == "blocked"
+    assert client.candidate_outcomes[0]["urgent"] is True
+    assert client.candidate_outcomes[0]["outcome_unknown"] is True
+    assert client.candidate_alerts
+
+
+async def test_later_matching_fill_establishes_supervision_and_completes_candidate(
+        tmp_path):
+    artifact = _artifact(
+        "a1", args=CANDIDATE_ARGS, candidate_id="candidate-1",
+        account="463605220")
+    warrant = {"expires_at": time.time() + 3600, "signature": "warrant"}
+    state, client, queue, reports = _setup(
+        tmp_path, artifact=artifact,
+        record_overrides={
+            "args": CANDIDATE_ARGS, "signal_id": "signal-1",
+            "exit_warrant": warrant,
+        },
+    )
+    queue.enqueue(
+        "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
+        candidate_id="candidate-1", intent_account="463605220",
+    )
+    hub = CandidateHub(positions=[{"symbol": "AAPL", "quantity": "3"}])
+    await poll_once(hub, state, client, EdgeAudit(state))
+
+    matched = await reconcile_submitted_fills(
+        hub, state, client, EdgeAudit(state), hub.spec("demo"), "463605220",
+        [{"order_id": "42", "symbol": "AAPL", "side": "buy",
+          "quantity": 3.0, "status": "filled", "fill_price": 211.31}],
+    )
+
+    assert matched == 1
+    stored = load_supervision(state)["a1"]
+    assert stored["state"] == "armed"
+    assert stored["entry_price"] == 211.31
+    assert intents(state) == {}
+    assert client.candidate_outcomes == [{
+        "mechanical_status": "submitted",
+        "mechanical_reason": "broker fill reconciled and supervision verified",
+        "approval_id": "a1", "urgent": False, "outcome_unknown": False,
+    }]
+
+
+async def test_ordinary_approved_entry_uses_the_same_exact_fill_supervision_path(
+        tmp_path):
+    artifact = _artifact("a1", args=CANDIDATE_ARGS, account="463605220")
+    state, client, queue, _reports = _setup(
+        tmp_path, artifact=artifact,
+        record_overrides={
+            "args": CANDIDATE_ARGS, "signal_id": "signal-1",
+            "exit_warrant": {
+                "expires_at": time.time() + 3600, "signature": "warrant"},
+        },
+    )
+    queue.enqueue(
+        "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
+        intent_account="463605220",
+    )
+    hub = CandidateHub()
+
+    await poll_once(hub, state, client, EdgeAudit(state))
+
+    assert load_supervision(state) == {}
+    assert intents(state)["a1"]["phase"] == "submitted"
+    assert intents(state)["a1"]["broker_order_id"] == "42"
+
+    matched = await reconcile_submitted_fills(
+        hub, state, client, EdgeAudit(state), hub.spec("demo"), "463605220",
+        [{"order_id": "42", "symbol": "AAPL", "side": "buy",
+          "quantity": 3.0, "status": "filled", "fill_price": 211.31}],
+    )
+
+    assert matched == 1
+    assert load_supervision(state)["a1"]["state"] == "armed"
+    assert intents(state) == {}
+    assert client.candidate_outcomes == []
+
+
+async def test_mismatched_fill_order_id_cannot_complete_candidate(tmp_path):
+    artifact = _artifact(
+        "a1", args=CANDIDATE_ARGS, candidate_id="candidate-1",
+        account="463605220")
+    state, client, queue, _reports = _setup(
+        tmp_path, artifact=artifact,
+        record_overrides={
+            "args": CANDIDATE_ARGS, "signal_id": "signal-1",
+            "exit_warrant": {
+                "expires_at": time.time() + 3600, "signature": "warrant"},
+        },
+    )
+    queue.enqueue(
+        "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
+        candidate_id="candidate-1", intent_account="463605220",
+    )
+    hub = CandidateHub()
+    await poll_once(hub, state, client, EdgeAudit(state))
+
+    matched = await reconcile_submitted_fills(
+        hub, state, client, EdgeAudit(state), hub.spec("demo"), "463605220",
+        [{"order_id": "other-order", "symbol": "AAPL", "side": "buy",
+          "quantity": 3.0, "status": "filled", "fill_price": 211.31}],
+    )
+
+    assert matched == 0
+    assert load_supervision(state) == {}
+    assert intents(state)["a1"]["phase"] == "submitted"
+    assert client.candidate_outcomes == []
+
+
+async def test_declared_terminal_order_blocks_candidate_without_supervision(
+        tmp_path):
+    artifact = _artifact(
+        "a1", args=CANDIDATE_ARGS, candidate_id="candidate-1",
+        account="463605220")
+    state, client, queue, _reports = _setup(
+        tmp_path, artifact=artifact,
+        record_overrides={
+            "args": CANDIDATE_ARGS, "signal_id": "signal-1",
+            "exit_warrant": {
+                "expires_at": time.time() + 3600, "signature": "warrant"},
+        },
+    )
+    queue.enqueue(
+        "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
+        candidate_id="candidate-1", intent_account="463605220",
+    )
+    hub = CandidateHub()
+    await poll_once(hub, state, client, EdgeAudit(state))
+
+    reconciled = await reconcile_submitted_fills(
+        hub, state, client, EdgeAudit(state), hub.spec("demo"), "463605220",
+        [{"order_id": "42", "symbol": "AAPL", "side": "buy",
+          "quantity": 3.0, "status": "cancelled"}],
+    )
+
+    assert reconciled == 1
+    assert intents(state) == {}
+    assert load_supervision(state) == {}
+    assert candidate_entries_armed(state) is True
+    assert client.candidate_outcomes == [{
+        "mechanical_status": "blocked",
+        "mechanical_reason": "broker order reached terminal status cancelled",
+        "approval_id": "a1", "urgent": False, "outcome_unknown": False,
+    }]
+
+
+async def test_undeclared_order_status_keeps_submitted_candidate_durable(
+        tmp_path):
+    artifact = _artifact(
+        "a1", args=CANDIDATE_ARGS, candidate_id="candidate-1",
+        account="463605220")
+    state, client, queue, _reports = _setup(
+        tmp_path, artifact=artifact,
+        record_overrides={"args": CANDIDATE_ARGS},
+    )
+    queue.enqueue(
+        "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
+        candidate_id="candidate-1", intent_account="463605220",
+    )
+    hub = CandidateHub()
+    await poll_once(hub, state, client, EdgeAudit(state))
+
+    reconciled = await reconcile_submitted_fills(
+        hub, state, client, EdgeAudit(state), hub.spec("demo"), "463605220",
+        [{"order_id": "42", "symbol": "AAPL", "side": "buy",
+          "quantity": 3.0, "status": "broker-specific-done"}],
+    )
+
+    assert reconciled == 0
+    assert intents(state)["a1"]["phase"] == "submitted"
+    assert load_supervision(state) == {}
+    assert client.candidate_outcomes == []
+
+
+async def test_supervision_failure_after_actual_fill_disarms_and_alerts_owner(
+        tmp_path):
+    artifact = _artifact(
+        "a1", args=CANDIDATE_ARGS, candidate_id="candidate-1",
+        account="463605220")
+    state, client, queue, reports = _setup(
+        tmp_path, artifact=artifact,
+        record_overrides={
+            "args": CANDIDATE_ARGS,
+            "signal_id": "signal-1",
+            "exit_warrant": {
+                "expires_at": time.time() + 3600, "signature": "warrant"},
+        },
+    )
+    queue.enqueue(
+        "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
+        candidate_id="candidate-1", intent_account="463605220",
+    )
+    hub = CandidateHub(position_error=RuntimeError("positions unreadable"))
+
+    assert await poll_once(hub, state, client, EdgeAudit(state)) == 1
+    assert reports[0]["ok"] is True
+
+    matched = await reconcile_submitted_fills(
+        hub, state, client, EdgeAudit(state), hub.spec("demo"), "463605220",
+        [{"order_id": "42", "symbol": "AAPL", "side": "buy",
+          "quantity": 3.0, "status": "filled", "fill_price": 211.31}],
+    )
+
+    assert matched == 1
+    assert len(hub.calls) == 1
+    assert client.candidate_outcomes == [{
+        "mechanical_status": "blocked",
+        "mechanical_reason": client.candidate_alerts[0]["note"],
+        "approval_id": "a1", "urgent": True, "outcome_unknown": True,
+    }]
+    assert client.candidate_alerts == [{
+        "status": "alert",
+        "note": client.candidate_outcomes[0]["mechanical_reason"],
+        "account_equity": None,
+        "day_pnl": None,
+    }]
+    assert candidate_entries_armed(state) is False
+    from nakagai_edge.edge.brake import armed
+    assert armed(state) is True
+    assert intents(state) == {}
+
+
+async def test_candidate_outcome_unknown_keeps_the_existing_fence_and_alerts(
+        tmp_path):
+    artifact = _artifact(
+        "a1", args=CANDIDATE_ARGS, candidate_id="candidate-1",
+        account="463605220")
+    state, client, queue, reports = _setup(tmp_path, artifact=artifact)
+    queue.enqueue(
+        "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
+        candidate_id="candidate-1", intent_account="463605220",
+    )
+    hub = CandidateHub()
+
+    async def uncertain(*args, **kwargs):
+        raise RuntimeError("broker timed out")
+
+    hub.call = uncertain
+
+    assert await poll_once(hub, state, client, EdgeAudit(state)) == 1
+
+    assert reports[0]["outcome_unknown"] is True
+    assert client.candidate_outcomes[0]["urgent"] is True
+    assert client.candidate_outcomes[0]["outcome_unknown"] is True
+    assert candidate_entries_armed(state) is False
 
 
 async def test_expired_artifact_never_executes(tmp_path):
@@ -328,18 +768,25 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
     monkeypatch.setenv("NAKAGAI_APPROVER_EMAILS", "chris@nakag.ai")
     monkeypatch.setenv("NAKAGAI_APPROVAL_SIGNING_KEY", priv)
 
-    order = {"symbol": "NVDA", "side": "buy", "quantity": 10,
-             "limit_price": 118.40, "stop_price": 116.10}
+    order = {"symbol": "NVDA", "side": "buy", "order_type": "limit",
+             "quantity": 10, "limit_price": 118.40, "stop_price": 116.10,
+             "time_in_force": "day"}
     # The connector's own words for placing an order. `tool` is also the
     # positive gate: exactly one declared share-order tool, so an option order
     # cannot ride in on a `place_*` glob and be sized without its multiplier.
     place_order = {
         "tool": "place_equity_order",
-        "args": {"symbol": "symbol", "side": "side", "quantity": "quantity",
-                 "price": "limit_price", "stop": "stop_price",
+        "args": {"symbol": "symbol", "side": "side", "order_type": "type",
+                 "quantity": "quantity", "limit_price": "limit_price",
+                 "stop_price": "stop_price", "time_in_force": "time_in_force",
                  "account": "account_number"},
+        "outbound_types": {"symbol": "string", "side": "string",
+                           "order_type": "string", "quantity": "string",
+                           "limit_price": "string", "stop_price": "string",
+                           "time_in_force": "string", "account": "string"},
         "values": {"side": {"buy": ["buy", "buy_to_open", "buy_to_cover"],
-                            "sell": ["sell", "sell_to_open", "sell_short"]}}}
+                            "sell": ["sell", "sell_to_open", "sell_short"]},
+                   "order_type": {"limit": ["limit"], "market": ["market"]}}}
 
     # ---- platform: autopilot armed, a seeded signal, the signing key ----
     plat = tmp_path / "platform"

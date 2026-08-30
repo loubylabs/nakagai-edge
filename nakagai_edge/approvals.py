@@ -194,11 +194,16 @@ class Approval:
     # A hide, never a delete: the record stays in the journal and in list(),
     # which autoapprove.py and mandate.py read for budgets and reconciliation.
     cleared_at: float = 0.0
+    # Present only for the bounded execution-candidate path. This is the
+    # queue-level idempotency and grant-binding key. Ordinary approvals keep
+    # the empty value and use the same queue, decision, and execution path.
+    candidate_id: str = ""
 
     _FIELDS = ("id", "account_key", "connector_id", "tool", "args", "status",
                "requested_by", "created_at", "expires_at", "decided_at", "decided_by",
                "reason", "result", "error", "outcome_unknown", "agent_id", "artifact",
-               "signal_id", "signal", "notional", "rationale", "cleared_at")
+               "signal_id", "signal", "notional", "rationale", "cleared_at",
+               "candidate_id")
 
     def to_dict(self) -> dict:
         return {k: getattr(self, k) for k in self._FIELDS}
@@ -469,7 +474,8 @@ class ApprovalQueue(BaseApprovalQueue):
     def enqueue(self, account_key: str, connector_id: str, tool: str, args: dict, *,
                 ttl_s: int, requested_by: str = "", agent_id: str = "",
                 signal_id: str = "", signal: dict | None = None,
-                notional: float = 0.0) -> Approval:
+                notional: float = 0.0, candidate_id: str = "",
+                intent_account: str = "") -> Approval:
         _require_account_key(account_key)
         now = time.time()
         with self._lock:
@@ -497,7 +503,8 @@ class ApprovalQueue(BaseApprovalQueue):
                          args=copy.deepcopy(args), requested_by=requested_by,
                          created_at=now, expires_at=now + ttl_s,
                          agent_id=agent_id, signal_id=signal_id,
-                         signal=copy.deepcopy(signal), notional=notional)
+                         signal=copy.deepcopy(signal), notional=notional,
+                         candidate_id=candidate_id)
             self._items[a.id] = a
         self._journal(a)
         return a
@@ -797,12 +804,12 @@ class PgApprovalQueue(BaseApprovalQueue):
                "requested_by", "created_at", "expires_at", "decided_at",
                "decided_by", "reason", "result", "error", "outcome_unknown",
                "agent_id", "artifact", "signal_id", "signal", "notional",
-               "rationale", "cleared_at")
+               "rationale", "cleared_at", "candidate_id")
     DB_COLUMNS = ("id", "workspace_id", "connector_id", "tool", "args", "status",
                   "requested_by", "created_at", "expires_at", "decided_at",
                   "decided_by", "reason", "result", "error", "outcome_unknown",
                   "agent_id", "artifact", "signal_id", "signal", "notional",
-                  "rationale", "cleared_at")
+                  "rationale", "cleared_at", "candidate_id")
 
     def __init__(self, database) -> None:
         self.db = database
@@ -818,6 +825,7 @@ class PgApprovalQueue(BaseApprovalQueue):
     @staticmethod
     def _row(row) -> Approval:
         values = dict(zip(PgApprovalQueue.COLUMNS, row))
+        values["candidate_id"] = values.get("candidate_id") or ""
         for key in ("created_at", "expires_at", "decided_at", "cleared_at"):
             values[key] = values[key].timestamp() if values[key] is not None else 0.0
         return Approval(**values)
@@ -896,7 +904,8 @@ class PgApprovalQueue(BaseApprovalQueue):
     def enqueue(self, account_key: str, connector_id: str, tool: str, args: dict, *,
                 ttl_s: int, requested_by: str = "", agent_id: str = "",
                 signal_id: str = "", signal: dict | None = None,
-                notional: float = 0.0) -> Approval:
+                notional: float = 0.0, candidate_id: str = "",
+                intent_account: str = "") -> Approval:
         _require_account_key(account_key)
         with self.db.pool.connection() as connection:
             with connection.transaction():
@@ -919,15 +928,16 @@ class PgApprovalQueue(BaseApprovalQueue):
                     )
                 row = connection.execute(
                     f"insert into approvals (id, workspace_id, connector_id, tool, args,"
-                    f" status, requested_by, expires_at, agent_id, signal_id, signal, notional)"
+                    f" status, requested_by, expires_at, agent_id, signal_id, signal, notional,"
+                    f" candidate_id)"
                     f" values (%s, %s, %s, %s, %s, 'pending', %s,"
-                    f" now() + make_interval(secs => %s), %s, %s, %s, %s)"
+                    f" now() + make_interval(secs => %s), %s, %s, %s, %s, %s)"
                     f" returning {self._columns()}",
                     (uuid.uuid4().hex, account_key, connector_id, tool,
                      json.dumps(copy.deepcopy(args)), requested_by, ttl_s, agent_id,
                      signal_id,
                      json.dumps(copy.deepcopy(signal)) if signal is not None else None,
-                     notional),
+                     notional, candidate_id or None),
                 ).fetchone()
         return self._row(row)
 

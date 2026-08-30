@@ -1,9 +1,9 @@
-"""The fill journal: what the broker's order history says, recorded locally and
-shipped to the platform (POST /api/agent/fills).
+"""The fill journal: what the broker's order history says, recorded locally,
+reconciled against submitted candidates, and shipped to the platform.
 
-This is the one path that carries trades the AGENT did not place. Everything
-else the edge reports is about its own conduct; a trade the owner made by hand
-in the broker's app reaches the platform here or not at all.
+This is the one path that declares an order filled. A submitted entry must
+match its exact broker order id here before supervision starts. An order id no
+approval claims remains an owner-placed trade when the rows reach the platform.
 
 Three rules govern this module, and each of them inverts a rule that holds
 elsewhere in the edge. They are worth reading before changing anything.
@@ -36,10 +36,13 @@ import logging
 import time
 from pathlib import Path
 
-from nakagai_edge.capability import CapabilityError, first, read_row, resolve
+from nakagai_edge.capability import (CapabilityError, first, read_partial,
+                                     read_row, resolve)
+from nakagai_edge.edge.audit import EdgeAudit
 from nakagai_edge.edge.journal import Journal
 from nakagai_edge.edge.portfolio import (broker_specs, listed_accounts,
                                          tiered_accounts)
+from nakagai_edge.edge.remote import intents
 
 FILLS_INTERVAL_S = 300          # the timer loop's cadence
 SHIP_LIMIT = 200                # rows per POST, matching the audit shipper
@@ -114,32 +117,61 @@ class Anchor:
         tmp.replace(self.path)
 
 
-async def account_rows(hub, spec, account: str) -> list[dict]:
-    """One account's order rows, canonical, unreadable ones dropped.
+async def _order_rows(hub, spec, account: str, *, status: str = "",
+                      retain_unknown: bool = False) -> list[dict] | None:
+    """One list_orders call and parse path for fills and exposure.
 
-    `status` is only sent when the connector declares a word for it; a broker
-    that declares none is asked for its default and journals whatever that is.
+    `None` means the connector answered with something that was not the list
+    its map declares. An empty list means the broker authoritatively answered
+    that it has no matching orders. Exposure retains malformed rows as explicit
+    unknown evidence; the fill journal still drops them because without an id
+    it cannot deduplicate or attribute a historical fill.
     """
     cap = spec.capability("list_orders")
     args: dict = {"account": account}
-    wanted = filled_status(cap)
-    if wanted:
-        args["status"] = wanted
+    if status:
+        args["status"] = status
     tool, resolved = resolve("list_orders", cap, args)
     payload = (await hub.call(
         spec.id, tool, resolved, account_key=hub.account_key
     )).get("data")
     rows = first(payload, cap.items) if cap.items else payload
     if not isinstance(rows, list):
-        return []
+        return None
     out = []
     for row in rows:
         if not isinstance(row, dict):
+            if retain_unknown:
+                out.append({"unknown": True})
             continue
         read = read_row("list_orders", cap, row)
-        if read is not None:          # no order_id or no symbol: see module docstring
+        if read is not None:
             out.append(read)
+            continue
+        if retain_unknown:
+            out.append({**read_partial("list_orders", cap, row), "unknown": True})
     return out
+
+
+async def account_rows(hub, spec, account: str) -> list[dict]:
+    """One account's filled order rows, canonical, unreadable ones dropped.
+
+    `status` is only sent when the connector declares a word for it; a broker
+    that declares none is asked for its default and journals whatever that is.
+    """
+    wanted = filled_status(spec.capability("list_orders"))
+    return await _order_rows(hub, spec, account, status=wanted) or []
+
+
+async def open_order_rows(hub, spec, account: str) -> list[dict] | None:
+    """One account's broker-default order book, canonical and fail closed.
+
+    The broker's default is intentionally requested without a status filter:
+    the connector's own working-order semantics remain its authority. A
+    malformed row is retained with `unknown: true` so it can block a later
+    autonomous entry instead of vanishing into an apparently empty book.
+    """
+    return await _order_rows(hub, spec, account, retain_unknown=True)
 
 
 async def connector_accounts(hub, spec) -> tuple[str, list[tuple[str, list[dict]]]]:
@@ -218,6 +250,43 @@ class FillsReporter:
                                 "are not journaled this cycle: %s", spec.id, error)
                     continue
                 for account, rows in accounts:
+                    from nakagai_edge.edge.executor import (
+                        declared_terminal_order_values,
+                        reconcile_submitted_fills,
+                    )
+                    await reconcile_submitted_fills(
+                        self._hub, self._state, self._client,
+                        EdgeAudit(self._state), spec, account, rows)
+                    submitted = any(
+                        isinstance(intent, dict)
+                        and intent.get("phase") == "submitted"
+                        and intent.get("connector_id") == spec.id
+                        and intent.get("account") == account
+                        for intent in intents(self._state).values()
+                    )
+                    if submitted:
+                        for status in declared_terminal_order_values(spec):
+                            try:
+                                terminal_rows = await _order_rows(
+                                    self._hub, spec, account, status=status)
+                            except Exception as error:  # noqa: BLE001 (retry next sweep)
+                                log.warning(
+                                    "terminal order status %s unreadable for %s "
+                                    "account %s: %s", status, spec.id, account, error)
+                                continue
+                            await reconcile_submitted_fills(
+                                self._hub, self._state, self._client,
+                                EdgeAudit(self._state), spec, account,
+                                terminal_rows or [])
+                            submitted = any(
+                                isinstance(intent, dict)
+                                and intent.get("phase") == "submitted"
+                                and intent.get("connector_id") == spec.id
+                                and intent.get("account") == account
+                                for intent in intents(self._state).values()
+                            )
+                            if not submitted:
+                                break
                     journaled.extend(self._absorb(spec.id, account, rows))
             await self._ship()
             return journaled

@@ -60,7 +60,10 @@ def install_skills(dest: Path, *, manifest: Path) -> InstallReport:
     recorded = _load_manifest(manifest)
     report = InstallReport()
 
-    for name in skills.list_skills():
+    # Take one verified inventory snapshot. An installation must not copy a
+    # partial bundle if a packaging change drifts from the declared release.
+    packaged = skills.list_skills()
+    for name in packaged:
         body = skills.read_skill(name)
         target = dest / name / "SKILL.md"
 

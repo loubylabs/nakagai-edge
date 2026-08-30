@@ -4,9 +4,12 @@
     config/connectors.yaml   synced from the bundle (secret-free)
     secrets/tokens/     broker OAuth tokens (the gateway's own layout)
     cache/bundle.json   last bundle + fetch metadata
-    cache/intents.json  write intents awaiting a platform grant
+    cache/intents.json  write intents awaiting a grant or an exact broker fill
     cache/supervised.json    positions the brake watches, and their warrants
     cache/brake-off.json     local disarm; its presence never needs the network
+    cache/candidate-wake.json    bounded listener-owned candidate write scope
+    cache/candidate-outcomes.json    mechanical outcomes awaiting platform ack
+    cache/candidate-entries-off.json    persistent local entry disarm
     results/audit.jsonl local audit journal, shipped in batches
     edge.pid            the serving daemon: pid, port, start, version.
                         pid 0 once it has stopped: the claim is released,
@@ -54,6 +57,18 @@ class EdgeState:
         return self.root / "cache" / "brake-off.json"
 
     @property
+    def candidate_wake_path(self) -> Path:
+        return self.root / "cache" / "candidate-wake.json"
+
+    @property
+    def candidate_outcomes_path(self) -> Path:
+        return self.root / "cache" / "candidate-outcomes.json"
+
+    @property
+    def candidate_entries_off_path(self) -> Path:
+        return self.root / "cache" / "candidate-entries-off.json"
+
+    @property
     def audit_path(self) -> Path:
         return self.root / "results" / "audit.jsonl"
 
@@ -78,8 +93,15 @@ class EdgeState:
         # window between write and chmod.
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as f:
-            f.write(json.dumps(doc, indent=2))
+            f.write(json.dumps(doc, indent=2, default=str))
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
     def agent(self) -> dict | None:
         if not self.agent_path.exists():

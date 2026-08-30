@@ -11,9 +11,11 @@ ALIEN = SPECS["alien-broker"].capability("place_order")
 RH = SPECS["robinhood-trading"].capability("place_order")
 
 ALIEN_ENTRY = {"acct": "AL-1", "ticker": "aapl", "action": "BUY_TO_OPEN",
-               "qty": 25, "limit": 187.20, "trigger": 180.00, "kind": "LIMIT"}
+               "qty": 25, "limit": 187.20, "trigger": 180.00,
+               "kind": "LIMIT", "tif": "day"}
 RH_ENTRY = {"account_number": "463605220", "symbol": "aapl", "side": "buy",
-            "quantity": 25, "limit_price": 187.20, "stop_price": 180.00}
+            "quantity": 25, "limit_price": 187.20, "stop_price": 180.00,
+            "type": "limit", "time_in_force": "gfd"}
 
 
 def test_read_entry_reads_both_shapes_identically():
@@ -21,6 +23,13 @@ def test_read_entry_reads_both_shapes_identically():
                 "price": 187.20, "stop": 180.00}
     assert read_entry(ALIEN, ALIEN_ENTRY) == {**expected, "side": "buy_to_open"}
     assert read_entry(RH, RH_ENTRY) == {**expected, "side": "buy"}
+
+
+def test_read_entry_does_not_require_order_type_from_a_position_read():
+    entry = {key: value for key, value in RH_ENTRY.items() if key != "type"}
+    assert read_entry(RH, entry) == {
+        "symbol": "AAPL", "side": "buy", "qty": 25.0,
+        "price": 187.20, "stop": 180.00}
 
 
 def test_read_entry_refuses_an_entry_with_no_stop():
@@ -57,10 +66,10 @@ def test_closing_side_inverts_through_each_connectors_own_words():
     assert closing_side(RH, "sell_short") == "buy"
 
 
-def test_exit_order_args_strips_price_and_stop_and_merges_market_args():
+def test_exit_order_args_resolves_a_canonical_market_order():
     args = exit_order_args(ALIEN, ALIEN_ENTRY, 10.0)
-    assert args == {"acct": "AL-1", "ticker": "aapl",
-                    "action": "SELL", "qty": 10.0, "kind": "MARKET"}
+    assert args == {"acct": "AL-1", "ticker": "aapl", "action": "SELL",
+                    "kind": "MARKET", "qty": "10", "tif": "day"}
     assert "limit" not in args and "trigger" not in args
 
 
@@ -68,12 +77,13 @@ def test_exit_order_args_keeps_the_raw_symbol_casing_the_broker_accepted():
     assert exit_order_args(RH, RH_ENTRY, 5.0)["symbol"] == "aapl"
 
 
-def test_exit_order_args_refuses_when_market_args_collide_with_an_identity_key():
-    bad = ALIEN.model_copy(update={"market_args": {"kind": "MARKET",
-                                                  "qty": 999}})
+def test_exit_order_args_refuses_without_a_market_order_type_value():
+    bad = ALIEN.model_copy(update={"values": {"side": ALIEN.values["side"],
+                                               "order_type": {"limit": ["LIMIT"]}}})
     assert exit_order_args(bad, ALIEN_ENTRY, 10.0) is None
 
 
-def test_exit_order_args_refuses_a_connector_with_no_market_args():
-    bare = RH.model_copy(update={"market_args": {}})
-    assert exit_order_args(bare, RH_ENTRY, 5.0) is None
+def test_exit_order_args_refuses_a_connector_with_no_time_in_force():
+    bare_entry = {key: value for key, value in RH_ENTRY.items()
+                  if key != "time_in_force"}
+    assert exit_order_args(RH, bare_entry, 5.0) is None

@@ -115,6 +115,77 @@ def test_chat_protocol_header_only_covers_chat_routes():
     client.await_events(timeout_s=0)
 
 
+def test_candidate_protocol_header_only_covers_authenticated_event_polls():
+    seen = []
+
+    def handler(request):
+        seen.append((request.url.path,
+                     request.headers.get("x-nakagai-candidate-protocol")))
+        if request.url.path == "/api/agent/events":
+            return httpx.Response(200, json={"ok": True, "events": []})
+        if request.url.path == "/api/agent/bundle":
+            return httpx.Response(200, json={"bundle_version": "v1"})
+        return httpx.Response(200, json={"ok": True})
+
+    client = PlatformClient("https://api.test", "nk_agent_t",
+                            transport=_transport(handler))
+    client.await_events(timeout_s=0)
+    client.agent_checkin("idle")
+    client.get_bundle()
+
+    assert seen == [
+        ("/api/agent/events", "1"),
+        ("/api/agent/checkin", None),
+        ("/api/agent/bundle", None),
+    ]
+
+
+def test_candidate_decision_routes_put_only_rationale_in_the_body():
+    seen = []
+
+    def handler(request):
+        seen.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={"candidate_id": "candidate-1",
+                                         "decision": "accepted"})
+
+    client = PlatformClient("https://api.test", "nk_agent_t",
+                            transport=_transport(handler))
+    client.accept_candidate("candidate-1", "fresh broker evidence")
+    client.abstain_candidate("candidate-1", "setup expired")
+
+    assert seen == [
+        ("/api/agent/candidates/candidate-1/accept",
+         {"rationale": "fresh broker evidence"}),
+        ("/api/agent/candidates/candidate-1/abstain",
+         {"rationale": "setup expired"}),
+    ]
+
+
+def test_candidate_mechanical_outcome_uses_the_internal_outcome_route():
+    seen = []
+
+    def handler(request):
+        seen.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={"ok": True, "candidate_id": "candidate-1"})
+
+    client = PlatformClient("https://api.test", "nk_agent_t",
+                            transport=_transport(handler))
+    out = client.report_candidate_outcome(
+        "candidate-1", mechanical_status="blocked",
+        mechanical_reason="local policy is stale", approval_id="approval-1",
+        urgent=False, outcome_unknown=False,
+    )
+
+    assert out["ok"] is True
+    assert seen == [("/api/agent/candidates/candidate-1/outcome", {
+        "mechanical_status": "blocked",
+        "mechanical_reason": "local policy is stale",
+        "approval_id": "approval-1",
+        "urgent": False,
+        "outcome_unknown": False,
+    })]
+
+
 def test_chat_conflict_body_is_returned_intact():
     conflict = {
         "ok": False,
