@@ -141,3 +141,14 @@ def test_published_candidate_guidance_rejects_retired_order_authority():
     )
     lowered = "\n".join(docs).lower()
     assert not any(term in lowered for term in forbidden)
+
+
+def test_readme_keeps_candidate_inspection_read_only():
+    """A candidate wake must retain evidence reads without gaining other writes."""
+    readme = " ".join((REPO / "README.md").read_text().split())
+
+    assert "Read-only inspection remains allowed." in readme
+    assert (
+        "`accept_candidate` and `abstain_candidate` are the only authorized "
+        "write actions for an execution-candidate workflow."
+    ) in readme

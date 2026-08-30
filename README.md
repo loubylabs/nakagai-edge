@@ -379,9 +379,10 @@ the one meant to cover a short.
 
 The generic broker surface exposes seven named tools that work against any
 broker. The shared MCP surface remains present during an execution-candidate
-wake. For that event, the candidate workflow authorizes only
-`accept_candidate` or `abstain_candidate`, and forbids connector writes,
-order construction, and every other action.
+wake. Read-only inspection remains allowed. `accept_candidate` and
+`abstain_candidate` are the only authorized write actions for an
+execution-candidate workflow. Connector writes and order construction remain
+forbidden for that event.
 `connector_id` is optional only while exactly one enabled broker declares the
 capability. Enable a second and the edge stops filling it in: the call comes
 back naming both candidates and the agent has to say which brokerage it meant.
