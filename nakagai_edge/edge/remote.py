@@ -86,17 +86,29 @@ class RemoteApprovalQueue:
         out = self.client.enqueue_approval(
             connector_id, tool, args, signal_id, candidate_id)
         doc = intents(self.state)
-        doc[out["approval_id"]] = {
+        frozen = {
             "connector_id": connector_id, "tool": tool, "args": args,
-            "args_hash": args_hash(args), "created_at": time.time(),
+            "args_hash": args_hash(args),
             "signal_id": signal_id, "candidate_id": candidate_id,
             "account": intent_account}
-        _write_intents(self.state, doc)
+        approval_id = out["approval_id"]
+        existing = doc.get(approval_id)
+        if existing is not None:
+            if (not isinstance(existing, dict)
+                    or any(existing.get(field) != value
+                           for field, value in frozen.items())):
+                raise ValueError(
+                    f"local frozen intent mismatch for approval {approval_id!r}")
+            created_at = existing.get("created_at", time.time())
+        else:
+            created_at = time.time()
+            doc[approval_id] = {**frozen, "created_at": created_at}
+            _write_intents(self.state, doc)
         return Approval(id=out["approval_id"], account_key=account_key,
                         connector_id=connector_id,
                         tool=tool, args=args, status=out["status"],
                         agent_id=self.agent_id, requested_by=requested_by,
-                        created_at=time.time(), expires_at=out["expires_at"],
+                        created_at=created_at, expires_at=out["expires_at"],
                         signal_id=signal_id, candidate_id=candidate_id)
 
     def get(self, account_key: str, approval_id: str) -> Approval | None:

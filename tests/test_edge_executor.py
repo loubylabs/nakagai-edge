@@ -95,8 +95,14 @@ def _setup(tmp_path, grant_status="granted", artifact=None,
                 return httpx.Response(200, text="<html>proxy</html>")
             return httpx.Response(200, json={"ok": True, "status": "executed"})
         if req.url.path.endswith("/outcome"):
-            outcomes.append(json.loads(req.content))
-            return httpx.Response(200, json={"ok": True})
+            payload = json.loads(req.content)
+            outcomes.append(payload)
+            return httpx.Response(200, json={
+                "candidate_id": req.url.path.split("/")[-2],
+                "mechanical_status": payload["mechanical_status"],
+                "mechanical_reason": payload["mechanical_reason"],
+                "approval_id": payload["approval_id"],
+            })
         if req.url.path == "/api/agent/checkin":
             alerts.append(json.loads(req.content))
             return httpx.Response(200, json={"ok": True})
@@ -227,6 +233,63 @@ async def test_candidate_grant_requires_the_same_frozen_signal(tmp_path):
     assert reports and reports[0]["ok"] is False
     assert client.candidate_outcomes[0]["mechanical_status"] == "blocked"
     assert "signal_id mismatch" in client.candidate_outcomes[0]["mechanical_reason"]
+
+
+@pytest.mark.parametrize(
+    ("local_signal", "remote_signal"),
+    [
+        (None, None),
+        ("signal-1", None),
+        ("", ""),
+        ("signal-1", ""),
+        (" signal-1 ", "signal-1"),
+    ],
+    ids=["missing-local", "missing-remote", "empty-local", "empty-remote",
+         "whitespace-exact-mismatch"],
+)
+async def test_candidate_signal_binding_fails_closed_at_persisted_verification(
+        tmp_path, local_signal, remote_signal):
+    artifact = _artifact(
+        "a1", candidate_id="candidate-1", account="463605220")
+    state, client, queue, reports = _setup(tmp_path, artifact=artifact)
+    queue.enqueue(
+        "ag1", "demo", "place_order", ARGS, ttl_s=900,
+        signal_id=(local_signal if isinstance(local_signal, str)
+                   and local_signal.strip() else "signal-1"),
+        candidate_id="candidate-1", intent_account="463605220",
+    )
+    stored = intents(state)
+    if local_signal is None:
+        stored["a1"].pop("signal_id")
+    else:
+        stored["a1"]["signal_id"] = local_signal
+    state._write_private(state.intents_path, stored)
+    original_get = client.get_approval
+
+    def approval_without_assumed_signal(approval_id):
+        record = original_get(approval_id)
+        if remote_signal is None:
+            record.pop("signal_id")
+        else:
+            record["signal_id"] = remote_signal
+        return record
+
+    client.get_approval = approval_without_assumed_signal
+
+    def platform_unavailable(*args, **kwargs):
+        raise RuntimeError("platform unavailable")
+
+    client.report_candidate_outcome = platform_unavailable
+    hub = FakeHub()
+
+    assert await poll_once(hub, state, client, EdgeAudit(state)) == 1
+
+    assert hub.calls == []
+    assert reports and reports[0]["ok"] is False
+    pending = pending_candidate_outcomes(state)["candidate-1"]
+    assert pending["mechanical_status"] == "blocked"
+    assert "signal_id" in pending["mechanical_reason"]
+    assert pending["approval_id"] == "a1"
 
 
 async def test_lost_candidate_approval_never_contacts_the_broker(tmp_path):
@@ -420,6 +483,114 @@ async def test_later_matching_fill_establishes_supervision_and_completes_candida
         "mechanical_reason": "broker fill reconciled and supervision verified",
         "approval_id": "a1", "urgent": False, "outcome_unknown": False,
     }]
+
+
+async def test_matching_fill_renews_missing_warrant_before_candidate_completion(
+        tmp_path):
+    artifact = _artifact(
+        "a1", args=CANDIDATE_ARGS, candidate_id="candidate-1",
+        account="463605220")
+    state, client, queue, _reports = _setup(
+        tmp_path, artifact=artifact,
+        record_overrides={"args": CANDIDATE_ARGS, "signal_id": "signal-1"},
+    )
+    queue.enqueue(
+        "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
+        signal_id="signal-1", candidate_id="candidate-1",
+        intent_account="463605220",
+    )
+    hub = CandidateHub(positions=[{"symbol": "AAPL", "quantity": "3"}])
+    await poll_once(hub, state, client, EdgeAudit(state))
+    asks = []
+
+    def renew(positions):
+        asks.append(positions)
+        return {"warrants": {"a1": {
+            "grant_id": "warrant-1", "max_qty": 3.0,
+            "expires_at": time.time() + 3600,
+        }}}
+
+    client.renew_warrants = renew
+
+    matched = await reconcile_submitted_fills(
+        hub, state, client, EdgeAudit(state), hub.spec("demo"), "463605220",
+        [{"order_id": "42", "symbol": "AAPL", "side": "buy",
+          "quantity": 3.0, "status": "filled", "fill_price": 211.31}],
+    )
+
+    assert matched == 1
+    assert asks == [[{
+        "position_id": "a1", "connector_id": "demo",
+        "account": "463605220", "symbol": "AAPL",
+        "confirmed_qty": 3.0, "signal_id": "signal-1",
+    }]]
+    assert load_supervision(state)["a1"]["state"] == "armed"
+    assert intents(state) == {}
+    assert client.candidate_outcomes[-1]["mechanical_status"] == "submitted"
+
+
+@pytest.mark.parametrize("retry_status", ["granted", "executed"])
+async def test_candidate_accept_retry_preserves_submitted_fill_fence(
+        tmp_path, retry_status):
+    artifact = _artifact(
+        "a1", args=CANDIDATE_ARGS, candidate_id="candidate-1",
+        account="463605220")
+    state, client, queue, _reports = _setup(
+        tmp_path, artifact=artifact,
+        record_overrides={
+            "args": CANDIDATE_ARGS,
+            "signal_id": "signal-1",
+            "exit_warrant": {
+                "expires_at": time.time() + 3600,
+                "signature": "warrant",
+            },
+        },
+    )
+    enqueue = {
+        "signal_id": "signal-1",
+        "candidate_id": "candidate-1",
+        "intent_account": "463605220",
+    }
+    queue.enqueue(
+        "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
+        **enqueue,
+    )
+    hub = CandidateHub(positions=[{"symbol": "AAPL", "quantity": "3"}])
+    assert await poll_once(hub, state, client, EdgeAudit(state)) == 1
+    before = intents(state)["a1"]
+    assert before["phase"] == "submitted"
+    assert before["broker_order_id"] == "42"
+    assert len(hub.calls) == 1
+    original_enqueue = client.enqueue_approval
+
+    def retry_existing(*args, **kwargs):
+        response = original_enqueue(*args, **kwargs)
+        return {**response, "status": retry_status}
+
+    client.enqueue_approval = retry_existing
+
+    retried = queue.enqueue(
+        "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
+        **enqueue,
+    )
+
+    assert retried.status == retry_status
+    assert intents(state)["a1"] == before
+    assert await poll_once(hub, state, client, EdgeAudit(state)) == 0
+    assert len(hub.calls) == 1
+    assert intents(state)["a1"]["broker_order_id"] == "42"
+
+    matched = await reconcile_submitted_fills(
+        hub, state, client, EdgeAudit(state), hub.spec("demo"), "463605220",
+        [{"order_id": "42", "symbol": "AAPL", "side": "buy",
+          "quantity": 3.0, "status": "filled", "fill_price": 211.31}],
+    )
+
+    assert matched == 1
+    assert len(hub.calls) == 1
+    assert hub.calls[0][3]["approved"] is True
+    assert load_supervision(state)["a1"]["state"] == "armed"
+    assert intents(state) == {}
 
 
 async def test_ordinary_approved_entry_uses_the_same_exact_fill_supervision_path(
@@ -794,7 +965,6 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
     from nakagai_edge.capability import resolve
     from nakagai_edge.edge.candidate import CandidateWakeScope
     from nakagai_edge.edge.runtime import _prepared_order
-    from nakagai_edge.edge.supervision import apply_renewals, renewal_request
     from tests.fixtures.inproc import connect_to
     from nakagai_edge.signing import generate_keypair, public_key_for
     from nakagai_platform.api.signal_store import SignalStore
@@ -1021,6 +1191,32 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
     assert n == 1
     assert placed == [("NVDA", "buy", "10")]
     assert intents(state)[rec.id]["broker_order_id"] == "broker-order-1"
+    assert store.decision(candidate["id"])["mechanical_status"] == "prepared"
+
+    # A repeated accepted decision receives the same frozen order and approval.
+    # The local retry must preserve the submitted fence rather than reopening
+    # broker dispatch after the platform has already recorded execution.
+    submitted_before_retry = intents(state)[rec.id]
+    accepted_retry = edge_client.accept_candidate(
+        candidate["id"], "The bounded setup is valid.")
+    prepared_retry = _prepared_order(
+        candidate["id"], accepted_retry,
+        load_specs({"connectors": [connector]})["broker"], "463605220",
+    )
+    retried = await edge_hub.call(
+        prepared_retry["connector_id"], prepared_retry["tool"],
+        prepared_retry["args"], account_key=agent_id,
+        signal_id=prepared_retry["signal_id"], candidate_id=candidate["id"],
+        intent_account=prepared_retry["account_id"], require_approval=True,
+    )
+    assert retried["approval_id"] == rec.id
+    assert store.decision(candidate["id"])["mechanical_status"] == "prepared"
+    assert intents(state)[rec.id] == submitted_before_retry
+    assert placed == [("NVDA", "buy", "10")]
+    assert await poll_once(
+        edge_hub, state, edge_client, EdgeAudit(state)) == 0
+    assert store.decision(candidate["id"])["mechanical_status"] == "prepared"
+    assert placed == [("NVDA", "buy", "10")]
 
     matched = await reconcile_submitted_fills(
         edge_hub, state, edge_client, EdgeAudit(state),
@@ -1029,16 +1225,15 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
           "quantity": 10.0, "status": "filled", "fill_price": 118.4}],
     )
     assert matched == 1
+    decision_after_fill = store.decision(candidate["id"])
+    assert decision_after_fill["mechanical_status"] == "submitted", {
+        "decision": decision_after_fill,
+        "supervision": load_supervision(state),
+        "outcomes": pending_candidate_outcomes(state),
+    }
     assert intents(state) == {}
     supervised = load_supervision(state)[rec.id]
     assert supervised["signal_id"] == signal_id
-    assert supervised["state"] == "unguarded"
-
-    # Warrant minting follows the executed approval. Exercise the same renewal
-    # exchange as the resident sync loop, then require the position to be armed.
-    renewed = edge_client.renew_warrants(renewal_request(state))
-    apply_renewals(state, renewed["warrants"])
-    supervised = load_supervision(state)[rec.id]
     assert supervised["state"] == "armed"
 
     # the platform's own record: decided by the owner, then executed by the edge.
@@ -1049,6 +1244,8 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
     assert plat_rec.status == "executed"
     assert plat_rec.candidate_id == candidate["id"]
     assert plat_rec.signal_id == signal_id
+    assert store.decision(candidate["id"])["mechanical_status"] == "submitted"
+    assert pending_candidate_outcomes(state) == {}
     await edge_hub.aclose()
 
 

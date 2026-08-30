@@ -216,7 +216,11 @@ class Client:
 
     def report_candidate_outcome(self, candidate_id, **payload):
         self.outcomes.append((candidate_id, payload))
-        return {"ok": True}
+        return {
+            "candidate_id": candidate_id,
+            "mechanical_status": payload["mechanical_status"],
+            "approval_id": payload["approval_id"],
+        }
 
     def agent_checkin(self, status, note, **payload):
         self.alerts.append((status, note, payload))

@@ -157,7 +157,10 @@ def deliver_candidate_outcome(
         acknowledged = client.report_candidate_outcome(candidate_id, **payload)
     except Exception:  # noqa: BLE001 (the durable row is retried by the executor)
         return False
-    if acknowledged.get("ok") is not True:
+    if (not isinstance(acknowledged, dict)
+            or acknowledged.get("candidate_id") != candidate_id
+            or acknowledged.get("mechanical_status") != mechanical_status
+            or str(acknowledged.get("approval_id") or "") != approval_id):
         return False
     current = pending_candidate_outcomes(state)
     if current.get(candidate_id) == payload:

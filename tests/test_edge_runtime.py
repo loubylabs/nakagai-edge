@@ -90,6 +90,17 @@ def _candidate_scope(state, candidate_id="candidate-1"):
     })
 
 
+def _outcome_ack(request):
+    payload = json.loads(request.content)
+    return httpx.Response(200, json={
+        "candidate_id": request.url.path.split("/")[-2],
+        "decision": "accepted",
+        "mechanical_status": payload["mechanical_status"],
+        "mechanical_reason": payload["mechanical_reason"],
+        "approval_id": payload["approval_id"],
+    })
+
+
 class _Reporter:
     """Stub for PortfolioReporter: these tests exercise the freshness gate and
     tool passthrough, not the portfolio path, so a no-op stand-in keeps their
@@ -553,7 +564,7 @@ async def test_accept_candidate_rejects_local_map_mismatch_without_connector_con
         if req.url.path == "/api/agent/checkin":
             return httpx.Response(200, json={"ok": True})
         if req.url.path.endswith("/outcome"):
-            return httpx.Response(200, json={"ok": True})
+            return _outcome_ack(req)
         canonical = dict(CANONICAL_ORDER)
         canonical["quantity"] = 4
         response = _prepared_response()
@@ -607,7 +618,7 @@ async def test_accept_candidate_rejects_blocked_response_with_prepared_order(
         if req.url.path == "/api/agent/checkin":
             return httpx.Response(200, json={"ok": True})
         if req.url.path.endswith("/outcome"):
-            return httpx.Response(200, json={"ok": True})
+            return _outcome_ack(req)
         response = _prepared_response()
         response["mechanical_status"] = "blocked"
         return httpx.Response(200, json=response)
@@ -661,7 +672,7 @@ async def test_accept_candidate_stale_local_policy_creates_no_approval(
         if req.url.path == "/api/agent/checkin":
             return httpx.Response(200, json={"ok": True})
         if req.url.path.endswith("/outcome"):
-            return httpx.Response(200, json={"ok": True})
+            return _outcome_ack(req)
         return httpx.Response(200, json=_prepared_response())
 
     class Hub:
@@ -782,7 +793,7 @@ async def test_prepared_order_is_not_submitted_after_portfolio_report_failure(
         if req.url.path.endswith("/accept"):
             return httpx.Response(200, json=_prepared_response())
         if req.url.path.endswith("/outcome"):
-            return httpx.Response(200, json={"ok": True})
+            return _outcome_ack(req)
         raise AssertionError(req.url.path)
 
     class Reporter:
