@@ -71,31 +71,44 @@ class RemoteApprovalQueue:
                 signal_id: str = "", signal: dict | None = None,
                 notional: float = 0.0, candidate_id: str = "",
                 intent_account: str = "") -> Approval:
-        # Forward `signal_id` to the platform: it is what the platform resolves
-        # to a frozen signal + notional and checks against the autopilot
-        # envelope. What it decides is the platform's business, and today it
-        # declines every order to the owner's tap, so a `pending` reply is the
-        # ordinary case, not a fault. We do NOT send `signal`/`notional`: the
-        # edge holds no authority to vouch for a signal it did not itself emit;
-        # the platform recomputes both from the id against its own store. The edge
-        # stays a dumb executor of a granted artifact it independently verifies
-        # (see nakagai_edge/edge/executor.py); the platform decides, the edge never
-        # does. `signal_id` is also carried onto the local record below so it is
-        # honest about what the agent claimed.
+        # Forward `signal_id` to the platform. For a candidate it is the exact
+        # binding returned with the frozen prepared order. We do not send
+        # `signal` or `notional`: the edge holds no authority to vouch for
+        # either, and the platform resolves them from its own store. The edge
+        # independently verifies the signed grant before dispatch. `signal_id`
+        # is retained locally so that verification uses the same frozen value.
         _require_account_key(account_key)
+        if candidate_id:
+            if not isinstance(signal_id, str) or not signal_id.strip():
+                raise ValueError("candidate signal_id must be a nonempty string")
+            if not isinstance(intent_account, str) or not intent_account.strip():
+                raise ValueError("candidate account must be a nonempty string")
         out = self.client.enqueue_approval(
             connector_id, tool, args, signal_id, candidate_id)
         doc = intents(self.state)
-        doc[out["approval_id"]] = {
+        frozen = {
             "connector_id": connector_id, "tool": tool, "args": args,
-            "args_hash": args_hash(args), "created_at": time.time(),
-            "candidate_id": candidate_id, "account": intent_account}
-        _write_intents(self.state, doc)
+            "args_hash": args_hash(args),
+            "signal_id": signal_id, "candidate_id": candidate_id,
+            "account": intent_account}
+        approval_id = out["approval_id"]
+        existing = doc.get(approval_id)
+        if existing is not None:
+            if (not isinstance(existing, dict)
+                    or any(existing.get(field) != value
+                           for field, value in frozen.items())):
+                raise ValueError(
+                    f"local frozen intent mismatch for approval {approval_id!r}")
+            created_at = existing.get("created_at", time.time())
+        else:
+            created_at = time.time()
+            doc[approval_id] = {**frozen, "created_at": created_at}
+            _write_intents(self.state, doc)
         return Approval(id=out["approval_id"], account_key=account_key,
                         connector_id=connector_id,
                         tool=tool, args=args, status=out["status"],
                         agent_id=self.agent_id, requested_by=requested_by,
-                        created_at=time.time(), expires_at=out["expires_at"],
+                        created_at=created_at, expires_at=out["expires_at"],
                         signal_id=signal_id, candidate_id=candidate_id)
 
     def get(self, account_key: str, approval_id: str) -> Approval | None:

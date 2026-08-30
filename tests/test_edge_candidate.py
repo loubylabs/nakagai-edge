@@ -19,7 +19,11 @@ class _Client:
         self.calls.append((candidate_id, payload))
         if self.fail:
             raise RuntimeError("platform down")
-        return {"ok": True}
+        return {
+            "candidate_id": candidate_id,
+            "mechanical_status": payload["mechanical_status"],
+            "approval_id": payload["approval_id"],
+        }
 
 
 def test_candidate_outcome_stays_durable_until_platform_acknowledges_it(tmp_path):
@@ -39,6 +43,33 @@ def test_candidate_outcome_stays_durable_until_platform_acknowledges_it(tmp_path
     client = _Client()
     assert flush_candidate_outcomes(state, client) == 1
     assert client.calls == [("candidate-1", payload)]
+    assert pending_candidate_outcomes(state) == {}
+
+
+def test_terminal_candidate_response_acknowledges_the_durable_outcome(tmp_path):
+    state = EdgeState(tmp_path)
+    payload = {
+        "mechanical_status": "submitted",
+        "mechanical_reason": "broker fill reconciled and supervision verified",
+        "approval_id": "approval-1",
+        "urgent": False,
+        "outcome_unknown": False,
+    }
+
+    class TerminalClient:
+        def report_candidate_outcome(self, candidate_id, **reported):
+            assert candidate_id == "candidate-1"
+            assert reported == payload
+            return {
+                "candidate_id": candidate_id,
+                "decision": "accepted",
+                "mechanical_status": reported["mechanical_status"],
+                "mechanical_reason": reported["mechanical_reason"],
+                "approval_id": reported["approval_id"],
+            }
+
+    assert deliver_candidate_outcome(
+        state, TerminalClient(), "candidate-1", **payload) is True
     assert pending_candidate_outcomes(state) == {}
 
 

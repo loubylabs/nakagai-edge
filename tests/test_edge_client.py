@@ -166,7 +166,12 @@ def test_candidate_mechanical_outcome_uses_the_internal_outcome_route():
 
     def handler(request):
         seen.append((request.url.path, json.loads(request.content)))
-        return httpx.Response(200, json={"ok": True, "candidate_id": "candidate-1"})
+        return httpx.Response(200, json={
+            "candidate_id": "candidate-1", "decision": "accepted",
+            "mechanical_status": "blocked",
+            "mechanical_reason": "local policy is stale",
+            "approval_id": "approval-1",
+        })
 
     client = PlatformClient("https://api.test", "nk_agent_t",
                             transport=_transport(handler))
@@ -176,7 +181,7 @@ def test_candidate_mechanical_outcome_uses_the_internal_outcome_route():
         urgent=False, outcome_unknown=False,
     )
 
-    assert out["ok"] is True
+    assert out["mechanical_status"] == "blocked"
     assert seen == [("/api/agent/candidates/candidate-1/outcome", {
         "mechanical_status": "blocked",
         "mechanical_reason": "local policy is stale",

@@ -11,6 +11,7 @@ their edge agent and then arm, exactly like a direct MCP agent can.
 
 import json
 import uuid
+from datetime import datetime, timezone
 
 import httpx
 import pytest
@@ -122,10 +123,9 @@ async def test_edge_checkin_lands_where_the_platform_can_read_it(
         tmp_path, platform_root, platform_app):
     """The whole point of this branch: an equity report relayed by an EDGE
     agent, through its shim's own agent_checkin tool, must be readable by
-    mandate.latest_equity_report() on the platform - exactly like a direct
-    MCP agent's report already was before this fix, and was NOT for an edge
-    agent (the defect this branch closes)."""
-    from nakagai_platform import mandate as m
+    risk_inputs.read_equity_inputs() on the platform, exactly like a direct
+    MCP agent's report."""
+    from nakagai_platform.risk_inputs import read_equity_inputs
 
     owner = f"equity-owner-{uuid.uuid4().hex}@nakag.ai"
     token = _enroll(platform_app, user=owner)
@@ -140,10 +140,10 @@ async def test_edge_checkin_lands_where_the_platform_can_read_it(
     assert out["ok"] is True
 
     history = _history(owner)
-    report = m.latest_equity_report(history)
-    assert report is not None
-    assert report["account_equity"] == 100_000.0
-    assert report["day_pnl"] == -1_500.0
+    report = read_equity_inputs(
+        history=history, now=datetime.now(timezone.utc), max_age_s=1e308)
+    assert report.equity == 100_000.0
+    assert report.day_pnl == -1_500.0
 
     # And it landed under the edge agent's own name/id, not a synthetic one.
     event = history.read(limit=1, category="agents")[0]
@@ -155,7 +155,7 @@ async def test_edge_checkin_discards_half_an_equity_report(
         tmp_path, platform_root, platform_app):
     """Both fields or nothing, over the edge path too: equity alone has no
     baseline and would read as a flat day."""
-    from nakagai_platform import mandate as m
+    from nakagai_platform.risk_inputs import read_equity_inputs
 
     owner = f"half-report-owner-{uuid.uuid4().hex}@nakag.ai"
     token = _enroll(platform_app, user=owner)
@@ -165,8 +165,10 @@ async def test_edge_checkin_discards_half_an_equity_report(
     await mcp.call_tool("agent_checkin", {
         "status": "scanning", "account_equity": 100_000.0})   # no day_pnl
 
-    assert m.latest_equity_report(
-        _history(owner)) is None
+    report = read_equity_inputs(
+        history=_history(owner), now=datetime.now(timezone.utc), max_age_s=1e308)
+    assert report.equity is None
+    assert report.day_pnl is None
 
 
 async def test_edge_agent_can_arm_autopilot_after_checking_in_with_equity(

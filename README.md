@@ -5,7 +5,7 @@ the only place a broker credential is ever written to disk. Your agent talks to
 exactly one MCP endpoint, the edge, and never sees a token. The platform never
 sees one either.
 
-Version 0.5.0 is the current release. An agent woken for one execution
+Version 0.5.1 is the current release. An agent woken for one execution
 candidate can inspect that candidate, accept or abstain with a rationale, then
 stop. A listener-owned local scope enforces that boundary for the wake. The
 same candidate decision tools and read-only inspection remain available, while

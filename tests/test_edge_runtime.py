@@ -71,14 +71,33 @@ def _prepared_response(**overrides):
         "connector_id": "robinhood-trading", "account_id": "broker-account",
         "tool": "place_equity_order", "args": dict(BROKER_ORDER),
         "args_hash": args_hash(BROKER_ORDER), **overrides}
-    return {"candidate_id": "candidate-1", "decision": "accepted",
-            "canonical_order": dict(CANONICAL_ORDER), "prepared_order": prepared}
+    return {
+        "candidate_id": "candidate-1",
+        "decision": "accepted",
+        "mechanical_status": "prepared",
+        "mechanical_reason": "",
+        "approval_id": "",
+        "signal_id": "signal-1",
+        "canonical_order": dict(CANONICAL_ORDER),
+        "prepared_order": prepared,
+    }
 
 
 def _candidate_scope(state, candidate_id="candidate-1"):
     return CandidateWakeScope(state).begin({
         "seq": 1, "kind": "execution_candidate", "response_required": True,
         "candidate_id": candidate_id, "expires_at": time.time() + 300,
+    })
+
+
+def _outcome_ack(request):
+    payload = json.loads(request.content)
+    return httpx.Response(200, json={
+        "candidate_id": request.url.path.split("/")[-2],
+        "decision": "accepted",
+        "mechanical_status": payload["mechanical_status"],
+        "mechanical_reason": payload["mechanical_reason"],
+        "approval_id": payload["approval_id"],
     })
 
 
@@ -324,6 +343,35 @@ async def test_candidate_scope_denies_direct_platform_writes(tmp_path):
     assert requests == []
 
 
+@pytest.mark.parametrize("signal_id", [None, "", "   ", 7])
+def test_prepared_order_requires_one_nonempty_platform_signal_id(signal_id):
+    response = _prepared_response()
+    if signal_id is None:
+        del response["signal_id"]
+    else:
+        response["signal_id"] = signal_id
+
+    with pytest.raises(ValueError, match="signal_id"):
+        _prepared_order(
+            "candidate-1", response, _candidate_spec(), "broker-account")
+
+
+def test_prepared_order_rejects_additional_response_fields():
+    response = _prepared_response()
+    response["unreviewed"] = True
+
+    with pytest.raises(ValueError, match="candidate acceptance.*fields"):
+        _prepared_order(
+            "candidate-1", response, _candidate_spec(), "broker-account")
+
+
+def test_prepared_order_returns_the_exact_signal_binding():
+    prepared = _prepared_order(
+        "candidate-1", _prepared_response(), _candidate_spec(), "broker-account")
+
+    assert prepared["signal_id"] == "signal-1"
+
+
 @pytest.mark.parametrize("missing", [
     "connector_id", "account_id", "tool", "args", "args_hash",
 ])
@@ -421,6 +469,8 @@ async def test_accept_candidate_refreshes_broker_evidence_then_submits_exact_ord
         if req.url.path.endswith("/accept"):
             return httpx.Response(200, json={
                 "candidate_id": "candidate-1", "decision": "accepted",
+                "mechanical_status": "prepared", "mechanical_reason": "",
+                "approval_id": "", "signal_id": "signal-1",
                 "canonical_order": dict(CANONICAL_ORDER),
                 "prepared_order": {
                     "connector_id": "robinhood-trading",
@@ -488,10 +538,17 @@ async def test_accept_candidate_refreshes_broker_evidence_then_submits_exact_ord
     ]
     assert reporter.calls == 1
     assert hub.calls == [("robinhood-trading", "place_equity_order", broker_args, {
-        "account_key": "ag1", "signal_id": "", "candidate_id": "candidate-1",
+        "account_key": "ag1", "signal_id": "signal-1",
+        "candidate_id": "candidate-1",
         "intent_account": "broker-account", "require_approval": True})]
-    assert doc == {"candidate_id": "candidate-1", "decision": "accepted",
-                   "approval_id": "approval-1", "status": "pending"}
+    assert doc == {
+        "candidate_id": "candidate-1",
+        "decision": "accepted",
+        "mechanical_status": "prepared",
+        "mechanical_reason": "",
+        "approval_id": "approval-1",
+        "status": "pending",
+    }
     assert "prepared_order" not in doc
 
 
@@ -507,16 +564,12 @@ async def test_accept_candidate_rejects_local_map_mismatch_without_connector_con
         if req.url.path == "/api/agent/checkin":
             return httpx.Response(200, json={"ok": True})
         if req.url.path.endswith("/outcome"):
-            return httpx.Response(200, json={"ok": True})
+            return _outcome_ack(req)
         canonical = dict(CANONICAL_ORDER)
         canonical["quantity"] = 4
-        return httpx.Response(200, json={
-            "candidate_id": "candidate-1", "decision": "accepted",
-            "canonical_order": canonical,
-            "prepared_order": {"connector_id": "robinhood-trading",
-                               "account_id": "broker-account",
-                               "tool": "place_equity_order", "args": broker_args,
-                               "args_hash": args_hash(broker_args)}})
+        response = _prepared_response()
+        response["canonical_order"] = canonical
+        return httpx.Response(200, json=response)
 
     class Hub:
         account_key = "ag1"
@@ -565,7 +618,7 @@ async def test_accept_candidate_rejects_blocked_response_with_prepared_order(
         if req.url.path == "/api/agent/checkin":
             return httpx.Response(200, json={"ok": True})
         if req.url.path.endswith("/outcome"):
-            return httpx.Response(200, json={"ok": True})
+            return _outcome_ack(req)
         response = _prepared_response()
         response["mechanical_status"] = "blocked"
         return httpx.Response(200, json=response)
@@ -619,14 +672,8 @@ async def test_accept_candidate_stale_local_policy_creates_no_approval(
         if req.url.path == "/api/agent/checkin":
             return httpx.Response(200, json={"ok": True})
         if req.url.path.endswith("/outcome"):
-            return httpx.Response(200, json={"ok": True})
-        return httpx.Response(200, json={
-            "candidate_id": "candidate-1", "decision": "accepted",
-            "canonical_order": dict(CANONICAL_ORDER),
-            "prepared_order": {"connector_id": "robinhood-trading",
-                               "account_id": "broker-account",
-                               "tool": "place_equity_order", "args": broker_args,
-                               "args_hash": args_hash(broker_args)}})
+            return _outcome_ack(req)
+        return httpx.Response(200, json=_prepared_response())
 
     class Hub:
         account_key = "ag1"
@@ -746,7 +793,7 @@ async def test_prepared_order_is_not_submitted_after_portfolio_report_failure(
         if req.url.path.endswith("/accept"):
             return httpx.Response(200, json=_prepared_response())
         if req.url.path.endswith("/outcome"):
-            return httpx.Response(200, json={"ok": True})
+            return _outcome_ack(req)
         raise AssertionError(req.url.path)
 
     class Reporter:

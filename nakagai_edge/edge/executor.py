@@ -2,6 +2,7 @@
 the LOCAL copy of the intent, execute at the broker, report back. Verification
 is fail-closed: any mismatch reports an error and never touches the broker."""
 
+import asyncio
 import logging
 import time
 
@@ -19,8 +20,13 @@ from nakagai_edge.edge.candidate import (
 from nakagai_edge.edge.portfolio import position_rows
 from nakagai_edge.edge.remote import drop_intent, intents, mark_submitted
 from nakagai_edge.edge.state import EdgeState
-from nakagai_edge.edge.supervision import (is_guarded, load as load_positions,
-                                           record as record_position)
+from nakagai_edge.edge.supervision import (
+    apply_renewals,
+    is_guarded,
+    load as load_positions,
+    record as record_position,
+    renewal_request,
+)
 from nakagai_edge.edge.sync import policy_fresh, public_key
 from nakagai_edge.signing import verify_artifact
 from nakagai_edge.warrant import exit_order_args, read_entry
@@ -31,7 +37,9 @@ TERMINAL_ORDER_STATUSES = ("cancelled", "rejected")
 log = logging.getLogger("nakagai.edge")
 
 
-def _verify(state: EdgeState, approval_id: str, intent: dict, artifact) -> str:
+def _verify(
+        state: EdgeState, approval_id: str, intent: dict,
+        record: dict, artifact) -> str:
     """Empty string when the artifact authorizes exactly this intent, else why not."""
     if not isinstance(artifact, dict):
         return "no artifact on a granted approval"
@@ -41,6 +49,14 @@ def _verify(state: EdgeState, approval_id: str, intent: dict, artifact) -> str:
     if not verify_artifact(pub, artifact):
         return "signature verification failed"
     agent = state.agent() or {}
+    if intent.get("candidate_id"):
+        signal_id = intent.get("signal_id")
+        if not isinstance(signal_id, str) or not signal_id.strip():
+            return "candidate signal_id is missing or empty"
+        if signal_id != signal_id.strip():
+            return "candidate signal_id is not whitespace-exact"
+        if record.get("signal_id") != signal_id:
+            return "signal_id mismatch"
     checks = (
         (artifact.get("approval_id") == approval_id, "approval_id mismatch"),
         (artifact.get("agent_id") == agent.get("agent_id"), "agent_id mismatch"),
@@ -198,7 +214,8 @@ def supervise(hub, state: EdgeState, approval_id: str, intent: dict,
 
 
 async def _verify_supervision(
-        hub, state: EdgeState, approval_id: str, intent: dict,
+        hub, state: EdgeState, client: PlatformClient,
+        approval_id: str, intent: dict,
         record_doc: dict, fill: dict) -> None:
     spec = hub.spec(intent["connector_id"])
     status, rows, error = await position_rows(hub, spec, intent["account"])
@@ -227,9 +244,21 @@ async def _verify_supervision(
     if rec is None:
         raise ValueError("supervision record was not durably persisted")
     from nakagai_edge.edge.brake import armed, disarmed_positions
+    guarded = {
+        "brake_armed": armed(state),
+        "disarmed": disarmed_positions(state),
+        "now": time.time(),
+    }
+    if not is_guarded(rec, **guarded):
+        ask = [position for position in renewal_request(state)
+               if position.get("position_id") == approval_id]
+        if ask:
+            renewed = await asyncio.to_thread(client.renew_warrants, ask)
+            apply_renewals(state, renewed.get("warrants") or {})
+            rec = load_positions(state).get(approval_id)
     if not is_guarded(
-            rec, brake_armed=armed(state), disarmed=disarmed_positions(state),
-            now=time.time()):
+            rec or {}, brake_armed=armed(state),
+            disarmed=disarmed_positions(state), now=time.time()):
         raise ValueError("supervision record is not armed and warranted")
     if load_positions(state).get(approval_id) != rec:
         raise ValueError("supervision record changed before broker verification completed")
@@ -345,7 +374,7 @@ async def reconcile_submitted_fills(
             if reason:
                 raise ValueError(reason)
             await _verify_supervision(
-                hub, state, approval_id, intent,
+                hub, state, client, approval_id, intent,
                 intent.get("approval") or {}, fill)
         except Exception as error:  # noqa: BLE001 (a matched fill now exists)
             reason = reason or (
@@ -434,7 +463,8 @@ async def poll_once(hub, state: EdgeState, client: PlatformClient,
         if status != "granted":
             continue
 
-        why_not = _verify(state, approval_id, intent, record.get("artifact"))
+        why_not = _verify(
+            state, approval_id, intent, record, record.get("artifact"))
         if why_not:
             audit.record("error", intent["connector_id"], intent["tool"],
                          {"approval_id": approval_id,
