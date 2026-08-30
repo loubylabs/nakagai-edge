@@ -26,6 +26,7 @@ from nakagai_edge.signing import verify_artifact
 from nakagai_edge.warrant import exit_order_args, read_entry
 
 DEAD_STATUSES = ("denied", "expired", "error", "executed")
+TERMINAL_ORDER_STATUSES = ("cancelled", "rejected")
 
 log = logging.getLogger("nakagai.edge")
 
@@ -235,15 +236,39 @@ async def _verify_supervision(
 
 
 def _declared_fill(spec, row: dict) -> bool:
+    return _declared_order_status(spec, row, "filled")
+
+
+def declared_terminal_order_values(spec) -> tuple[str, ...]:
+    """Broker values explicitly mapped as terminal without a fill."""
+    try:
+        cap = spec.capability("list_orders")
+    except CapabilityError:
+        return ()
+    values = cap.values.get("status") or {}
+    return tuple(dict.fromkeys(
+        str(value).strip()
+        for canonical in TERMINAL_ORDER_STATUSES
+        for value in values.get(canonical) or []
+        if str(value).strip()
+    ))
+
+
+def _declared_order_status(spec, row: dict, canonical: str) -> bool:
     try:
         cap = spec.capability("list_orders")
     except CapabilityError:
         return False
     declared = {
         str(value).strip().lower()
-        for value in (cap.values.get("status") or {}).get("filled") or []
+        for value in (cap.values.get("status") or {}).get(canonical) or []
     }
     return bool(declared) and str(row.get("status") or "").strip().lower() in declared
+
+
+def _terminal_order_status(spec, row: dict) -> str:
+    return next((status for status in TERMINAL_ORDER_STATUSES
+                 if _declared_order_status(spec, row, status)), "")
 
 
 def _matching_fill(spec, intent: dict, row: dict) -> str:
@@ -287,6 +312,31 @@ async def reconcile_submitted_fills(
                      and str(row.get("order_id") or "")
                      == str(intent.get("broker_order_id") or "")
                      and _declared_fill(spec, row)), None)
+        terminal = next((
+            _terminal_order_status(spec, row)
+            for row in rows
+            if isinstance(row, dict)
+            and str(row.get("order_id") or "")
+            == str(intent.get("broker_order_id") or "")
+            and _terminal_order_status(spec, row)
+        ), "")
+        if fill is None and terminal:
+            matched += 1
+            reason = f"broker order reached terminal status {terminal}"
+            try:
+                audit.record(
+                    "denial", intent["connector_id"], intent["tool"],
+                    {"approval_id": approval_id, "error": reason,
+                     "order_id": intent["broker_order_id"]})
+            except Exception:  # noqa: BLE001 (the durable outcome owns retry)
+                pass
+            if intent.get("candidate_id"):
+                _candidate_outcome(
+                    state, client, intent["candidate_id"],
+                    mechanical_status="blocked", reason=reason,
+                    approval_id=approval_id)
+            drop_intent(state, approval_id)
+            continue
         if fill is None:
             continue
         matched += 1
@@ -546,7 +596,8 @@ async def poll_once(hub, state: EdgeState, client: PlatformClient,
                         _candidate_outcome(
                             state, client, intent["candidate_id"],
                             mechanical_status="blocked", reason=reason,
-                            approval_id=approval_id, urgent=True)
+                            approval_id=approval_id, urgent=True,
+                            outcome_unknown=True)
                         _alert_candidate(client, reason)
                         try:
                             audit.record(

@@ -168,7 +168,9 @@ ROBINHOOD_CONNECTOR = {
                        "filled_at": ["last_transaction_at"]},
             "values": {"side": {"buy": ["buy", "buy_to_open", "buy_to_cover"],
                                 "sell": ["sell", "sell_to_open", "sell_short"]},
-                       "status": {"filled": ["filled"]}}},
+                       "status": {"filled": ["filled"],
+                                  "cancelled": ["cancelled"],
+                                  "rejected": ["rejected"]}}},
         "cancel_order": {
             "tool": "cancel_order",
             "args": {"order_id": "order_id", "account": "account_number"}},

@@ -285,6 +285,53 @@ async def test_fill_sweep_completes_exact_submitted_candidate_before_anchoring(
     assert client.outcomes[0][1]["mechanical_status"] == "submitted"
 
 
+async def test_fill_sweep_queries_declared_terminal_states_for_submitted_order(
+        tmp_path):
+    state = _state(tmp_path, [ROBINHOOD_CONNECTOR])
+    state._write_private(state.intents_path, {
+        "approval-1": {
+            "connector_id": "robinhood-trading",
+            "tool": "place_equity_order",
+            "args": {
+                "account_number": "463605220", "symbol": "NVDA",
+                "side": "buy", "type": "limit", "quantity": "60",
+                "limit_price": "112.35", "stop_price": "109.50",
+                "time_in_force": "day",
+            },
+            "args_hash": "frozen", "candidate_id": "candidate-1",
+            "account": "463605220", "phase": "submitted",
+            "broker_order_id": "ord-1", "approval": {},
+            "broker_result": {"data": {"order_id": "ord-1"}},
+        },
+    })
+
+    class TerminalHub(EnvelopeHub):
+        async def call(self, connector_id, tool, args, **kw):
+            self.calls.append((connector_id, tool, dict(args)))
+            if tool == "get_accounts":
+                out = {"accounts": [{"account_number": "463605220"}]}
+            elif args.get("state") == "cancelled":
+                out = {"orders": [{
+                    "id": "ord-1", "symbol": "NVDA", "side": "buy",
+                    "quantity": "60", "state": "cancelled",
+                }]}
+            else:
+                out = {"orders": []}
+            return {"data": {"data": out, "guide": "ignore me"}}
+
+    hub = TerminalHub({})
+    client = Client()
+
+    await FillsReporter(state, hub, client).sweep()
+
+    from nakagai_edge.edge.remote import intents
+    assert intents(state) == {}
+    assert client.outcomes[0][1]["mechanical_status"] == "blocked"
+    queried = [args.get("state") for _connector, tool, args in hub.calls
+               if tool == "get_equity_orders"]
+    assert queried == ["filled", "cancelled"]
+
+
 async def test_only_what_appears_after_the_anchor_is_journaled(tmp_path):
     client = Client()
     state = _rh_only(tmp_path)

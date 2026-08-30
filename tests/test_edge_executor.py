@@ -307,6 +307,7 @@ async def test_candidate_execution_report_failure_keeps_submission_and_disarms(
     assert candidate_entries_armed(state) is False
     assert client.candidate_outcomes[0]["mechanical_status"] == "blocked"
     assert client.candidate_outcomes[0]["urgent"] is True
+    assert client.candidate_outcomes[0]["outcome_unknown"] is True
     assert client.candidate_alerts
 
 
@@ -411,6 +412,71 @@ async def test_mismatched_fill_order_id_cannot_complete_candidate(tmp_path):
     assert matched == 0
     assert load_supervision(state) == {}
     assert intents(state)["a1"]["phase"] == "submitted"
+    assert client.candidate_outcomes == []
+
+
+async def test_declared_terminal_order_blocks_candidate_without_supervision(
+        tmp_path):
+    artifact = _artifact(
+        "a1", args=CANDIDATE_ARGS, candidate_id="candidate-1",
+        account="463605220")
+    state, client, queue, _reports = _setup(
+        tmp_path, artifact=artifact,
+        record_overrides={
+            "args": CANDIDATE_ARGS, "signal_id": "signal-1",
+            "exit_warrant": {
+                "expires_at": time.time() + 3600, "signature": "warrant"},
+        },
+    )
+    queue.enqueue(
+        "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
+        candidate_id="candidate-1", intent_account="463605220",
+    )
+    hub = CandidateHub()
+    await poll_once(hub, state, client, EdgeAudit(state))
+
+    reconciled = await reconcile_submitted_fills(
+        hub, state, client, EdgeAudit(state), hub.spec("demo"), "463605220",
+        [{"order_id": "42", "symbol": "AAPL", "side": "buy",
+          "quantity": 3.0, "status": "cancelled"}],
+    )
+
+    assert reconciled == 1
+    assert intents(state) == {}
+    assert load_supervision(state) == {}
+    assert candidate_entries_armed(state) is True
+    assert client.candidate_outcomes == [{
+        "mechanical_status": "blocked",
+        "mechanical_reason": "broker order reached terminal status cancelled",
+        "approval_id": "a1", "urgent": False, "outcome_unknown": False,
+    }]
+
+
+async def test_undeclared_order_status_keeps_submitted_candidate_durable(
+        tmp_path):
+    artifact = _artifact(
+        "a1", args=CANDIDATE_ARGS, candidate_id="candidate-1",
+        account="463605220")
+    state, client, queue, _reports = _setup(
+        tmp_path, artifact=artifact,
+        record_overrides={"args": CANDIDATE_ARGS},
+    )
+    queue.enqueue(
+        "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
+        candidate_id="candidate-1", intent_account="463605220",
+    )
+    hub = CandidateHub()
+    await poll_once(hub, state, client, EdgeAudit(state))
+
+    reconciled = await reconcile_submitted_fills(
+        hub, state, client, EdgeAudit(state), hub.spec("demo"), "463605220",
+        [{"order_id": "42", "symbol": "AAPL", "side": "buy",
+          "quantity": 3.0, "status": "broker-specific-done"}],
+    )
+
+    assert reconciled == 0
+    assert intents(state)["a1"]["phase"] == "submitted"
+    assert load_supervision(state) == {}
     assert client.candidate_outcomes == []
 
 
