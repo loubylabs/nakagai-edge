@@ -587,15 +587,14 @@ async def test_a_write_infers_the_single_allowed_account(tmp_path):
                          "tif": "day", "acct": "AL-1"}]
 
 
-async def test_a_write_does_not_infer_when_two_accounts_are_allowed(tmp_path):
-    """Two allowed accounts is a choice the agent has to make out loud. The
-    call still goes down, carrying no account, and `check_accounts` refuses it
-    there."""
+async def test_a_write_without_an_unambiguous_account_is_refused_before_the_broker(tmp_path):
+    """An absent account must not reach a broker default selection."""
     hub = MapHub(specs=_tiered(["AL-1", "AL-2"], []))
-    await _call(_server(_state(tmp_path), hub), "place_order",
-                symbol="AAPL", side="buy", quantity=1, **ORDER)
+    doc = await _call(_server(_state(tmp_path), hub), "place_order",
+                      symbol="AAPL", side="buy", quantity=1, **ORDER)
 
-    assert "acct" not in hub.args[0]
+    assert doc["is_error"] is True and "account" in doc["error"]
+    assert hub.args == []
 
 
 async def test_a_write_never_infers_the_read_tiers_account(tmp_path):
@@ -644,7 +643,7 @@ async def test_with_no_tiers_and_two_listed_accounts_nothing_is_inferred(tmp_pat
     assert hub.args[1] == {}, "an ambiguous list is not an answer"
 
 
-async def test_the_brokers_account_list_is_never_consulted_when_tiers_exist(tmp_path):
+async def test_a_missing_write_account_never_consults_the_brokers_account_list(tmp_path):
     """The one rule that would reintroduce the default-account hole.
 
     Tiers are the OWNER's statement of authority; the broker's list is not.
@@ -656,8 +655,8 @@ async def test_the_brokers_account_list_is_never_consulted_when_tiers_exist(tmp_
     await _call(_server(_state(tmp_path), hub), "place_order",
                 symbol="AAPL", side="buy", quantity=1, **ORDER)
 
-    assert hub.tools == ["submit"], "the broker's account list was consulted"
-    assert "acct" not in hub.args[0]
+    assert hub.tools == [], "the broker's account list was consulted"
+    assert hub.args == []
 
 
 async def test_an_account_the_agent_named_is_never_overridden(tmp_path):
@@ -798,14 +797,11 @@ async def test_a_side_the_connector_cannot_spell_is_refused(tmp_path):
     assert hub.calls == []
 
 
-async def test_an_uninferable_write_is_refused_by_the_guardrails(tmp_path):
+async def test_an_uninferable_write_is_refused_by_the_order_resolver(tmp_path):
     """The proof that this layer holds no authority of its own.
 
-    Two allowed accounts, so nothing is inferred and the call reaches
-    `check_accounts` naming no account. What comes back is `check_accounts`'
-    own sentence, through the same door `call_connector` uses. A capability
-    layer that refused this itself would be a second authorization path, and
-    the two would drift.
+    Two allowed accounts leave no account to infer. The resolver refuses before
+    the broker can apply a default account.
     """
     entry = {**ALIEN_CONNECTOR,
              "guardrails": {**ALIEN_CONNECTOR["guardrails"],
@@ -820,8 +816,7 @@ async def test_an_uninferable_write_is_refused_by_the_guardrails(tmp_path):
         await hub.aclose()
 
     assert doc["is_error"] is True
-    assert "names no account" in doc["error"]
-    assert "AL-1, AL-2" in doc["error"]
+    assert "account" in doc["error"]
 
 
 async def test_a_write_to_a_read_only_connector_is_refused_by_the_guardrails(

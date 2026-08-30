@@ -15,7 +15,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from nakagai_edge._env import read_env_ref
-from nakagai_edge.capability import (CAPABILITIES, OUTBOUND_ORDER_FIELDS, OUTBOUND_TYPES, Capability,
+from nakagai_edge.capability import (CANONICAL_ORDER_ENUMS, CAPABILITIES, OUTBOUND_ORDER_FIELDS, OUTBOUND_TYPES, Capability,
                                      CapabilityError)
 from nakagai_edge.slug import safe_slug
 
@@ -235,6 +235,21 @@ class ConnectorSpec(BaseModel):
             raise ValueError(
                 f"connector {cid!r} declares unsupported outbound types: "
                 f"{', '.join(unknown)}")
+        return v
+
+    @field_validator("capabilities")
+    @classmethod
+    def _order_enum_values_are_closed(cls, v: dict, info) -> dict:
+        cap = v.get("place_order")
+        if cap is None:
+            return v
+        cid = (info.data or {}).get("id", "?")
+        for field, allowed in CANONICAL_ORDER_ENUMS.items():
+            unknown = sorted(set(cap.values.get(field) or {}) - allowed)
+            if unknown:
+                raise ValueError(
+                    f"connector {cid!r} declares unsupported canonical {field} "
+                    f"values: {', '.join(unknown)}")
         return v
 
     @model_validator(mode="after")

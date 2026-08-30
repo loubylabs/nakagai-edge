@@ -140,6 +140,53 @@ def test_resolve_refuses_an_unknown_canonical_order_field():
         resolve("place_order", ORDER, args)
 
 
+def test_resolve_refuses_an_outbound_key_shared_by_two_canonical_fields():
+    duplicate = ORDER.model_copy(update={
+        "args": {**ORDER.args, "limit_price": "quantity"}})
+    with pytest.raises(CapabilityError, match="quantity.*limit_price"):
+        resolve("place_order", duplicate, {
+            "symbol": "AAPL", "side": "buy", "order_type": "limit",
+            "quantity": 5, "limit_price": 187.2, "stop_price": 180.0,
+            "time_in_force": "gfd", "account": "463605220"})
+
+
+def test_resolve_refuses_a_connector_added_canonical_side_value():
+    expanded = ORDER.model_copy(update={
+        "values": {**ORDER.values, "side": {
+            **ORDER.values["side"], "short": ["sell_short"]}}})
+    with pytest.raises(CapabilityError, match="side"):
+        resolve("place_order", expanded, {
+            "symbol": "AAPL", "side": "short", "order_type": "limit",
+            "quantity": 5, "limit_price": 187.2, "stop_price": 180.0,
+            "time_in_force": "gfd", "account": "463605220"})
+
+
+def test_resolve_refuses_a_connector_added_canonical_order_type_value():
+    expanded = ORDER.model_copy(update={
+        "values": {**ORDER.values, "order_type": {
+            **ORDER.values["order_type"], "stop_limit": ["stop_limit"]}}})
+    with pytest.raises(CapabilityError, match="order_type"):
+        resolve("place_order", expanded, {
+            "symbol": "AAPL", "side": "buy", "order_type": "stop_limit",
+            "quantity": 5, "limit_price": 187.2, "stop_price": 180.0,
+            "time_in_force": "gfd", "account": "463605220"})
+
+
+def test_resolve_normalizes_limit_before_checking_its_required_prices():
+    with pytest.raises(CapabilityError, match="limit_price, stop_price"):
+        resolve("place_order", ORDER, {
+            "symbol": "AAPL", "side": "buy", "order_type": "LIMIT",
+            "quantity": 5, "time_in_force": "gfd", "account": "463605220"})
+
+
+def test_resolve_refuses_an_order_without_an_account():
+    with pytest.raises(CapabilityError, match="account"):
+        resolve("place_order", ORDER, {
+            "symbol": "AAPL", "side": "buy", "order_type": "limit",
+            "quantity": 5, "limit_price": 187.2, "stop_price": 180.0,
+            "time_in_force": "gfd"})
+
+
 def test_resolve_refuses_an_arg_the_connector_never_declared():
     cap = Capability(tool="get_portfolio", args={})
     with pytest.raises(CapabilityError, match="account"):

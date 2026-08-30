@@ -149,6 +149,13 @@ def test_an_order_map_with_an_unknown_outbound_type_is_rejected_at_parse_time():
         ConnectorSpec(**BASE, capabilities={"place_order": cap})
 
 
+def test_an_order_map_cannot_add_a_canonical_order_type_value():
+    cap = _order_map()["place_order"]
+    cap["values"]["order_type"]["stop_limit"] = ["stop_limit"]
+    with pytest.raises(ValueError, match="demo.*unsupported canonical order_type.*stop_limit"):
+        ConnectorSpec(**BASE, capabilities={"place_order": cap})
+
+
 def test_a_connector_that_declares_no_place_order_still_parses():
     # A quotes or positions connector is not a broken broker, and this rule is
     # about what an order IS, not about what every connector must serve.

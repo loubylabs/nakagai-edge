@@ -76,6 +76,10 @@ OUTBOUND_ORDER_FIELDS = (
     "stop_price", "time_in_force", "account")
 
 OUTBOUND_TYPES = frozenset(("string", "number"))
+CANONICAL_ORDER_ENUMS = {
+    "side": frozenset(("buy", "sell")),
+    "order_type": frozenset(("limit", "market")),
+}
 
 CAPABILITIES: dict[str, CapabilitySpec] = {
     "list_accounts": CapabilitySpec(
@@ -226,6 +230,43 @@ def _outbound_enum(field: str, value: Any, cap: Capability) -> Any:
     return aliases[0]
 
 
+def _normalize_order_args(args: dict) -> dict:
+    """Return one canonical spelling before any order validation runs."""
+    normalized = dict(args)
+    for field, allowed in CANONICAL_ORDER_ENUMS.items():
+        value = normalized.get(field)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise CapabilityError(f"{field!r} must be a canonical string")
+        value = value.strip().lower()
+        if value not in allowed:
+            raise CapabilityError(f"unsupported canonical {field!r}: {value!r}")
+        normalized[field] = value
+    return normalized
+
+
+def _validate_order_map(cap: Capability) -> None:
+    """Refuse ambiguous keys and connector-expanded canonical enums."""
+    mapped: dict[str, str] = {}
+    for field in OUTBOUND_ORDER_FIELDS:
+        key = cap.args.get(field)
+        if not key:
+            continue
+        other = mapped.get(key)
+        if other is not None:
+            raise CapabilityError(
+                f"place_order maps {other!r} and {field!r} to broker argument "
+                f"{key!r}")
+        mapped[key] = field
+    for field, allowed in CANONICAL_ORDER_ENUMS.items():
+        unknown = sorted(set(cap.values.get(field) or {}) - allowed)
+        if unknown:
+            raise CapabilityError(
+                f"connector adds unsupported canonical {field!r} values: "
+                f"{', '.join(unknown)}")
+
+
 def _finite_number(field: str, value: Any) -> int | float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise CapabilityError(f"{field!r} must be a finite number")
@@ -273,8 +314,10 @@ def resolve(name: str, cap: Capability, args: dict) -> tuple[str, dict]:
     if not isinstance(args, dict):
         raise CapabilityError(f"capability {name!r} arguments must be a dictionary")
     if name == "place_order":
+        args = _normalize_order_args(args)
+        _validate_order_map(cap)
         missing = [field for field in ("symbol", "side", "order_type", "quantity",
-                                       "time_in_force")
+                                       "time_in_force", "account")
                    if args.get(field) is None]
         if args.get("order_type") == "limit":
             missing.extend(field for field in ("limit_price", "stop_price")
