@@ -378,8 +378,10 @@ order opens or closes. A broker with separate verbs mapped as
 the one meant to cover a short.
 
 The generic broker surface exposes seven named tools that work against any
-broker. An execution-candidate wake receives only its two candidate decision
-tools, never an order-construction surface.
+broker. The shared MCP surface remains present during an execution-candidate
+wake. For that event, the candidate workflow authorizes only
+`accept_candidate` or `abstain_candidate`, and forbids connector writes,
+order construction, and every other action.
 `connector_id` is optional only while exactly one enabled broker declares the
 capability. Enable a second and the edge stops filling it in: the call comes
 back naming both candidates and the agent has to say which brokerage it meant.

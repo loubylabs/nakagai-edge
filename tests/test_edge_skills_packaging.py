@@ -118,6 +118,8 @@ def test_candidate_trader_skill_bounds_one_terminal_decision(wheel):
         "stop after one durable decision",
         "Accepting does not authorize changing any prepared field.",
         "Local policy or the brake can still refuse execution.",
+        "The platform owns quantity and price.",
+        "The model cannot select or edit quantity or price.",
     ):
         assert required in body
 

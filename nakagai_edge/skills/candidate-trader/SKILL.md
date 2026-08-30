@@ -46,6 +46,7 @@ The candidate tools are the only write-shaped tools for this event. Do not call
 Accepting does not authorize changing any prepared field. The platform alone
 constructs the frozen order and retains authority for its symbol, side, order
 type, account, quantity, entry, stop, connector, risk policy, and expiry.
+The platform owns quantity and price. The model cannot select or edit quantity or price.
 
 Local policy or the brake can still refuse execution. Acceptance is a judgment,
 not approval, a grant, a broker call, or a promise that a trade will execute.
