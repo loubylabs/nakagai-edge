@@ -508,8 +508,9 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
             default=str)
 
     @mcp.tool()
-    async def place_order(symbol: str, side: str, quantity: float,
-                          price: float | None = None, stop: float | None = None,
+    async def place_order(symbol: str, side: str, order_type: str, quantity: int,
+                          limit_price: float, stop_price: float,
+                          time_in_force: str,
                           connector_id: str = "", account: str = "",
                           signal_id: str = "") -> str:
         """Place an order, or ask the owner for permission to. WHICH ONE
@@ -534,10 +535,11 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         the tool your order maps to. Do not assume either.
 
         `side` is canonical: pass `buy` or `sell`, never the broker's own
-        spelling. `quantity` is in shares. `price` makes it a limit order and
-        `stop` sets the stop, both in the account's currency; only the fields
-        you name are sent, and the edge never adds an order type of its own, so
-        a broker that needs one will say so in its own error.
+        spelling. `order_type` is `limit` or `market`. `quantity` is a positive
+        whole-share count. `limit_price` and `stop_price` are in the account's
+        currency. `time_in_force` is the connector's declared canonical value.
+        The edge resolves each value through the connector map before it hashes
+        or sends the broker arguments.
 
         AN ORDER WITH NO `stop` GETS NO BRAKE. The stop is the level the edge
         watches, so an order placed without one is executed and then supervised
@@ -565,9 +567,13 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         return json.dumps(
             await _capability_call("place_order", connector_id,
                                    {"symbol": symbol, "side": side,
-                                    "quantity": quantity, "price": price,
-                                    "stop": stop, "account": account},
-                                   required=("symbol", "side", "quantity"),
+                                    "order_type": order_type, "quantity": quantity,
+                                    "limit_price": limit_price,
+                                    "stop_price": stop_price,
+                                    "time_in_force": time_in_force,
+                                    "account": account},
+                                   required=("symbol", "side", "order_type", "quantity",
+                                             "limit_price", "stop_price", "time_in_force"),
                                    signal_id=signal_id), default=str)
 
     @mcp.tool()

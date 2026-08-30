@@ -15,7 +15,7 @@ from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.supervision import record as record_position
 from nakagai_edge.edge.sync import policy_fresh, public_key
 from nakagai_edge.signing import verify_artifact
-from nakagai_edge.warrant import read_entry
+from nakagai_edge.warrant import exit_order_args, read_entry
 
 DEAD_STATUSES = ("denied", "expired", "error", "executed")
 
@@ -134,8 +134,8 @@ def supervise(hub, state: EdgeState, approval_id: str, intent: dict,
         # Anything on this list leaves a position we can SEE but must never act
         # on: the direction decides how reconcile reads the broker's sign, the
         # account is what the warrant is scoped to and the only thing the
-        # broker can be asked about, and with no market_args declared
-        # there is no exit order to build at all (spec section 9). Recording
+        # broker can be asked about, and without a resolvable canonical market
+        # order there is no exit order to build at all (spec section 9). Recording
         # those unguarded keeps them visible; recording a guess would put a
         # wrong R multiple on the owner's screen beside a `guarded: True` that
         # is not true. Every reason is named rather than just the first: the
@@ -144,7 +144,8 @@ def supervise(hub, state: EdgeState, approval_id: str, intent: dict,
         blocked = "; ".join(why for why, ok in (
             ("unclassifiable order side", direction),
             ("no account on the order", account),
-            ("connector declares no market_args", cap.market_args),
+            ("connector cannot express a canonical market exit",
+             exit_order_args(cap, intent.get("args") or {}, entry["qty"])),
         ) if not ok)
         rec = {
             "position_id": approval_id,

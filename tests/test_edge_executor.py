@@ -328,18 +328,25 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
     monkeypatch.setenv("NAKAGAI_APPROVER_EMAILS", "chris@nakag.ai")
     monkeypatch.setenv("NAKAGAI_APPROVAL_SIGNING_KEY", priv)
 
-    order = {"symbol": "NVDA", "side": "buy", "quantity": 10,
-             "limit_price": 118.40, "stop_price": 116.10}
+    order = {"symbol": "NVDA", "side": "buy", "order_type": "limit",
+             "quantity": 10, "limit_price": 118.40, "stop_price": 116.10,
+             "time_in_force": "day"}
     # The connector's own words for placing an order. `tool` is also the
     # positive gate: exactly one declared share-order tool, so an option order
     # cannot ride in on a `place_*` glob and be sized without its multiplier.
     place_order = {
         "tool": "place_equity_order",
-        "args": {"symbol": "symbol", "side": "side", "quantity": "quantity",
-                 "price": "limit_price", "stop": "stop_price",
+        "args": {"symbol": "symbol", "side": "side", "order_type": "type",
+                 "quantity": "quantity", "limit_price": "limit_price",
+                 "stop_price": "stop_price", "time_in_force": "time_in_force",
                  "account": "account_number"},
+        "outbound_types": {"symbol": "string", "side": "string",
+                           "order_type": "string", "quantity": "string",
+                           "limit_price": "string", "stop_price": "string",
+                           "time_in_force": "string", "account": "string"},
         "values": {"side": {"buy": ["buy", "buy_to_open", "buy_to_cover"],
-                            "sell": ["sell", "sell_to_open", "sell_short"]}}}
+                            "sell": ["sell", "sell_to_open", "sell_short"]},
+                   "order_type": {"limit": ["limit"], "market": ["market"]}}}
 
     # ---- platform: autopilot armed, a seeded signal, the signing key ----
     plat = tmp_path / "platform"

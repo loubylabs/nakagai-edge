@@ -323,19 +323,34 @@ package:
       args:
         symbol: ticker
         side: action
+        order_type: kind
         quantity: qty
-        price: limit
-        stop: trigger
+        limit_price: limit
+        stop_price: trigger
+        time_in_force: tif
         account: acct
+      outbound_types:
+        symbol: string
+        side: string
+        order_type: string
+        quantity: string
+        limit_price: string
+        stop_price: string
+        time_in_force: string
+        account: string
       values:
         side:
           buy: [BUY]
           sell: [SELL]
-      market_args: {kind: MARKET}
+        order_type:
+          limit: [LIMIT]
+          market: [MARKET]
 ```
 
-**A `place_order` map has to name all five order keys**: symbol, side,
-quantity, price and stop. The edge reads an executed entry back through them to
+**A `place_order` map has to name every canonical outbound field**: symbol,
+side, order_type, quantity, limit_price, stop_price, time_in_force, and
+account. The edge reads an executed entry back through symbol, side, quantity,
+limit_price, and stop_price to
 build the ledger record the brake watches, so a map missing one places real
 orders that are then supervised by nothing, absent from `get_open_risk` while
 the Portfolio page still lists them. A connector declaring an incomplete
@@ -442,11 +457,10 @@ nakagai-edge brake on                  # re-arm
 The brake does not promise the level. A gap opens a position under its stop and
 the exit goes off at the market, below it. That is what a stop is.
 
-A connector must declare a `place_order` capability with `market_args` before
-its positions can be supervised, and the two halves of that fail differently.
-A connector that declares `place_order` but no `market_args` still gets a
-ledger record: there is no exit order to build, so the position is recorded
-unguarded, listed that way by `get_open_risk`, and shown that way on the
+A connector must declare a complete `place_order` capability before its
+positions can be supervised. The canonical market exit uses the same resolver
+as an entry, with `order_type: market`. A connector that cannot express it gets
+a ledger record marked unguarded and shown that way by `get_open_risk` and the
 Portfolio page. A connector that declares no `place_order` at all leaves no
 ledger record to make, so its positions are absent from `get_open_risk`
 entirely; the Portfolio page still shows them unguarded, because a position

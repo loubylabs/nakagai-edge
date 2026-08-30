@@ -4,7 +4,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from nakagai_edge.capability import (CAPABILITIES, ORDER_FIELDS,
+from nakagai_edge.capability import (CAPABILITIES, OUTBOUND_ORDER_FIELDS,
                                      CapabilityError, resolve)
 from nakagai_edge.config import ConnectorSpec, load_specs
 from tests.fixtures.alien_registry import ALIEN_CONNECTOR, ROBINHOOD_CONNECTOR
@@ -12,8 +12,11 @@ from tests.fixtures.alien_registry import ALIEN_CONNECTOR, ROBINHOOD_CONNECTOR
 BASE = {"id": "demo", "kind": "mcp-http", "role": "broker",
         "url": "https://example.test/mcp/", "enabled": True}
 
-ORDER_ARGS = {"symbol": "ticker", "side": "action", "quantity": "qty",
-              "price": "limit", "stop": "trigger"}
+ORDER_ARGS = {"symbol": "ticker", "side": "action", "order_type": "kind",
+              "quantity": "qty", "limit_price": "limit",
+              "stop_price": "trigger", "time_in_force": "tif",
+              "account": "acct"}
+ORDER_TYPES = {field: "string" for field in OUTBOUND_ORDER_FIELDS}
 
 
 def _order_map(*dropped: str) -> dict:
@@ -21,7 +24,9 @@ def _order_map(*dropped: str) -> dict:
     return {"place_order": {
         "tool": "submit",
         "args": {k: v for k, v in ORDER_ARGS.items() if k not in dropped},
-        "market_args": {"kind": "MARKET"}}}
+        "outbound_types": {**ORDER_TYPES},
+        "values": {"side": {"buy": ["BUY"], "sell": ["SELL"]},
+                   "order_type": {"limit": ["LIMIT"], "market": ["MARKET"]}}}}
 
 
 def test_a_connector_parses_its_capability_map():
@@ -86,7 +91,9 @@ def test_the_write_capabilities_require_nothing_and_parse_with_no_fields():
     assert CAPABILITIES["cancel_order"].required == ()
     spec = ConnectorSpec(**BASE, capabilities={
         "place_order": {"tool": "submit", "args": ORDER_ARGS,
-                        "market_args": {"kind": "MARKET"}},
+                        "outbound_types": ORDER_TYPES,
+                        "values": {"side": {"buy": ["BUY"], "sell": ["SELL"]},
+                                   "order_type": {"limit": ["LIMIT"], "market": ["MARKET"]}}},
         "cancel_order": {"tool": "scrub", "args": {"order_id": "ref"}}})
     assert spec.capability("place_order").fields == {}
 
@@ -104,28 +111,42 @@ def test_the_write_capabilities_require_nothing_and_parse_with_no_fields():
 # computed list is wrong or empty and pins nothing at all.
 
 
-def test_an_order_map_with_no_stop_key_is_rejected_at_parse_time():
+def test_an_order_map_with_no_stop_price_key_is_rejected_at_parse_time():
     # The release path this closes: with no `stop` key, read_entry returns None
     # for every order this connector places, so executor.supervise returns
     # early. No ledger record, no `blocked` reason, no anomaly and no audit
     # line: the position is missing from get_open_risk entirely while the
     # Portfolio page still shows it, and nothing anywhere says why.
     with pytest.raises(ValueError,
-                       match="demo.*place_order.*no argument key for stop;"):
-        ConnectorSpec(**BASE, capabilities=_order_map("stop"))
+                       match="demo.*place_order.*no argument key for stop_price;"):
+        ConnectorSpec(**BASE, capabilities=_order_map("stop_price"))
 
 
 def test_an_order_map_missing_two_keys_names_both():
     # One hidden behind another costs a second edit and a second deploy to
     # find, with real orders placed in between.
     with pytest.raises(ValueError,
-                       match="demo.*no argument key for price, stop;"):
-        ConnectorSpec(**BASE, capabilities=_order_map("price", "stop"))
+                       match="demo.*no argument key for limit_price, stop_price;"):
+        ConnectorSpec(**BASE, capabilities=_order_map("limit_price", "stop_price"))
 
 
 def test_an_order_map_declaring_all_five_parses():
     spec = ConnectorSpec(**BASE, capabilities=_order_map())
-    assert spec.capability("place_order").args["stop"] == "trigger"
+    assert spec.capability("place_order").args["stop_price"] == "trigger"
+
+
+def test_an_order_map_with_no_outbound_type_is_rejected_at_parse_time():
+    cap = _order_map()["place_order"]
+    del cap["outbound_types"]["order_type"]
+    with pytest.raises(ValueError, match="demo.*outbound type.*order_type"):
+        ConnectorSpec(**BASE, capabilities={"place_order": cap})
+
+
+def test_an_order_map_with_an_unknown_outbound_type_is_rejected_at_parse_time():
+    cap = _order_map()["place_order"]
+    cap["outbound_types"]["quantity"] = "integer"
+    with pytest.raises(ValueError, match="demo.*unsupported outbound types.*integer"):
+        ConnectorSpec(**BASE, capabilities={"place_order": cap})
 
 
 def test_a_connector_that_declares_no_place_order_still_parses():
@@ -147,7 +168,8 @@ def test_both_shipped_fixture_connectors_map_every_field_they_need():
             assert set(CAPABILITIES[name].required) <= set(cap.fields)
         # And the argument side: both of these place orders, so both have to
         # be readable back into a supervised position.
-        assert set(ORDER_FIELDS) <= set(spec.capability("place_order").args)
+        assert set(OUTBOUND_ORDER_FIELDS) <= set(spec.capability("place_order").args)
+        assert set(OUTBOUND_ORDER_FIELDS) <= set(spec.capability("place_order").outbound_types)
 
 
 def test_the_readme_registry_example_parses_and_resolves_as_written():
@@ -166,13 +188,16 @@ def test_the_readme_registry_example_parses_and_resolves_as_written():
 
     spec = load_specs({"connectors": entries})["alien-broker"]
     tool, args = resolve("place_order", spec.capability("place_order"),
-                         {"symbol": "AAPL", "side": "buy", "quantity": 10,
-                          "price": 187.20, "stop": 180.0, "account": "AL-1"})
+                         {"symbol": "AAPL", "side": "buy", "order_type": "limit",
+                          "quantity": 10, "limit_price": 187.20,
+                          "stop_price": 180.0, "time_in_force": "day",
+                          "account": "AL-1"})
     assert tool == "submit"
     # The broker's own words throughout, and `buy` sent as the first alias
     # `values.side` lists, which is what the paragraph under the example says.
-    assert args == {"ticker": "AAPL", "action": "BUY", "qty": 10,
-                    "limit": 187.20, "trigger": 180.0, "acct": "AL-1"}
+    assert args == {"ticker": "AAPL", "action": "BUY", "kind": "LIMIT",
+                    "qty": "10", "limit": "187.2", "trigger": "180.0",
+                    "tif": "day", "acct": "AL-1"}
 
 
 def test_an_unmapped_capability_refuses_and_names_the_connector():

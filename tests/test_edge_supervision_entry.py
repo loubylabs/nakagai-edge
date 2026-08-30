@@ -15,21 +15,29 @@ from nakagai_edge.edge.supervision import load
 
 PLACE_ORDER = Capability(
     tool="place_equity_order",
-    args={"symbol": "symbol", "side": "side", "quantity": "quantity",
-          "price": "limit_price", "stop": "stop_price"},
+    args={"symbol": "symbol", "side": "side", "order_type": "order_type",
+          "quantity": "quantity", "limit_price": "limit_price",
+          "stop_price": "stop_price", "time_in_force": "time_in_force",
+          "account": "account_number"},
+    outbound_types={field: "string" for field in (
+        "symbol", "side", "order_type", "quantity", "limit_price",
+        "stop_price", "time_in_force", "account")},
     # What the broker says BACK. `fill_price` is what the entry price is read
     # from; it used to be guessed from a list of candidate key names compiled
     # into executor.py, which is the leak the capability layer exists to stop.
     fields={"order_id": ["order_id"], "fill_price": ["average_price"]},
     values={"side": {"buy": ["buy", "buy_to_open", "buy_to_cover"],
-                     "sell": ["sell", "sell_to_open", "sell_short"]}},
-    market_args={"order_type": "market"})
+                     "sell": ["sell", "sell_to_open", "sell_short"]},
+            "order_type": {"limit": ["limit"], "market": ["market"]}})
 
-# No market_args declared, so nothing here can build an exit.
-NO_MARKET_CAP = PLACE_ORDER.model_copy(update={"market_args": {}})
+# No market type declaration, so nothing here can build an exit.
+NO_MARKET_CAP = PLACE_ORDER.model_copy(update={
+    "values": {"side": PLACE_ORDER.values["side"],
+               "order_type": {"limit": ["limit"]}}})
 
 ENTRY_ARGS = {"account_number": "463605220", "symbol": "AAPL", "side": "buy",
-              "quantity": 100, "limit_price": 47.55, "stop_price": 46.20}
+              "quantity": 100, "limit_price": 47.55, "stop_price": 46.20,
+              "order_type": "limit", "time_in_force": "day"}
 
 
 class FakeHub:
@@ -119,7 +127,7 @@ def test_a_place_order_map_missing_a_field_is_not_supervised(tmp_path):
     hub = FakeHub()
     hub.spec("demo").capabilities["place_order"] = PLACE_ORDER.model_copy(
         update={"args": {k: v for k, v in PLACE_ORDER.args.items()
-                         if k != "stop"}})
+                         if k != "stop_price"}})
     supervise(hub, state, "ap_1", _intent(), _record({"grant_id": "wr_1"}), {})
     assert load(state) == {}
 
@@ -179,7 +187,7 @@ def test_an_unclassifiable_order_side_records_unguarded(tmp_path):
     assert rec["direction"] == ""
     assert rec["state"] == "unguarded"
     assert rec["warrant"] is None
-    assert rec["anomaly"] == "unclassifiable order side"
+    assert "unclassifiable order side" in rec["anomaly"]
 
 
 def test_an_entry_with_no_recognizable_account_records_unguarded(tmp_path):
@@ -196,7 +204,7 @@ def test_an_entry_with_no_recognizable_account_records_unguarded(tmp_path):
     assert rec["account"] == ""
     assert rec["state"] == "unguarded"
     assert rec["warrant"] is None
-    assert rec["anomaly"] == "no account on the order"
+    assert "no account on the order" in rec["anomaly"]
 
 
 # ---- final round: the disqualifications must compose, and be complete -----
@@ -217,8 +225,8 @@ def test_both_an_unclassifiable_side_and_a_missing_account_are_reported(tmp_path
     assert "no account on the order" in rec["anomaly"]
 
 
-def test_a_connector_with_no_market_args_records_unguarded(tmp_path):
-    # Spec section 9: no place_order map OR no market_args means this
+def test_a_connector_with_no_market_order_type_records_unguarded(tmp_path):
+    # Spec section 9: no place_order map OR no market type declaration means this
     # connector's positions cannot be supervised. The platform mints the
     # warrant from the entry order and cannot see an edge-side connector
     # field, so nothing but this check keeps the record out of `armed`, and
@@ -230,7 +238,7 @@ def test_a_connector_with_no_market_args_records_unguarded(tmp_path):
     rec = load(state)["ap_1"]
     assert rec["state"] == "unguarded"
     assert rec["warrant"] is None
-    assert "market_args" in rec["anomaly"]
+    assert "canonical market exit" in rec["anomaly"]
 
 
 def test_the_disqualification_is_persisted_on_the_record(tmp_path):
@@ -240,7 +248,7 @@ def test_the_disqualification_is_persisted_on_the_record(tmp_path):
     state = EdgeState(tmp_path)
     supervise(FakeHub(NO_MARKET_CAP), state, "ap_1", _intent(),
               _record({"grant_id": "wr_1"}), {})
-    assert load(state)["ap_1"]["blocked"] == "connector declares no market_args"
+    assert load(state)["ap_1"]["blocked"] == "connector cannot express a canonical market exit"
 
 
 def test_a_healthy_position_records_an_empty_blocked_field(tmp_path):

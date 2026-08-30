@@ -39,11 +39,16 @@ SPECS = load_specs({"connectors": [ALIEN_CONNECTOR, ROBINHOOD_CONNECTOR]})
 
 PLACE_ORDER = Capability(
     tool="place_equity_order",
-    args={"symbol": "symbol", "side": "side", "quantity": "quantity",
-          "price": "limit_price", "stop": "stop_price"},
+    args={"symbol": "symbol", "side": "side", "order_type": "order_type",
+          "quantity": "quantity", "limit_price": "limit_price",
+          "stop_price": "stop_price", "time_in_force": "time_in_force",
+          "account": "account_number"},
+    outbound_types={field: "string" for field in (
+        "symbol", "side", "order_type", "quantity", "limit_price",
+        "stop_price", "time_in_force", "account")},
     values={"side": {"buy": ["buy", "buy_to_open", "buy_to_cover"],
-                     "sell": ["sell", "sell_to_open", "sell_short"]}},
-    market_args={"order_type": "market"})
+                     "sell": ["sell", "sell_to_open", "sell_short"]},
+            "order_type": {"limit": ["limit"], "market": ["market"]}})
 
 # The pre-fire position re-read now goes through the map like everything else.
 # Rooted at `positions` rather than Robinhood's real `data.positions` because
@@ -56,7 +61,8 @@ LIST_POSITIONS = Capability(
     fields={"symbol": ["symbol"], "quantity": ["quantity"]})
 
 ENTRY_ARGS = {"account_number": "463605220", "symbol": "AAPL", "side": "buy",
-              "quantity": 100, "limit_price": 47.55, "stop_price": 46.20}
+              "quantity": 100, "limit_price": 47.55, "stop_price": 46.20,
+              "order_type": "limit", "time_in_force": "day"}
 
 
 def _demo_spec(**caps) -> ConnectorSpec:
@@ -120,8 +126,10 @@ class NoQtyKeyHub(FakeHub):
         return {"is_error": False, "data": {"order_id": "42"}}
 
 
-# No market_args declared, so this connector cannot express an exit at all.
-NO_MARKET_CAP = PLACE_ORDER.model_copy(update={"market_args": {}})
+# No market order type declaration, so this connector cannot express an exit.
+NO_MARKET_CAP = PLACE_ORDER.model_copy(update={
+    "values": {"side": PLACE_ORDER.values["side"],
+               "order_type": {"limit": ["limit"]}}})
 
 
 class NoMarketExitHub(FakeHub):
@@ -312,7 +320,7 @@ async def test_a_breach_places_a_market_exit(tmp_path):
     tool, args, kw = hub.calls[-1]
     assert tool == "place_equity_order"
     assert args["side"] == "sell"
-    assert args["quantity"] == 100.0
+    assert args["quantity"] == "100"
     assert args["order_type"] == "market"
     assert "limit_price" not in args and "stop_price" not in args
     assert kw["approved"] is True
@@ -325,7 +333,7 @@ async def test_the_exit_is_clamped_to_what_the_broker_says_is_held_right_now(tmp
     state, client, brake = _brake(tmp_path, hub)
     record(state, _rec())
     assert await brake.fire(load(state)["ap_1"]) == ""
-    assert hub.calls[-1][1]["quantity"] == 40.0
+    assert hub.calls[-1][1]["quantity"] == "40"
 
 
 async def test_a_position_the_broker_no_longer_holds_is_released_not_sold(tmp_path):

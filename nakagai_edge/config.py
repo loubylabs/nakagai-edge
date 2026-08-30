@@ -15,7 +15,7 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from nakagai_edge._env import read_env_ref
-from nakagai_edge.capability import (CAPABILITIES, ORDER_FIELDS, Capability,
+from nakagai_edge.capability import (CAPABILITIES, OUTBOUND_ORDER_FIELDS, OUTBOUND_TYPES, Capability,
                                      CapabilityError)
 from nakagai_edge.slug import safe_slug
 
@@ -183,13 +183,13 @@ class ConnectorSpec(BaseModel):
     @field_validator("capabilities")
     @classmethod
     def _order_args_are_mapped(cls, v: dict, info) -> dict:
-        """A declared `place_order` must say where all five order fields go.
+        """A declared `place_order` must say where every order field goes.
 
         The twin of `_required_fields_are_mapped`, on the ARGUMENT side. That
         one closed this hole for the fields a capability READS; this one closes
         it for the keys `place_order` WRITES, and the consequence here is worse.
 
-        `warrant.configured()` needs every one of ORDER_FIELDS before an entry
+        `warrant.configured()` needs every one of its entry fields before an entry
         can be read at all, and nothing downstream complains when they are not
         there. A map declaring three of the five parses, places real orders,
         and then `read_entry` returns None for every one of them, so
@@ -199,22 +199,42 @@ class ConnectorSpec(BaseModel):
         the brake is not watching it. Nothing anywhere says why, which is what
         makes parse time the only place to catch it.
 
-        Scoped to `place_order` alone. The five are what an order IS, so a
+        Scoped to `place_order` alone. The fields are what an order IS, so a
         connector serving quotes or positions and no orders declares no
         `place_order` and parses untouched.
         """
         cap = v.get("place_order")
         if cap is None:
             return v
-        missing = [field for field in ORDER_FIELDS if field not in cap.args]
+        missing = [field for field in OUTBOUND_ORDER_FIELDS if field not in cap.args]
         if missing:
             cid = (info.data or {}).get("id", "?")
             raise ValueError(
                 f"connector {cid!r} declares place_order but maps no argument "
                 f"key for {', '.join(missing)}; all of "
-                f"{', '.join(ORDER_FIELDS)} must be mapped or the edge cannot "
+                f"{', '.join(OUTBOUND_ORDER_FIELDS)} must be mapped or the edge cannot "
                 f"read back the orders it places, and every position opened "
                 f"through this connector goes unsupervised and unreported")
+        return v
+
+    @field_validator("capabilities")
+    @classmethod
+    def _order_outbound_types_are_declared(cls, v: dict, info) -> dict:
+        cap = v.get("place_order")
+        if cap is None:
+            return v
+        missing = [field for field in OUTBOUND_ORDER_FIELDS
+                   if field not in cap.outbound_types]
+        unknown = sorted(set(cap.outbound_types.values()) - OUTBOUND_TYPES)
+        cid = (info.data or {}).get("id", "?")
+        if missing:
+            raise ValueError(
+                f"connector {cid!r} declares place_order but no outbound type for "
+                f"{', '.join(missing)}")
+        if unknown:
+            raise ValueError(
+                f"connector {cid!r} declares unsupported outbound types: "
+                f"{', '.join(unknown)}")
         return v
 
     @model_validator(mode="after")

@@ -62,14 +62,20 @@ class CapabilitySpec:
     is_write: bool
 
 
-# The five fields that identify and size one order. A statement about the
-# `place_order` capability, so it belongs here beside the vocabulary rather
-# than in the modules that consume it: config.py validates a declared map
-# against this tuple at parse time, and warrant.py reads an executed entry
-# through it. Two copies would let those two drift, and a `place_order` map the
-# validator accepts but `read_entry` cannot read is a live position with no
-# brake on it.
-ORDER_FIELDS = ("symbol", "side", "quantity", "price", "stop")
+# A broker's accepted entry is read through these fields. `order_type` is not
+# a position-read requirement. An old broker result can still establish brake
+# supervision when it does not echo the type it accepted.
+ENTRY_FIELDS = ("symbol", "side", "quantity", "limit_price", "stop_price")
+
+# Every field a version-one equity entry sends to a broker. This is deliberately
+# distinct from ENTRY_FIELDS: writes need explicit type, time-in-force, and
+# account declarations; position reads must not pretend those are facts a
+# broker necessarily returns.
+OUTBOUND_ORDER_FIELDS = (
+    "symbol", "side", "order_type", "quantity", "limit_price",
+    "stop_price", "time_in_force", "account")
+
+OUTBOUND_TYPES = frozenset(("string", "number"))
 
 CAPABILITIES: dict[str, CapabilitySpec] = {
     "list_accounts": CapabilitySpec(
@@ -110,7 +116,7 @@ CAPABILITIES: dict[str, CapabilitySpec] = {
     # guess-list of broker price keys that used to live in executor.py. A
     # connector declaring neither still places orders exactly as before.
     "place_order": CapabilitySpec(
-        args=ORDER_FIELDS + ("account",),
+        args=OUTBOUND_ORDER_FIELDS,
         required=(), optional=("order_id", "fill_price"),
         is_list=False, is_write=True),
     "cancel_order": CapabilitySpec(
@@ -135,7 +141,7 @@ class Capability(BaseModel):
     items: list[str] = Field(default_factory=list)
     fields: dict[str, list[str]] = Field(default_factory=dict)
     values: dict[str, dict[str, list[str]]] = Field(default_factory=dict)
-    market_args: dict = Field(default_factory=dict)
+    outbound_types: dict[str, str] = Field(default_factory=dict)
 
 
 def walk(payload: Any, path: str) -> Any:
@@ -208,19 +214,50 @@ def coerce(field: str, value: Any, cap: Capability) -> Any | None:
     return value
 
 
-def _outbound(field: str, value: Any, cap: Capability) -> Any:
+def _outbound_enum(field: str, value: Any, cap: Capability) -> Any:
     """A canonical argument value in the broker's own spelling.
 
-    Only `side` needs translating. The first alias a connector lists is the
-    spelling it gets, which is why the order of `values.side.buy` matters.
+    The first declared alias is the spelling the broker receives.
     """
-    if COERCIONS.get(field) is not SIDE:
-        return value
-    aliases = (cap.values.get("side") or {}).get(str(value).lower()) or []
+    aliases = (cap.values.get(field) or {}).get(str(value).lower()) or []
     if not aliases:
         raise CapabilityError(
-            f"connector declares no {value!r} spelling for `side`")
+            f"connector declares no {value!r} spelling for {field!r}")
     return aliases[0]
+
+
+def _finite_number(field: str, value: Any) -> int | float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise CapabilityError(f"{field!r} must be a finite number")
+    if not math.isfinite(value):
+        raise CapabilityError(f"{field!r} must be a finite number")
+    return value
+
+
+def _outbound_value(field: str, value: Any, cap: Capability) -> Any:
+    """Translate and exactly type one outgoing canonical argument."""
+    if field in ("side", "order_type"):
+        value = _outbound_enum(field, value, cap)
+    outbound_type = cap.outbound_types.get(field)
+    if outbound_type not in OUTBOUND_TYPES:
+        raise CapabilityError(
+            f"connector declares no supported outbound type for {field!r}")
+    if field == "quantity":
+        number = _finite_number(field, value)
+        if int(number) != number:
+            raise CapabilityError("'quantity' must be a whole-share integer")
+        value = int(number)
+    elif field in ("limit_price", "stop_price"):
+        value = _finite_number(field, value)
+    elif isinstance(value, bool):
+        raise CapabilityError(f"{field!r} must not be a boolean")
+    if outbound_type == "number":
+        return _finite_number(field, value)
+    if isinstance(value, (dict, list, tuple, set)):
+        raise CapabilityError(f"{field!r} cannot convert to string")
+    if isinstance(value, float) and not math.isfinite(value):
+        raise CapabilityError(f"{field!r} must be a finite number")
+    return str(value)
 
 
 def resolve(name: str, cap: Capability, args: dict) -> tuple[str, dict]:
@@ -233,8 +270,20 @@ def resolve(name: str, cap: Capability, args: dict) -> tuple[str, dict]:
     vocab = CAPABILITIES.get(name)
     if vocab is None:
         raise CapabilityError(f"unknown capability {name!r}")
+    if not isinstance(args, dict):
+        raise CapabilityError(f"capability {name!r} arguments must be a dictionary")
+    if name == "place_order":
+        missing = [field for field in ("symbol", "side", "order_type", "quantity",
+                                       "time_in_force")
+                   if args.get(field) is None]
+        if args.get("order_type") == "limit":
+            missing.extend(field for field in ("limit_price", "stop_price")
+                           if args.get(field) is None)
+        if missing:
+            raise CapabilityError(
+                f"place_order is missing required fields: {', '.join(missing)}")
     out: dict = {}
-    for canonical, value in (args or {}).items():
+    for canonical, value in args.items():
         if value is None:
             continue
         if canonical not in vocab.args:
@@ -245,7 +294,10 @@ def resolve(name: str, cap: Capability, args: dict) -> tuple[str, dict]:
             raise CapabilityError(
                 f"connector does not declare where {canonical!r} goes for "
                 f"{name!r}")
-        out[key] = _outbound(canonical, value, cap)
+        if name == "place_order":
+            out[key] = _outbound_value(canonical, value, cap)
+        else:
+            out[key] = _outbound_enum(canonical, value, cap) if canonical == "side" else value
     return cap.tool, out
 
 

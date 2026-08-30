@@ -1,6 +1,12 @@
 import pytest
 
-from nakagai_edge.capability import Capability, CapabilityError, extract, resolve
+import nakagai_edge.capability as capability_module
+from nakagai_edge.capability import (
+    Capability,
+    CapabilityError,
+    extract,
+    resolve,
+)
 
 BALANCE = Capability(
     tool="get_portfolio",
@@ -18,12 +24,16 @@ POSITIONS = Capability(
 
 ORDER = Capability(
     tool="place_equity_order",
-    args={"symbol": "symbol", "side": "side", "quantity": "quantity",
-          "price": "limit_price", "stop": "stop_price",
+    args={"symbol": "symbol", "side": "side", "order_type": "type",
+          "quantity": "quantity", "limit_price": "limit_price",
+          "stop_price": "stop_price", "time_in_force": "time_in_force",
           "account": "account_number"},
+    outbound_types={field: "string" for field in (
+        "symbol", "side", "order_type", "quantity", "limit_price",
+        "stop_price", "time_in_force", "account")},
     values={"side": {"buy": ["buy", "buy_to_open"],
-                     "sell": ["sell", "sell_short"]}},
-    market_args={"type": "market"})
+                     "sell": ["sell", "sell_short"]},
+            "order_type": {"limit": ["limit"], "market": ["market"]}})
 
 
 def test_resolve_renames_canonical_args_to_broker_keys():
@@ -38,10 +48,96 @@ def test_resolve_drops_none_valued_args():
 
 
 def test_resolve_translates_canonical_side_to_the_brokers_first_alias():
-    _, args = resolve("place_order", ORDER, {"symbol": "AAPL", "side": "buy",
-                                             "quantity": 5})
+    _, args = resolve("place_order", ORDER, {
+        "symbol": "AAPL", "side": "buy", "order_type": "limit",
+        "quantity": 5, "limit_price": 187.20, "stop_price": 180.0,
+        "time_in_force": "gfd", "account": "463605220"})
     assert args["side"] == "buy"
+    assert args["quantity"] == "5"
+
+
+def test_order_entry_fields_stay_separate_from_outbound_requirements():
+    # A broker's accepted entry is read through these five durable fields. Its
+    # outbound requirement adds type, time-in-force, and account, without
+    # making a historical position unreadable because it has no order type.
+    assert capability_module.ENTRY_FIELDS == (
+        "symbol", "side", "quantity", "limit_price", "stop_price")
+    assert capability_module.OUTBOUND_ORDER_FIELDS == (
+        "symbol", "side", "order_type", "quantity", "limit_price",
+        "stop_price", "time_in_force", "account")
+
+
+def test_resolve_translates_the_complete_canonical_limit_order():
+    tool, args = resolve("place_order", ORDER, {
+        "symbol": "aapl", "side": "buy", "order_type": "limit",
+        "quantity": 5, "limit_price": 187.2, "stop_price": 180.0,
+        "time_in_force": "gfd", "account": "463605220"})
+    assert tool == "place_equity_order"
+    assert args == {
+        "symbol": "aapl", "side": "buy", "type": "limit",
+        "quantity": "5", "limit_price": "187.2", "stop_price": "180.0",
+        "time_in_force": "gfd", "account_number": "463605220"}
+
+
+@pytest.mark.parametrize("field, value", [
+    ("quantity", 5.5),
+    ("quantity", True),
+    ("limit_price", float("nan")),
+    ("stop_price", float("inf")),
+])
+def test_resolve_refuses_invalid_equity_order_numbers(field, value):
+    args = {"symbol": "AAPL", "side": "buy", "order_type": "limit",
+            "quantity": 5, "limit_price": 187.2, "stop_price": 180.0,
+            "time_in_force": "gfd", "account": "463605220"}
+    args[field] = value
+    with pytest.raises(CapabilityError, match=field):
+        resolve("place_order", ORDER, args)
+
+
+def test_resolve_refuses_a_missing_required_equity_order_field():
+    args = {"symbol": "AAPL", "side": "buy", "order_type": "limit",
+            "quantity": 5, "limit_price": 187.2, "stop_price": 180.0,
+            "time_in_force": "gfd", "account": "463605220"}
+    del args["order_type"]
+    with pytest.raises(CapabilityError, match="order_type"):
+        resolve("place_order", ORDER, args)
+
+
+def test_resolve_refuses_an_unknown_order_type():
+    args = {"symbol": "AAPL", "side": "buy", "order_type": "stop_limit",
+            "quantity": 5, "limit_price": 187.2, "stop_price": 180.0,
+            "time_in_force": "gfd", "account": "463605220"}
+    with pytest.raises(CapabilityError, match="order_type"):
+        resolve("place_order", ORDER, args)
+
+
+def test_resolve_refuses_a_lossy_number_conversion():
+    numeric = ORDER.model_copy(update={
+        "outbound_types": {**ORDER.outbound_types, "quantity": "number"}})
+    args = {"symbol": "AAPL", "side": "buy", "order_type": "limit",
+            "quantity": "5", "limit_price": 187.2, "stop_price": 180.0,
+            "time_in_force": "gfd", "account": "463605220"}
+    with pytest.raises(CapabilityError, match="quantity"):
+        resolve("place_order", numeric, args)
+
+
+def test_resolve_preserves_a_declared_numeric_broker_argument():
+    numeric = ORDER.model_copy(update={
+        "outbound_types": {**ORDER.outbound_types, "quantity": "number"}})
+    _, args = resolve("place_order", numeric, {
+        "symbol": "AAPL", "side": "buy", "order_type": "limit",
+        "quantity": 5, "limit_price": 187.2, "stop_price": 180.0,
+        "time_in_force": "gfd", "account": "463605220"})
     assert args["quantity"] == 5
+
+
+def test_resolve_refuses_an_unknown_canonical_order_field():
+    args = {"symbol": "AAPL", "side": "buy", "order_type": "limit",
+            "quantity": 5, "limit_price": 187.2, "stop_price": 180.0,
+            "time_in_force": "gfd", "account": "463605220",
+            "trail_price": 1.0}
+    with pytest.raises(CapabilityError, match="trail_price"):
+        resolve("place_order", ORDER, args)
 
 
 def test_resolve_refuses_an_arg_the_connector_never_declared():

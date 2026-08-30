@@ -19,7 +19,7 @@ canonical field and declares how that broker spells "market order".
 import math
 import time
 
-from nakagai_edge.capability import ORDER_FIELDS, Capability
+from nakagai_edge.capability import ENTRY_FIELDS, Capability, resolve
 from nakagai_edge.signing import verify_artifact
 
 WARRANT_KIND = "exit_warrant"
@@ -133,17 +133,13 @@ def authorizes(public_key: str, warrant: dict, exit_order: dict, *,
 def configured(cap: Capability) -> bool:
     """Can this connector's order payload be read at all?
 
-    All five identity-and-size fields must be declared, and config.py refuses
+    All entry fields must be declared, and config.py refuses
     a `place_order` map that omits one, so a spec that parsed cannot reach here
     unconfigured. This stays as the local statement of the rule: a Capability
     built in code rather than loaded from the registry never went past that
-    validator. `market_args` is
-    deliberately not here: a map without it is perfectly READABLE, it just
-    cannot express an exit, and the caller says so in the owner's words.
-    Folding it in would surface a missing declaration as "the order could not
-    be read", which is a lie.
+    validator.
     """
-    return all(field in cap.args for field in ORDER_FIELDS)
+    return all(field in cap.args for field in ENTRY_FIELDS)
 
 
 def _present(args: dict, key: str) -> bool:
@@ -166,15 +162,15 @@ def read_entry(cap: Capability, args: dict) -> dict | None:
     and with no level there is nothing to watch."""
     if not configured(cap) or not isinstance(args, dict):
         return None
-    keys = {field: cap.args[field] for field in ORDER_FIELDS}
+    keys = {field: cap.args[field] for field in ENTRY_FIELDS}
     if not all(_present(args, key) for key in keys.values()):
         return None
     try:
         return {"symbol": str(args[keys["symbol"]]).upper(),
                 "side": str(args[keys["side"]]).lower(),
                 "qty": float(args[keys["quantity"]]),
-                "price": float(args[keys["price"]]),
-                "stop": float(args[keys["stop"]])}
+                "price": float(args[keys["limit_price"]]),
+                "stop": float(args[keys["stop_price"]])}
     except (TypeError, ValueError):
         return None
 
@@ -205,43 +201,20 @@ def exit_order_args(cap: Capability, entry_args: dict, qty: float) -> dict | Non
     scratch, so account ids and any broker-required extras carry over without
     this module needing to know they exist.
     """
-    if not cap.market_args:
-        return None
     entry = read_entry(cap, entry_args)
     if entry is None:
         return None
     side = closing_side(cap, entry["side"])
     if not side:
         return None
-    # A market declaration may not touch the fields that identify or size the
-    # position: symbol, side, and quantity. A connector that declares one of
-    # those is misconfigured, and resolving the collision either way would be
-    # a guess about an order bound for a real brokerage, so refuse. Price and
-    # stop keys are deliberately excluded from this set: they are already
-    # stripped below, so a collision there is expected and harmless.
-    identity = {cap.args[field] for field in ("symbol", "side", "quantity")}
-    if identity & set(cap.market_args):
+    canonical = {
+        "symbol": entry_args[cap.args["symbol"]], "side": side,
+        "order_type": "market", "quantity": qty,
+        "time_in_force": entry_args.get(cap.args["time_in_force"]),
+        "account": entry_args.get(cap.args["account"]),
+    }
+    try:
+        _, args = resolve("place_order", cap, canonical)
+    except Exception:
         return None
-    symbol_key, side_key = cap.args["symbol"], cap.args["side"]
-    qty_key = cap.args["quantity"]
-    # Price and stop must leave the payload: a market exit still carrying the
-    # entry's limit would be a limit order at the wrong level, and the stop is
-    # the thing being acted on, not something to attach again.
-    #
-    # The three identity keys are redundant here, on two counts: the collision
-    # check above already refused any `market_args` naming one, and all three
-    # are rewritten unconditionally below. They stay so the strip set is
-    # complete on its own terms. It means "nothing from the entry survives but
-    # the extras this module knows nothing about", and reading it should not
-    # require holding two distant invariants in mind to see that a stale side
-    # cannot ride along beside the flipped one.
-    drop = identity | {cap.args["price"], cap.args["stop"]}
-    args = {k: v for k, v in entry_args.items() if k not in drop}
-    args.update(cap.market_args)
-    # The RAW value, not entry["symbol"]: read_entry uppercases for
-    # comparison, but the exit reuses the payload the broker already
-    # accepted, so a lowercase ticker on the way in stays lowercase here.
-    args[symbol_key] = entry_args[symbol_key]
-    args[side_key] = side
-    args[qty_key] = float(qty)
     return args
