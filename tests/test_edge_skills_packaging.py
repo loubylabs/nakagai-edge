@@ -12,7 +12,7 @@ import pytest
 REPO = Path(__file__).resolve().parents[1]
 EXPECTED = {"connect-edge", "pair-agent", "verify-edge",
             "daily-brief", "halt", "check-the-evidence",
-            "nakagai-chat", "verify"}
+            "nakagai-chat", "verify", "candidate-trader"}
 
 
 @pytest.fixture(scope="module")
@@ -100,3 +100,42 @@ def test_live_chat_skill_teaches_the_same_room_aware_protocol(wheel):
     assert "claim_required" in body
     assert "claim_message(message_seq)" in body
     assert "send_message(text, room_id, idempotency_key, reply_to_seq=0)" in body
+
+
+def test_candidate_trader_skill_bounds_one_terminal_decision(wheel):
+    """Removing the terminal boundary could let a wake process keep trading."""
+    body = wheel.read("nakagai_edge/skills/candidate-trader/SKILL.md").decode()
+
+    for required in (
+        "## The bounded decision",
+        "## One-event loop",
+        "## Boundaries",
+        "accept_candidate(candidate_id, rationale)",
+        "abstain_candidate(candidate_id, rationale)",
+        "inspect one candidate",
+        "choose accept or abstain",
+        "provide a concise rationale",
+        "stop after one durable decision",
+        "Accepting does not authorize changing any prepared field.",
+        "Local policy or the brake can still refuse execution.",
+    ):
+        assert required in body
+
+
+def test_published_candidate_guidance_rejects_retired_order_authority():
+    """A stale instruction could give the resident agent money-moving scope."""
+    docs = [
+        (REPO / "README.md").read_text(),
+        (REPO / "nakagai_edge/skills/candidate-trader/SKILL.md").read_text(),
+    ]
+    forbidden = (
+        "market_args",
+        "raw model-authored order",
+        "raw model order",
+        "agent chooses quantity",
+        "agent chooses price",
+        "agent sets quantity",
+        "agent sets price",
+    )
+    lowered = "\n".join(docs).lower()
+    assert not any(term in lowered for term in forbidden)

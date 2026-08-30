@@ -5,11 +5,14 @@ the only place a broker credential is ever written to disk. Your agent talks to
 exactly one MCP endpoint, the edge, and never sees a token. The platform never
 sees one either.
 
-Version 0.4.5 is the current release. Since 0.4.4, semantic `place_order` is
-the only order entry: a raw `call_connector` request whose tool exactly matches
-the selected connector's declared `capabilities.place_order.tool` is refused
-before dispatch with `canonical_order_required`. Other raw connector operations
-remain available.
+Version 0.5.0 is the current release. An agent woken for one execution
+candidate can inspect that candidate, accept or abstain with a rationale, then
+stop. It cannot alter a prepared order field. The platform compiles the order,
+and local policy or the brake can still refuse execution. Semantic
+`place_order` remains the only owner-mediated order entry: a raw
+`call_connector` request whose tool exactly matches the selected connector's
+declared `capabilities.place_order.tool` is refused before dispatch with
+`canonical_order_required`. Other raw connector operations remain available.
 
 Every local approval queue operation still requires an explicit `account_key`.
 A paired edge uses its stable `agent_id` for that key. The key stays local; the
@@ -97,7 +100,7 @@ uvx nakagai-edge connect
 The one client recognized today is Claude Code, detected by `claude` being on
 your PATH. It gets an MCP entry added with
 `claude mcp add --scope user nakagai --transport http <url>`, at user scope
-because a project-scoped entry needs a per-project approval, and the eight skills
+because a project-scoped entry needs a per-project approval, and the nine skills
 below are copied into `~/.claude/skills/`. A client that is not detected is not
 an obstacle: the snippet below is the whole contract.
 
@@ -151,7 +154,7 @@ because a name that fails legibly beats a set of tools that silently vanish.
 
 ## Skills
 
-Eight skills ship inside the wheel:
+Nine skills ship inside the wheel:
 
 - **`connect-edge`**: connect a local edge to a hosted platform, and diagnose
   the known failure modes.
@@ -169,6 +172,9 @@ Eight skills ship inside the wheel:
   messages as they arrive.
 - **`verify`**: launch an isolated local platform and verify web, API, and MCP
   changes end to end.
+- **`candidate-trader`**: inspect one execution candidate, choose accept or
+  abstain with a rationale, then stop. Accepting cannot change a prepared
+  field, and local policy or the brake can still refuse execution.
 
 A client that reads skills as files gets them installed by `connect` (Claude
 Code: `~/.claude/skills/`). Any MCP client can read exactly the same text off
@@ -243,6 +249,11 @@ Notes that matter:
   This starts bounded non-interactive Codex turns. It cannot inject a message
   into an already-open Codex app conversation, and non-actionable context does
   not start a turn.
+* **Candidate wakes are one decision.** An `execution_candidate` is an
+  addressed, response-required event. Use `candidate-trader`: inspect one
+  candidate, choose accept or abstain, provide a concise rationale, and stop.
+  An acceptance leaves every prepared field under platform control. Local
+  policy and the brake retain their authority to refuse execution.
 * **Claim first when required.** If `claim_required` is true, call
   `claim_message(seq)` before reasoning or using another tool. A `409` is an
   ordinary coordination outcome. `already_claimed`, `claim_lost`, and
@@ -283,7 +294,7 @@ for a position's quantity. When those names live in the edge, a second broker
 is not a config change, and the failure is not a loud one. The brake stops
 seeing positions while every display goes on reporting them as guarded.
 
-So the edge knows seven things a broker can be asked to do, and nothing about
+So the generic broker surface knows seven things a broker can be asked to do, and nothing about
 how any particular broker spells them: `list_accounts`, `get_balance`,
 `list_positions`, `get_quote`, `list_orders`, `place_order`, `cancel_order`.
 
@@ -366,7 +377,9 @@ order opens or closes. A broker with separate verbs mapped as
 `buy: [BUY_TO_OPEN, BUY_TO_COVER]` sends `BUY_TO_OPEN` for every buy, including
 the one meant to cover a short.
 
-The agent gets seven named tools it learns once and uses against any broker.
+The generic broker surface exposes seven named tools that work against any
+broker. An execution-candidate wake receives only its two candidate decision
+tools, never an order-construction surface.
 `connector_id` is optional only while exactly one enabled broker declares the
 capability. Enable a second and the edge stops filling it in: the call comes
 back naming both candidates and the agent has to say which brokerage it meant.
