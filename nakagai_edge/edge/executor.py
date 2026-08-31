@@ -18,7 +18,12 @@ from nakagai_edge.edge.candidate import (
     flush_candidate_outcomes,
 )
 from nakagai_edge.edge.portfolio import position_rows
-from nakagai_edge.edge.remote import drop_intent, intents, mark_submitted
+from nakagai_edge.edge.remote import (
+    acknowledge_execution_report,
+    drop_intent,
+    intents,
+    mark_submitted,
+)
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.supervision import (
     apply_renewals,
@@ -333,6 +338,8 @@ async def reconcile_submitted_fills(
     matched = 0
     for approval_id, intent in list(intents(state).items()):
         if (not isinstance(intent, dict) or intent.get("phase") != "submitted"
+                or intent.get("pending_execution_report") is not None
+                or not str(intent.get("broker_order_id") or "")
                 or intent.get("connector_id") != spec.id
                 or intent.get("account") != account):
             continue
@@ -424,14 +431,70 @@ def _alert_candidate(client: PlatformClient, reason: str) -> None:
         pass
 
 
+def _execution_report(result, order_id: str, *, missing_order_id: bool) -> dict:
+    reason = (
+        "candidate broker result has no declared order id; "
+        "fill attribution is impossible"
+        if missing_order_id else ""
+    )
+    return {
+        "ok": True,
+        "result": result,
+        "error": reason,
+        "outcome_unknown": missing_order_id,
+        "order_id": order_id,
+    }
+
+
+def _deliver_pending_execution_report(
+        state: EdgeState, client: PlatformClient, audit: EdgeAudit,
+        approval_id: str, intent: dict) -> bool:
+    """Retry one frozen report and clear it only on the exact platform ack."""
+    report = intent.get("pending_execution_report")
+    if not isinstance(report, dict):
+        return False
+    try:
+        response = client.report_execution(approval_id, **report)
+        if response != {"ok": True, "status": "executed"}:
+            return False
+        acknowledge_execution_report(state, approval_id, report)
+    except Exception:  # noqa: BLE001 (the frozen report owns the next retry)
+        return False
+    try:
+        audit.record(
+            "execution", intent["connector_id"], intent["tool"],
+            {
+                "approval_id": approval_id,
+                "ok": True,
+                "order_id": report["order_id"],
+                "submitted": True,
+                "error": report["error"],
+                "outcome_unknown": report["outcome_unknown"],
+            },
+        )
+    except Exception:  # noqa: BLE001 (the platform acknowledgement is durable)
+        pass
+    return True
+
+
 async def poll_once(hub, state: EdgeState, client: PlatformClient,
                     audit: EdgeAudit) -> int:
     """One pass over pending intents. Returns how many reached a terminal state."""
+    resolved = 0
+    for approval_id, intent in list(intents(state).items()):
+        if (not isinstance(intent, dict) or intent.get("phase") != "submitted"
+                or not isinstance(intent.get("pending_execution_report"), dict)):
+            continue
+        if _deliver_pending_execution_report(
+                state, client, audit, approval_id, intent):
+            resolved += 1
+            if (not intent.get("candidate_id")
+                    and not str(intent.get("broker_order_id") or "")):
+                drop_intent(state, approval_id)
     try:
         flush_candidate_outcomes(state, client)
     except Exception:  # noqa: BLE001 (one corrupt report cannot stop the executor)
         pass
-    resolved = 0
     for approval_id, intent in list(intents(state).items()):
         if isinstance(intent, dict) and intent.get("phase") == "submitted":
             continue
@@ -555,113 +618,44 @@ async def poll_once(hub, state: EdgeState, client: PlatformClient,
             # Broker acceptance is a submitted order, not a fill. Candidate
             # entries stay durable under their exact broker id until the fill
             # journal sees that same order in a declared filled state.
-            if intent.get("candidate_id"):
-                order_id = placed_order_id(hub, intent, result)
-                try:
-                    mark_submitted(
-                        state, approval_id, order_id=order_id,
-                        approval=record, result=result)
-                except Exception as error:  # noqa: BLE001 (the broker accepted)
-                    reason = (
-                        "candidate submission could not be persisted after broker result: "
-                        f"{type(error).__name__}: {error}")
+            candidate_id = str(intent.get("candidate_id") or "")
+            order_id = placed_order_id(hub, intent, result)
+            missing_order_id = bool(candidate_id and not order_id)
+            execution_report = _execution_report(
+                result, order_id, missing_order_id=missing_order_id)
+            try:
+                mark_submitted(
+                    state, approval_id, order_id=order_id,
+                    approval=record, result=result,
+                    execution_report=execution_report)
+            except Exception as error:  # noqa: BLE001 (the broker accepted)
+                reason = (
+                    "submission could not be persisted after broker result: "
+                    f"{type(error).__name__}: {error}")
+                if candidate_id:
                     disarm_candidate_entries(
-                        state, candidate_id=intent["candidate_id"],
+                        state, candidate_id=candidate_id,
                         approval_id=approval_id, reason=reason)
-                    try:
-                        client.report_execution(
-                            approval_id, ok=False, result=result, error=reason,
-                            outcome_unknown=True)
-                    except Exception:  # noqa: BLE001 (the candidate outcome is durable)
-                        pass
-                    _candidate_outcome(
-                        state, client, intent["candidate_id"],
-                        mechanical_status="blocked", reason=reason,
-                        approval_id=approval_id, urgent=True,
-                        outcome_unknown=True)
                     _alert_candidate(client, reason)
-                    try:
-                        audit.record(
-                            "error", intent["connector_id"], intent["tool"],
-                            {"approval_id": approval_id, "error": reason,
-                             "outcome_unknown": True})
-                    except Exception:  # noqa: BLE001 (journal is best-effort here)
-                        pass
-                else:
-                    if not order_id:
-                        reason = (
-                            "candidate broker result has no declared order id; "
-                            "fill attribution is impossible")
-                        disarm_candidate_entries(
-                            state, candidate_id=intent["candidate_id"],
-                            approval_id=approval_id, reason=reason)
-                        _candidate_outcome(
-                            state, client, intent["candidate_id"],
-                            mechanical_status="blocked", reason=reason,
-                            approval_id=approval_id, urgent=True,
-                            outcome_unknown=True)
-                        _alert_candidate(client, reason)
-                    try:
-                        client.report_execution(
-                            approval_id, ok=True, result=result,
-                            order_id=order_id)
-                    except Exception as error:  # noqa: BLE001 (never retry the broker)
-                        reason = (
-                            "candidate execution report failed after broker result: "
-                            f"{type(error).__name__}: {error}")
-                        disarm_candidate_entries(
-                            state, candidate_id=intent["candidate_id"],
-                            approval_id=approval_id, reason=reason)
-                        _candidate_outcome(
-                            state, client, intent["candidate_id"],
-                            mechanical_status="blocked", reason=reason,
-                            approval_id=approval_id, urgent=True,
-                            outcome_unknown=True)
-                        _alert_candidate(client, reason)
-                        try:
-                            audit.record(
-                                "error", intent["connector_id"], intent["tool"],
-                                {"approval_id": approval_id, "error": reason})
-                        except Exception:  # noqa: BLE001 (journal is best-effort here)
-                            pass
-                    else:
-                        try:
-                            audit.record(
-                                "execution", intent["connector_id"], intent["tool"],
-                                {"approval_id": approval_id, "ok": True,
-                                 "order_id": order_id, "submitted": True})
-                        except Exception:  # noqa: BLE001 (journal is best-effort here)
-                            pass
-            else:
-                order_id = placed_order_id(hub, intent, result)
-                if order_id:
-                    try:
-                        mark_submitted(
-                            state, approval_id, order_id=order_id,
-                            approval=record, result=result)
-                    except Exception as error:  # noqa: BLE001 (the broker accepted)
-                        try:
-                            audit.record(
-                                "error", intent["connector_id"], intent["tool"],
-                                {"approval_id": approval_id,
-                                 "error": ("submission could not be persisted: "
-                                           f"{type(error).__name__}: {error}"),
-                                 "outcome_unknown": True})
-                        except Exception:  # noqa: BLE001 (journal is best effort)
-                            pass
                 try:
                     audit.record(
-                        "execution", intent["connector_id"], intent["tool"],
-                        {"approval_id": approval_id, "ok": True,
-                         "order_id": order_id, "submitted": True})
-                except Exception:  # noqa: BLE001 (journal is best-effort here)
+                        "error", intent["connector_id"], intent["tool"],
+                        {"approval_id": approval_id, "error": reason,
+                         "outcome_unknown": True})
+                except Exception:  # noqa: BLE001 (journal is best effort)
                     pass
-                try:
-                    client.report_execution(
-                        approval_id, ok=True, result=result,
-                        order_id=order_id)
-                except Exception:  # noqa: BLE001 (never re-arm an executed intent)
-                    pass
+            else:
+                submitted = intents(state).get(approval_id) or {}
+                if missing_order_id:
+                    reason = execution_report["error"]
+                    disarm_candidate_entries(
+                        state, candidate_id=candidate_id,
+                        approval_id=approval_id, reason=reason)
+                    _alert_candidate(client, reason)
+                acknowledged = _deliver_pending_execution_report(
+                    state, client, audit, approval_id, submitted)
+                if acknowledged and not candidate_id and not order_id:
+                    drop_intent(state, approval_id)
         current = intents(state).get(approval_id)
         if not isinstance(current, dict) or current.get("phase") != "submitted":
             drop_intent(state, approval_id)
