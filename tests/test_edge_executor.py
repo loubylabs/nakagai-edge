@@ -479,11 +479,7 @@ async def test_later_matching_fill_establishes_supervision_and_completes_candida
     assert stored["state"] == "armed"
     assert stored["entry_price"] == 211.31
     assert intents(state) == {}
-    assert client.candidate_outcomes == [{
-        "mechanical_status": "submitted",
-        "mechanical_reason": "broker fill reconciled and supervision verified",
-        "approval_id": "a1", "urgent": False, "outcome_unknown": False,
-    }]
+    assert client.candidate_outcomes == []
 
 
 async def test_matching_fill_renews_missing_warrant_before_candidate_completion(
@@ -527,7 +523,7 @@ async def test_matching_fill_renews_missing_warrant_before_candidate_completion(
     }]]
     assert load_supervision(state)["a1"]["state"] == "armed"
     assert intents(state) == {}
-    assert client.candidate_outcomes[-1]["mechanical_status"] == "submitted"
+    assert client.candidate_outcomes == []
 
 
 @pytest.mark.parametrize("retry_status", ["granted", "executed"])
@@ -661,7 +657,7 @@ async def test_mismatched_fill_order_id_cannot_complete_candidate(tmp_path):
     assert client.candidate_outcomes == []
 
 
-async def test_declared_terminal_order_blocks_candidate_without_supervision(
+async def test_declared_terminal_order_preserves_submitted_broker_truth(
         tmp_path):
     artifact = _artifact(
         "a1", args=CANDIDATE_ARGS, candidate_id="candidate-1",
@@ -692,11 +688,7 @@ async def test_declared_terminal_order_blocks_candidate_without_supervision(
     assert intents(state) == {}
     assert load_supervision(state) == {}
     assert candidate_entries_armed(state) is True
-    assert client.candidate_outcomes == [{
-        "mechanical_status": "blocked",
-        "mechanical_reason": "broker order reached terminal status cancelled",
-        "approval_id": "a1", "urgent": False, "outcome_unknown": False,
-    }]
+    assert client.candidate_outcomes == []
 
 
 async def test_undeclared_order_status_keeps_submitted_candidate_durable(
@@ -761,7 +753,7 @@ async def test_supervision_failure_after_actual_fill_disarms_and_alerts_owner(
     assert matched == 1
     assert len(hub.calls) == 1
     assert client.candidate_outcomes == [{
-        "mechanical_status": "blocked",
+        "mechanical_status": "submitted",
         "mechanical_reason": client.candidate_alerts[0]["note"],
         "approval_id": "a1", "urgent": True, "outcome_unknown": True,
     }]
@@ -1192,7 +1184,7 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
     assert n == 1
     assert placed == [("NVDA", "buy", "10")]
     assert intents(state)[rec.id]["broker_order_id"] == "broker-order-1"
-    assert store.decision(candidate["id"])["mechanical_status"] == "prepared"
+    assert store.decision(candidate["id"])["mechanical_status"] == "submitted"
 
     # A repeated accepted decision receives the same frozen order and approval.
     # The local retry must preserve the submitted fence rather than reopening
@@ -1200,23 +1192,19 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
     submitted_before_retry = intents(state)[rec.id]
     accepted_retry = edge_client.accept_candidate(
         candidate["id"], "The bounded setup is valid.")
-    prepared_retry = _prepared_order(
-        candidate["id"], accepted_retry,
-        load_specs({"connectors": [connector]})["broker"], "463605220",
-    )
-    retried = await edge_hub.call(
-        prepared_retry["connector_id"], prepared_retry["tool"],
-        prepared_retry["args"], account_key=agent_id,
-        signal_id=prepared_retry["signal_id"], candidate_id=candidate["id"],
-        intent_account=prepared_retry["account_id"], require_approval=True,
-    )
-    assert retried["approval_id"] == rec.id
-    assert store.decision(candidate["id"])["mechanical_status"] == "prepared"
+    assert accepted_retry == {
+        "candidate_id": candidate["id"],
+        "decision": "accepted",
+        "mechanical_status": "submitted",
+        "mechanical_reason": "",
+        "approval_id": rec.id,
+    }
+    assert store.decision(candidate["id"])["mechanical_status"] == "submitted"
     assert intents(state)[rec.id] == submitted_before_retry
     assert placed == [("NVDA", "buy", "10")]
     assert await poll_once(
         edge_hub, state, edge_client, EdgeAudit(state)) == 0
-    assert store.decision(candidate["id"])["mechanical_status"] == "prepared"
+    assert store.decision(candidate["id"])["mechanical_status"] == "submitted"
     assert placed == [("NVDA", "buy", "10")]
 
     matched = await reconcile_submitted_fills(

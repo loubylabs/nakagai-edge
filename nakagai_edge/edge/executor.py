@@ -359,11 +359,6 @@ async def reconcile_submitted_fills(
                      "order_id": intent["broker_order_id"]})
             except Exception:  # noqa: BLE001 (the durable outcome owns retry)
                 pass
-            if intent.get("candidate_id"):
-                _candidate_outcome(
-                    state, client, intent["candidate_id"],
-                    mechanical_status="blocked", reason=reason,
-                    approval_id=approval_id)
             drop_intent(state, approval_id)
             continue
         if fill is None:
@@ -386,7 +381,7 @@ async def reconcile_submitted_fills(
                     approval_id=approval_id, reason=reason)
                 _candidate_outcome(
                     state, client, intent["candidate_id"],
-                    mechanical_status="blocked", reason=reason,
+                    mechanical_status="submitted", reason=reason,
                     approval_id=approval_id, urgent=True, outcome_unknown=True)
             _alert_candidate(client, reason)
             try:
@@ -404,12 +399,6 @@ async def reconcile_submitted_fills(
                      "order_id": intent["broker_order_id"], "filled": True})
             except Exception:  # noqa: BLE001 (journal is best effort)
                 pass
-            if intent.get("candidate_id"):
-                _candidate_outcome(
-                    state, client, intent["candidate_id"],
-                    mechanical_status="submitted",
-                    reason="broker fill reconciled and supervision verified",
-                    approval_id=approval_id)
         drop_intent(state, approval_id)
     return matched
 

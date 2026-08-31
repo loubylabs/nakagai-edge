@@ -285,8 +285,7 @@ async def test_fill_sweep_completes_exact_submitted_candidate_before_anchoring(
     from nakagai_edge.edge.supervision import load
     assert intents(state) == {}
     assert load(state)["approval-1"]["state"] == "armed"
-    assert client.outcomes[0][0] == "candidate-1"
-    assert client.outcomes[0][1]["mechanical_status"] == "submitted"
+    assert client.outcomes == []
 
 
 async def test_fill_sweep_queries_declared_terminal_states_for_submitted_order(
@@ -330,7 +329,7 @@ async def test_fill_sweep_queries_declared_terminal_states_for_submitted_order(
 
     from nakagai_edge.edge.remote import intents
     assert intents(state) == {}
-    assert client.outcomes[0][1]["mechanical_status"] == "blocked"
+    assert client.outcomes == []
     queried = [args.get("state") for _connector, tool, args in hub.calls
                if tool == "get_equity_orders"]
     assert queried == ["filled", "cancelled"]
