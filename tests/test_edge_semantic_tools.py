@@ -193,7 +193,7 @@ async def _call(mcp, name, **args):
     return json.loads(text)
 
 
-# ---- raw calls cannot bypass semantic order intent -----------------------
+# ---- raw calls cannot bypass frozen candidate execution -----------------
 
 
 @pytest.mark.parametrize("connector,raw_tool", [
@@ -214,40 +214,9 @@ async def test_raw_declared_order_tool_requires_canonical_order_intent(
     assert doc == {
         "is_error": True,
         "code": "canonical_order_required",
-        "error": "raw order calls are retired; use place_order",
+        "error": "raw order calls are retired; orders require a frozen execution candidate",
     }
     assert hub.calls == [], "the refusal must land before hub call or enqueue"
-
-
-async def test_semantic_place_order_still_resolves_the_declared_order_tool(
-        tmp_path):
-    """Guarding the raw name must not guard the semantic route after it has
-    translated canonical fields through the selected connector map."""
-    hub = MapHub(specs=_specs(ALIEN_CONNECTOR))
-    doc = await _call(
-        _server(_state(tmp_path), hub), "place_order",
-        connector_id=ALIEN, symbol="AAPL", side="buy", quantity=1,
-        account="AL-1", **ORDER,
-    )
-
-    assert doc["tool"] == "submit"
-    assert hub.calls == [(ALIEN, "submit", {
-        "ticker": "AAPL", "action": "BUY", "kind": "LIMIT",
-        "qty": "1", "limit": "190.0", "trigger": "180.0",
-        "tif": "day", "acct": "AL-1",
-    })]
-
-
-async def test_semantic_place_order_exposes_only_limit_entries(tmp_path):
-    tools = {
-        tool.name: tool
-        for tool in await _server(_state(tmp_path), MapHub()).list_tools()
-    }
-
-    schema = tools["place_order"].input_schema
-    assert "order_type" not in schema["properties"]
-    assert "order_type" not in schema["required"]
-    assert {"limit_price", "stop_price"} <= set(schema["required"])
 
 
 async def test_candidate_wake_denies_every_model_order_door_and_keeps_reads(
@@ -261,9 +230,6 @@ async def test_candidate_wake_denies_every_model_order_door_and_keeps_reads(
     hub = _live_hub(state, client)
     mcp = _server(state, hub, client)
     try:
-        place = await _call(
-            mcp, "place_order", symbol="AAPL", side="buy", quantity=1,
-            account="AL-1", **ORDER)
         cancel = await _call(
             mcp, "cancel_order", order_id="AL-ORD-1", account="AL-1")
         raw = await _call(
@@ -274,7 +240,7 @@ async def test_candidate_wake_denies_every_model_order_door_and_keeps_reads(
     finally:
         await hub.aclose()
 
-    for result in (place, cancel, raw):
+    for result in (cancel, raw):
         assert result["is_error"] is True
         assert "candidate wake" in result["error"]
     assert positions["is_error"] is False
@@ -476,17 +442,14 @@ async def test_list_orders_reads_both_brokers_into_one_shape(tmp_path, connector
 
 @pytest.mark.parametrize("tool,args,named", [
     ("cancel_order", {"order_id": ""}, "order_id"),
-    ("place_order", {"symbol": "", "side": "buy", "quantity": 1, **ORDER}, "symbol"),
-    ("place_order", {"symbol": "AAPL", "side": "", "quantity": 1, **ORDER}, "side"),
     ("get_quote", {"symbols": []}, "symbols"),
 ])
 async def test_an_empty_mandatory_argument_is_refused_not_dropped(
         tmp_path, tool, args, named):
     """Dropping an empty one would not ask the broker a smaller question, it
-    would ask a different one: a cancel with no order id, or an order with no
-    symbol, is a materially different request that the broker (or a human
-    reading the approval) has to make sense of. Refuse it by name instead, and
-    dial nothing."""
+    would ask a different one. A cancel with no order id is a materially
+    different request that the broker or a human reading the approval has to
+    make sense of. Refuse it by name instead, and dial nothing."""
     hub = MapHub(specs=_tiered(["AL-1"], []))
     doc = await _call(_server(_state(tmp_path), hub), tool, **args)
 
@@ -649,30 +612,18 @@ async def test_a_failed_inference_probe_journals_no_denial(tmp_path):
 
 async def test_a_write_infers_the_single_allowed_account(tmp_path):
     hub = MapHub(specs=_tiered(["AL-1"], []))
-    await _call(_server(_state(tmp_path), hub), "place_order",
-                symbol="AAPL", side="buy", quantity=1, **ORDER)
+    await _call(_server(_state(tmp_path), hub), "cancel_order",
+                order_id="AL-ORD-1")
 
-    assert hub.args == [{"ticker": "AAPL", "action": "BUY", "kind": "LIMIT",
-                         "qty": "1", "limit": "190.0", "trigger": "180.0",
-                         "tif": "day", "acct": "AL-1"}]
-
-
-async def test_a_write_without_an_unambiguous_account_is_refused_before_the_broker(tmp_path):
-    """An absent account must not reach a broker default selection."""
-    hub = MapHub(specs=_tiered(["AL-1", "AL-2"], []))
-    doc = await _call(_server(_state(tmp_path), hub), "place_order",
-                      symbol="AAPL", side="buy", quantity=1, **ORDER)
-
-    assert doc["is_error"] is True and "account" in doc["error"]
-    assert hub.args == []
+    assert hub.args == [{"ref": "AL-ORD-1", "acct": "AL-1"}]
 
 
 async def test_a_write_never_infers_the_read_tiers_account(tmp_path):
     """`read` accounts may be viewed, never acted on. A write infers from
     `allow` alone, so the account it fills is one that could have been named."""
     hub = MapHub(specs=_tiered(["AL-2"], ["AL-1"]))
-    await _call(_server(_state(tmp_path), hub), "place_order",
-                symbol="AAPL", side="buy", quantity=1, **ORDER)
+    await _call(_server(_state(tmp_path), hub), "cancel_order",
+                order_id="AL-ORD-1")
 
     assert hub.args[0]["acct"] == "AL-2"
 
@@ -711,22 +662,6 @@ async def test_with_no_tiers_and_two_listed_accounts_nothing_is_inferred(tmp_pat
     await _call(_server(_state(tmp_path), hub), "get_balance")
 
     assert hub.args[1] == {}, "an ambiguous list is not an answer"
-
-
-async def test_a_missing_write_account_never_consults_the_brokers_account_list(tmp_path):
-    """The one rule that would reintroduce the default-account hole.
-
-    Tiers are the OWNER's statement of authority; the broker's list is not.
-    Here the broker holds exactly one account and it is the read-tier one, so a
-    layer that fell back to the broker's list would fill in the very account
-    the owner walled off from writes. It must not even ask.
-    """
-    hub = MapHub(specs=_tiered(["AL-2", "AL-3"], ["AL-1"]))
-    await _call(_server(_state(tmp_path), hub), "place_order",
-                symbol="AAPL", side="buy", quantity=1, **ORDER)
-
-    assert hub.tools == [], "the broker's account list was consulted"
-    assert hub.args == []
 
 
 async def test_an_account_the_agent_named_is_never_overridden(tmp_path):
@@ -780,52 +715,6 @@ def _live_hub(state, client):
     return hub
 
 
-async def test_place_order_returns_the_approval_envelope_intact(tmp_path):
-    """The whole envelope, verbatim. Running a write through `extract` would
-    return `{}` (place_order maps no readable fields by construction) and throw
-    away the approval id the agent must poll."""
-    posted = []
-    state, client = _state(tmp_path, ALIEN_CONNECTOR), _platform(posted)
-    hub = _live_hub(state, client)
-    try:
-        doc = await _call(_server(state, hub, client), "place_order",
-                          symbol="AAPL", side="buy", quantity=1,
-                          account="AL-1", **ORDER)
-    finally:
-        await hub.aclose()
-
-    assert doc["approval_required"] is True
-    assert doc["approval_id"] == "ap_live"
-    assert doc["status"] == "pending"
-    assert doc["expires_at"] > time.time()
-    assert doc["is_write"] is True
-    assert "get_approval" in doc["message"]
-    assert (doc["capability"], doc["connector"], doc["tool"]) == (
-        "place_order", ALIEN, "submit")
-    # Translated on the way down: the broker's own words are what the human
-    # sees on the approval screen and what the edge later executes.
-    assert posted[0]["args"] == {"acct": "AL-1", "ticker": "AAPL",
-                                 "action": "BUY", "kind": "LIMIT", "qty": "1",
-                                 "limit": "190.0", "trigger": "180.0", "tif": "day"}
-
-
-async def test_place_order_forwards_signal_id_to_the_platform(tmp_path):
-    """autopilot's envelope checks the cited signal: an order citing nothing
-    never auto-executes. Dropping it here would disable that check silently,
-    from the platform's side, with everything still looking normal."""
-    posted = []
-    state, client = _state(tmp_path, ALIEN_CONNECTOR), _platform(posted)
-    hub = _live_hub(state, client)
-    try:
-        await _call(_server(state, hub, client), "place_order",
-                    symbol="AAPL", side="buy", quantity=1, account="AL-1",
-                    signal_id="sig-42", **ORDER)
-    finally:
-        await hub.aclose()
-
-    assert posted[0]["signal_id"] == "sig-42"
-
-
 async def test_cancel_order_returns_the_approval_envelope_intact(tmp_path):
     posted = []
     state, client = _state(tmp_path, ALIEN_CONNECTOR), _platform(posted)
@@ -841,86 +730,20 @@ async def test_cancel_order_returns_the_approval_envelope_intact(tmp_path):
     assert posted[0]["args"] == {"acct": "AL-1", "ref": "AL-ORD-1"}
 
 
-async def test_an_executed_write_returns_the_brokers_own_answer(tmp_path):
-    """A write that needs no approval still comes back verbatim: the broker's
-    order reference is what the agent has to hold on to, and `extract` would
-    hand back `{}` in its place."""
-    hub = MapHub()
-    doc = await _call(_server(_state(tmp_path), hub), "place_order",
-                      connector_id=ALIEN, symbol="AAPL", side="buy",
-                      quantity=1, account="AL-1", **ORDER)
-
-    assert doc["data"] == {"order_ref": "AL-ORD-1", "state": "accepted"}
-    assert doc["capability"] == "place_order"
-
-
-async def test_a_side_the_connector_cannot_spell_is_refused(tmp_path):
-    """The vocabulary is closed at the edge of this layer too. `resolve`
-    refuses a side it cannot translate rather than passing the agent's own word
-    down, because a broker that read `short` as something else would open the
-    opposite position."""
-    hub = MapHub(specs=_specs(ALIEN_CONNECTOR))
-    doc = await _call(_server(_state(tmp_path), hub), "place_order",
-                      symbol="AAPL", side="short", quantity=1, account="AL-1", **ORDER)
-
-    assert doc["is_error"] is True and "side" in doc["error"]
-    assert hub.calls == []
-
-
-async def test_an_uninferable_write_is_refused_by_the_order_resolver(tmp_path):
-    """The proof that this layer holds no authority of its own.
-
-    Two allowed accounts leave no account to infer. The resolver refuses before
-    the broker can apply a default account.
-    """
-    entry = {**ALIEN_CONNECTOR,
-             "guardrails": {**ALIEN_CONNECTOR["guardrails"],
-                            "accounts": {**ALIEN_CONNECTOR["guardrails"]["accounts"],
-                                         "allow": ["AL-1", "AL-2"]}}}
-    state, client = _state(tmp_path, entry), _platform([])
-    hub = _live_hub(state, client)
-    try:
-        doc = await _call(_server(state, hub, client), "place_order",
-                          symbol="AAPL", side="buy", quantity=1, **ORDER)
-    finally:
-        await hub.aclose()
-
-    assert doc["is_error"] is True
-    assert "account" in doc["error"]
-
-
-async def test_a_write_to_a_read_only_connector_is_refused_by_the_guardrails(
-        tmp_path):
-    """`allow_writes: false` is the owner's word, and the capability layer
-    cannot spend it. Same denial, same sentence, through the semantic tool."""
-    entry = {**ALIEN_CONNECTOR,
-             "guardrails": {**ALIEN_CONNECTOR["guardrails"], "allow_writes": False}}
-    state, client = _state(tmp_path, entry), _platform([])
-    hub = _live_hub(state, client)
-    try:
-        doc = await _call(_server(state, hub, client), "place_order",
-                          symbol="AAPL", side="buy", quantity=1, account="AL-1", **ORDER)
-    finally:
-        await hub.aclose()
-
-    assert doc["is_error"] is True and "read-only" in doc["error"]
-
-
 # ---- the stale-policy gate ------------------------------------------------
 
 
-SEVEN = [
+SIX = [
     ("list_accounts", {}),
     ("get_balance", {}),
     ("list_positions", {}),
     ("get_quote", {"symbols": ["AAPL"]}),
     ("list_orders", {}),
-    ("place_order", {"symbol": "AAPL", "side": "buy", "quantity": 1, **ORDER}),
     ("cancel_order", {"order_id": "AL-ORD-1"}),
 ]
 
 
-@pytest.mark.parametrize("tool,args", SEVEN)
+@pytest.mark.parametrize("tool,args", SIX)
 async def test_every_semantic_tool_refuses_on_stale_policy(tmp_path, monkeypatch,
                                                            tool, args):
     """Fail closed exactly like `call_connector`: policy past its TTL refuses
@@ -973,13 +796,13 @@ async def test_a_stale_write_attempt_is_still_journalled(tmp_path, monkeypatch):
     real = time.time
     monkeypatch.setattr(time, "time", lambda: real() + 1000)
 
-    await _call(mcp, "place_order", symbol="AAPL", side="buy", quantity=1, **ORDER)
+    await _call(mcp, "cancel_order", order_id="AL-ORD-1")
 
     events = EdgeAudit(state).pending()
     assert len(events) == 1
     assert events[0]["kind"] == "denial"
     assert events[0]["detail"] == {"reason": "policy stale",
-                                   "capability": "place_order"}
+                                   "capability": "cancel_order"}
 
 
 async def test_a_refusal_before_the_connector_was_chosen_names_no_broker(tmp_path,

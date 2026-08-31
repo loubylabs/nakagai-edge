@@ -99,9 +99,9 @@ Only with the owner's explicit go-ahead, because it creates a real approval
 record and, on a real broker, a real order. Prefer the demo broker where
 available.
 
-1. Stage: semantic `place_order` with a small order; expect
-   `approval_required: true` and an `approval_id` (or `auto_approved: true`
-   under an armed autopilot mandate).
+1. Stage one platform execution candidate and wake the paired agent for it.
+   Accept that exact candidate; expect `mechanical_status: prepared` and an
+   `approval_id` (or `auto_approved: true` under an armed autopilot mandate).
 2. Human approves on the platform's Approvals page.
 3. Poll `get_approval(approval_id)` until status leaves `pending`; expect
    `executed` with a result, or a broker-side `error` message (which still

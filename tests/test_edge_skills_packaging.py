@@ -158,7 +158,7 @@ def test_readme_keeps_candidate_inspection_read_only():
 def test_readme_states_the_strict_entry_and_market_exit_contract():
     readme = " ".join((REPO / "README.md").read_text().split())
 
-    assert "model-facing `place_order` tool creates limit entries only" in readme
+    assert "frozen candidate executor creates limit entries only" in readme
     assert "positive whole-share count" in readme
     assert "both the limit and protective stop must be positive" in readme
     assert "Market orders carrying either priced field are refused" in readme

@@ -148,7 +148,7 @@ async def test_platform_tools_are_promoted(edge):
     # Sixteen: the platform's twenty-eight minus the eleven local collisions and
     # the event reader. A number, so that a promotion that quietly dropped
     # half of them is a failure rather than a smaller success.
-    assert len(names) == 21 + 16, sorted(names)
+    assert len(names) == 20 + 16, sorted(names)
 
 
 async def test_a_promoted_tool_publishes_the_platforms_own_argument_schema(edge):

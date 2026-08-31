@@ -5,17 +5,17 @@ the only place a broker credential is ever written to disk. Your agent talks to
 exactly one MCP endpoint, the edge, and never sees a token. The platform never
 sees one either.
 
-Version 0.5.2 is the current release. An agent woken for one execution
+Version 0.5.3 is the current release. An agent woken for one execution
 candidate can inspect that candidate, accept or abstain with a rationale, then
 stop. A listener-owned local scope enforces that boundary for the wake. The
 same candidate decision tools and read-only inspection remain available, while
 every other write is refused until the wake ends or expires. The agent cannot
 alter a prepared order field. The platform compiles the order, and local policy
-or the brake can still refuse execution. Semantic
-`place_order` remains the only owner-mediated order entry: a raw
-`call_connector` request whose tool exactly matches the selected connector's
-declared `capabilities.place_order.tool` is refused before dispatch with
-`canonical_order_required`. Other raw connector operations remain available.
+or the brake can still refuse execution. Frozen candidate execution is the
+only order entry. A raw `call_connector` request whose tool exactly matches the
+selected connector's declared `capabilities.place_order.tool` is refused before
+dispatch with `canonical_order_required`. Other raw connector operations remain
+available.
 
 A listener started with a parsed, nonempty `--wake-command` adds
 `X-Nakagai-Candidate-Wake: 1` only to its authenticated event polls. This
@@ -379,9 +379,9 @@ the Portfolio page still lists them. A connector declaring an incomplete
 are missing, rather than found later by a position that had no stop watching
 it. A connector that places no orders at all simply declares no `place_order`.
 
-The model-facing `place_order` tool creates limit entries only. Quantity must
-be a positive whole-share count, and both the limit and protective stop must
-be positive. Market orders carrying either priced field are refused. The only
+The frozen candidate executor creates limit entries only. Quantity must be a
+positive whole-share count, and both the limit and protective stop must be
+positive. Market orders carrying either priced field are refused. The only
 market orders the edge constructs are reduce-only warrant exits, and those
 payloads omit both priced fields.
 
@@ -393,8 +393,11 @@ order opens or closes. A broker with separate verbs mapped as
 `buy: [BUY_TO_OPEN, BUY_TO_COVER]` sends `BUY_TO_OPEN` for every buy, including
 the one meant to cover a short.
 
-The generic broker surface exposes seven named tools that work against any
-broker. The shared MCP surface remains present during an execution-candidate
+The model-facing broker surface exposes six named tools that work against any
+broker: `list_accounts`, `get_balance`, `list_positions`, `get_quote`,
+`list_orders`, and `cancel_order`. The internal `place_order` capability map
+serves frozen candidate execution and supervision only. The shared MCP surface
+remains present during an execution-candidate
 wake. Read-only inspection remains allowed. The edge enforces
 `accept_candidate` and `abstain_candidate` as the only write actions for the
 same candidate during that wake. Connector writes and order construction are
@@ -409,7 +412,7 @@ gets louder rather than quieter as brokers are added.
 `call_connector` remains the raw escape hatch for a broker tool outside the
 vocabulary. A connector's declared `place_order` tool is the exact exception:
 calling that raw name returns `canonical_order_required`, so every order starts
-through semantic `place_order`. Other raw operations still use the same
+from a frozen execution candidate. Other raw operations still use the same
 guardrails, approval queue, and audit record.
 
 **Three read-only classifications, each of which fails silently.** An
