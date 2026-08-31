@@ -71,11 +71,13 @@ class FakeHub:
 
 
 def _setup(tmp_path, grant_status="granted", artifact=None,
-           broken_execution=False, record_overrides=None):
+           broken_execution=False, execution_failures=0,
+           record_overrides=None):
     state = EdgeState(tmp_path)
     state.save_agent("https://api.test", "ag1", "nk_agent_t")
     apply_bundle(state, _bundle(), "v1")
     reports, outcomes, alerts = [], [], []
+    failures_left = execution_failures
 
     def handler(req):
         if req.url.path == "/api/agent/approvals" and req.method == "POST":
@@ -90,7 +92,19 @@ def _setup(tmp_path, grant_status="granted", artifact=None,
                 "signal_id": "signal-1"},
                 **(record_overrides or {})})
         if req.url.path.endswith("/execution"):
+            nonlocal failures_left
             reports.append(json.loads(req.content))
+            if failures_left:
+                failures_left -= 1
+                return httpx.Response(
+                    503,
+                    json={
+                        "detail": (
+                            "retry this exact execution report, and do not "
+                            "retry the broker order"
+                        )
+                    },
+                )
             if broken_execution:
                 return httpx.Response(200, text="<html>proxy</html>")
             return httpx.Response(200, json={"ok": True, "status": "executed"})
@@ -416,13 +430,13 @@ async def test_preexisting_position_does_not_turn_resting_candidate_limit_into_f
     assert candidate_entries_armed(state) is True
 
 
-async def test_candidate_execution_report_failure_keeps_submission_and_disarms(
+async def test_503_report_recovers_after_restart_without_duplicate_broker_submit(
         tmp_path):
     artifact = _artifact(
         "a1", args=CANDIDATE_ARGS, candidate_id="candidate-1",
         account="463605220")
     state, client, queue, reports = _setup(
-        tmp_path, artifact=artifact, broken_execution=True,
+        tmp_path, artifact=artifact, execution_failures=1,
         record_overrides={
             "args": CANDIDATE_ARGS, "signal_id": "signal-1",
             "exit_warrant": {
@@ -435,16 +449,203 @@ async def test_candidate_execution_report_failure_keeps_submission_and_disarms(
         intent_account="463605220",
     )
 
-    await poll_once(CandidateHub(), state, client, EdgeAudit(state))
+    hub = CandidateHub(positions=[{"symbol": "AAPL", "quantity": "3"}])
+    await poll_once(hub, state, client, EdgeAudit(state))
 
+    submitted = intents(state)["a1"]
     assert reports and reports[0]["ok"] is True
-    assert intents(state)["a1"]["phase"] == "submitted"
-    assert intents(state)["a1"]["broker_order_id"] == "42"
+    assert submitted["phase"] == "submitted"
+    assert submitted["broker_order_id"] == "42"
+    assert submitted["pending_execution_report"] == reports[0]
+    assert candidate_entries_armed(state) is True
+    assert client.candidate_outcomes == []
+    assert client.candidate_alerts == []
+
+    fill = {
+        "order_id": "42", "symbol": "AAPL", "side": "buy",
+        "quantity": 3.0, "status": "filled", "fill_price": 211.31,
+    }
+    assert await reconcile_submitted_fills(
+        hub, state, client, EdgeAudit(state), hub.spec("demo"), "463605220",
+        [fill],
+    ) == 0
+    assert load_supervision(state) == {}
+
+    state._write_private(state.candidate_outcomes_path, {
+        "older-candidate": {
+            "mechanical_status": "blocked",
+            "mechanical_reason": "older durable outcome",
+            "approval_id": "older-approval",
+            "urgent": False,
+            "outcome_unknown": False,
+        },
+    })
+    recovery_trace = []
+    original_execution = client.report_execution
+    original_outcome = client.report_candidate_outcome
+
+    def traced_execution(*args, **kwargs):
+        recovery_trace.append("execution-report")
+        return original_execution(*args, **kwargs)
+
+    def traced_outcome(*args, **kwargs):
+        recovery_trace.append("candidate-outcome")
+        return original_outcome(*args, **kwargs)
+
+    client.report_execution = traced_execution
+    client.report_candidate_outcome = traced_outcome
+
+    restarted = EdgeState(tmp_path)
+    await poll_once(hub, restarted, client, EdgeAudit(restarted))
+
+    assert recovery_trace[:2] == ["execution-report", "candidate-outcome"]
+    assert len(hub.calls) == 1
+    assert len(reports) == 2
+    assert reports[1] == reports[0]
+    recovered = intents(restarted)["a1"]
+    expected = dict(submitted)
+    expected.pop("pending_execution_report")
+    assert recovered == expected
+    assert await reconcile_submitted_fills(
+        hub, restarted, client, EdgeAudit(restarted), hub.spec("demo"),
+        "463605220", [fill],
+    ) == 1
+    assert load_supervision(restarted)["a1"]["state"] == "armed"
+    assert intents(restarted) == {}
+
+
+async def test_lost_execution_ack_retries_the_exact_report_only(tmp_path):
+    artifact = _artifact(
+        "a1", args=CANDIDATE_ARGS, candidate_id="candidate-1",
+        account="463605220")
+    state, client, queue, reports = _setup(
+        tmp_path, artifact=artifact,
+        record_overrides={
+            "args": CANDIDATE_ARGS, "signal_id": "signal-1",
+            "exit_warrant": {
+                "expires_at": time.time() + 3600, "signature": "warrant"},
+        },
+    )
+    queue.enqueue(
+        "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
+        signal_id="signal-1", candidate_id="candidate-1",
+        intent_account="463605220",
+    )
+    original_report = client.report_execution
+    lose_response = True
+
+    def report_then_lose_response(*args, **kwargs):
+        nonlocal lose_response
+        response = original_report(*args, **kwargs)
+        if lose_response:
+            lose_response = False
+            raise httpx.ReadError("execution acknowledgement was lost")
+        return response
+
+    client.report_execution = report_then_lose_response
+    hub = CandidateHub()
+
+    await poll_once(hub, state, client, EdgeAudit(state))
+    pending = intents(state)["a1"]["pending_execution_report"]
+    restarted = EdgeState(tmp_path)
+    await poll_once(hub, restarted, client, EdgeAudit(restarted))
+
+    assert len(hub.calls) == 1
+    assert reports == [pending, pending]
+    assert "pending_execution_report" not in intents(state)["a1"]
+    assert candidate_entries_armed(state) is True
+    assert client.candidate_outcomes == []
+
+
+async def test_nonexact_execution_ack_keeps_the_report_pending(tmp_path):
+    artifact = _artifact(
+        "a1", args=CANDIDATE_ARGS, candidate_id="candidate-1",
+        account="463605220")
+    state, client, queue, reports = _setup(
+        tmp_path, artifact=artifact,
+        record_overrides={"args": CANDIDATE_ARGS, "signal_id": "signal-1"},
+    )
+    queue.enqueue(
+        "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
+        signal_id="signal-1", candidate_id="candidate-1",
+        intent_account="463605220",
+    )
+    original_report = client.report_execution
+    acknowledge_exactly = False
+
+    def report(*args, **kwargs):
+        if not acknowledge_exactly:
+            return {"ok": True, "status": "submitted"}
+        return original_report(*args, **kwargs)
+
+    client.report_execution = report
+    hub = CandidateHub()
+    await poll_once(hub, state, client, EdgeAudit(state))
+
+    submitted = intents(state)["a1"]
+    assert "pending_execution_report" in submitted
+    acknowledge_exactly = True
+    await poll_once(hub, state, client, EdgeAudit(state))
+
+    recovered = intents(state)["a1"]
+    expected = dict(submitted)
+    expected.pop("pending_execution_report")
+    assert recovered == expected
+    assert len(hub.calls) == 1
+    assert reports == [submitted["pending_execution_report"]]
+
+
+async def test_missing_order_id_preserves_urgent_submitted_truth_and_disarms(
+        tmp_path):
+    artifact = _artifact(
+        "a1", args=CANDIDATE_ARGS, candidate_id="candidate-1",
+        account="463605220")
+    state, client, queue, reports = _setup(
+        tmp_path, artifact=artifact,
+        record_overrides={"args": CANDIDATE_ARGS, "signal_id": "signal-1"},
+    )
+    queue.enqueue(
+        "ag1", "demo", "place_order", CANDIDATE_ARGS, ttl_s=900,
+        signal_id="signal-1", candidate_id="candidate-1",
+        intent_account="463605220",
+    )
+
+    class MissingOrderIdHub(CandidateHub):
+        async def call(self, connector_id, tool, args, **kw):
+            if kw.get("approved"):
+                self.calls.append((connector_id, tool, args, kw))
+                return {"is_error": False, "data": {"accepted": True}}
+            return await super().call(connector_id, tool, args, **kw)
+
+    hub = MissingOrderIdHub()
+    await poll_once(hub, state, client, EdgeAudit(state))
+
+    reason = (
+        "candidate broker result has no declared order id; "
+        "fill attribution is impossible"
+    )
+    assert reports == [{
+        "ok": True,
+        "result": {"is_error": False, "data": {"accepted": True}},
+        "error": reason,
+        "outcome_unknown": True,
+        "order_id": "",
+    }]
+    submitted = intents(state)["a1"]
+    assert submitted["phase"] == "submitted"
+    assert submitted["broker_order_id"] == ""
+    assert "pending_execution_report" not in submitted
     assert candidate_entries_armed(state) is False
-    assert client.candidate_outcomes[0]["mechanical_status"] == "blocked"
-    assert client.candidate_outcomes[0]["urgent"] is True
-    assert client.candidate_outcomes[0]["outcome_unknown"] is True
+    assert client.candidate_outcomes == []
     assert client.candidate_alerts
+    assert await reconcile_submitted_fills(
+        hub, state, client, EdgeAudit(state), hub.spec("demo"), "463605220",
+        [{
+            "order_id": "", "symbol": "AAPL", "side": "buy",
+            "quantity": 3.0, "status": "filled", "fill_price": 211.31,
+        }],
+    ) == 0
+    assert intents(state)["a1"] == submitted
 
 
 async def test_later_matching_fill_establishes_supervision_and_completes_candidate(
@@ -1094,13 +1295,19 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
                          "connectors": {"connectors": [connector]},
                          "signing_public_key": public_key_for(priv)}, "v1")
 
+    lose_execution_ack = True
+
     def forward(req):
+        nonlocal lose_execution_ack
         headers = {"Authorization": f"Bearer {token}"}
         ct = req.headers.get("content-type")
         if ct:
             headers["content-type"] = ct
         resp = platform.request(req.method, req.url.path, content=req.content,
                                 headers=headers)
+        if req.url.path.endswith("/execution") and lose_execution_ack:
+            lose_execution_ack = False
+            raise httpx.ReadError("execution acknowledgement was lost")
         return httpx.Response(resp.status_code, content=resp.content,
                               headers={"content-type": "application/json"})
 
@@ -1184,6 +1391,7 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
     assert n == 1
     assert placed == [("NVDA", "buy", "10")]
     assert intents(state)[rec.id]["broker_order_id"] == "broker-order-1"
+    assert "pending_execution_report" in intents(state)[rec.id]
     assert store.decision(candidate["id"])["mechanical_status"] == "submitted"
 
     # A repeated accepted decision receives the same frozen order and approval.
@@ -1203,7 +1411,8 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
     assert intents(state)[rec.id] == submitted_before_retry
     assert placed == [("NVDA", "buy", "10")]
     assert await poll_once(
-        edge_hub, state, edge_client, EdgeAudit(state)) == 0
+        edge_hub, state, edge_client, EdgeAudit(state)) == 1
+    assert "pending_execution_report" not in intents(state)[rec.id]
     assert store.decision(candidate["id"])["mechanical_status"] == "submitted"
     assert placed == [("NVDA", "buy", "10")]
 
@@ -1246,6 +1455,8 @@ async def test_nonjson_execution_response_cannot_rearm_intent(tmp_path):
     audit = EdgeAudit(state)
     await poll_once(hub, state, client, audit)     # must not raise
     assert len(hub.calls) == 1
-    assert intents(state) == {}
+    assert intents(state)["a1"]["phase"] == "submitted"
+    assert intents(state)["a1"]["pending_execution_report"] == reports[0]
     await poll_once(hub, state, client, audit)
     assert len(hub.calls) == 1                      # no duplicate broker order
+    assert reports[1] == reports[0]

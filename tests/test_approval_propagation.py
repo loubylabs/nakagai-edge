@@ -256,9 +256,16 @@ def test_exact_candidate_enqueue_retry_preserves_complete_submitted_intent(
     )
     approval = {"id": "approval-a", "status": "granted", "artifact": {"sig": "x"}}
     result = {"data": {"order_id": "broker-order-1"}}
+    report = {
+        "ok": True,
+        "result": result,
+        "error": "",
+        "outcome_unknown": False,
+        "order_id": "broker-order-1",
+    }
     mark_submitted(
         state, "approval-a", order_id="broker-order-1",
-        approval=approval, result=result,
+        approval=approval, result=result, execution_report=report,
     )
     before = intents(state)["approval-a"]
 
@@ -273,6 +280,7 @@ def test_exact_candidate_enqueue_retry_preserves_complete_submitted_intent(
     assert before["broker_order_id"] == "broker-order-1"
     assert before["approval"] == approval
     assert before["broker_result"] == result
+    assert before["pending_execution_report"] == report
     assert isinstance(before["submitted_at"], float)
 
 

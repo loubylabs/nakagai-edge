@@ -5,7 +5,7 @@ the only place a broker credential is ever written to disk. Your agent talks to
 exactly one MCP endpoint, the edge, and never sees a token. The platform never
 sees one either.
 
-Version 0.5.4 is the current release. An agent woken for one execution
+Version 0.5.5 is the current release. An agent woken for one execution
 candidate can inspect that candidate, accept or abstain with a rationale, then
 stop. A listener-owned local scope enforces that boundary for the wake. The
 same candidate decision tools and read-only inspection remain available, while
@@ -16,6 +16,13 @@ only order entry. A raw `call_connector` request whose tool exactly matches the
 selected connector's declared `capabilities.place_order.tool` is refused before
 dispatch with `canonical_order_required`. Other raw connector operations remain
 available.
+
+After broker acceptance, the edge durably stores the exact platform execution
+report beside the submitted intent. It retries that report until the platform
+acknowledges it and never repeats the broker order. Fill supervision starts only
+after that acknowledgement. An accepted result without a declared broker order
+id stays submitted, disarms further candidate entries, and alerts the owner that
+the outcome cannot be attributed safely.
 
 A listener started with a parsed, nonempty `--wake-command` adds
 `X-Nakagai-Candidate-Wake: 1` only to its authenticated event polls. This

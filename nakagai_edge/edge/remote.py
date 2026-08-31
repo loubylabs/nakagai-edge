@@ -36,8 +36,11 @@ def drop_intent(state: EdgeState, approval_id: str) -> None:
 
 def mark_submitted(
         state: EdgeState, approval_id: str, *, order_id: str,
-        approval: dict, result: dict) -> None:
-    """Freeze a broker-accepted intent until its exact order id fills."""
+        approval: dict, result: dict, execution_report: dict) -> None:
+    """Freeze a broker acceptance and its exact pending platform report."""
+    expected = {"ok", "result", "error", "outcome_unknown", "order_id"}
+    if set(execution_report) != expected:
+        raise ValueError("execution report does not have the exact wire fields")
     doc = intents(state)
     intent = doc.get(approval_id)
     if not isinstance(intent, dict):
@@ -48,8 +51,26 @@ def mark_submitted(
         "broker_order_id": order_id,
         "approval": approval,
         "broker_result": result,
+        "pending_execution_report": execution_report,
         "submitted_at": time.time(),
     }
+    _write_intents(state, doc)
+
+
+def acknowledge_execution_report(
+        state: EdgeState, approval_id: str, execution_report: dict) -> None:
+    """Clear only the exact report marker after platform acknowledgement."""
+    doc = intents(state)
+    intent = doc.get(approval_id)
+    if not isinstance(intent, dict):
+        raise ValueError(f"local intent {approval_id!r} disappeared before report ack")
+    if intent.get("pending_execution_report") != execution_report:
+        raise ValueError(
+            f"local intent {approval_id!r} changed before exact report ack"
+        )
+    settled = dict(intent)
+    settled.pop("pending_execution_report")
+    doc[approval_id] = settled
     _write_intents(state, doc)
 
 
