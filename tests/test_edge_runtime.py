@@ -274,6 +274,7 @@ async def test_candidate_tools_publish_only_candidate_id_and_rationale(tmp_path)
 
     tools = {tool.name: tool for tool in await mcp.list_tools()}
 
+    assert "place_order" not in tools
     for name in ("accept_candidate", "abstain_candidate"):
         assert set(tools[name].input_schema["properties"]) == {
             "candidate_id", "rationale"}

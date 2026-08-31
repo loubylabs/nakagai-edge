@@ -63,7 +63,7 @@ STALE_POLICY = {"is_error": True, "error":
 CANONICAL_ORDER_REQUIRED = {
     "is_error": True,
     "code": "canonical_order_required",
-    "error": "raw order calls are retired; use place_order",
+    "error": "raw order calls are retired; orders require a frozen execution candidate",
 }
 
 
@@ -467,13 +467,13 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
     @mcp.tool()
     async def call_connector(connector_id: str, tool: str, args_json: str = "{}") -> str:
         """Call one tool on a configured connector (broker or platform), in
-        that connector's OWN vocabulary. The seven capability tools
+        that connector's OWN vocabulary. The six model-facing capability tools
         (list_accounts, get_balance, list_positions, get_quote, list_orders,
-        place_order, cancel_order) do the same work in one shared vocabulary
-        and are what you want unless a broker offers something they do not
-        cover. A connector's declared raw order tool is refused here because
-        place_order is the only order entry. Other writes enqueue for human
-        approval on the platform; poll get_approval for the outcome."""
+        cancel_order) do the same work in one shared vocabulary and are what
+        you want unless a broker offers something they do not cover. A
+        connector's declared raw order tool is refused here because only the
+        frozen candidate executor may submit an order. Other writes enqueue
+        for human approval on the platform; poll get_approval for the outcome."""
         try:
             args = json.loads(args_json or "{}")
         except json.JSONDecodeError as e:
@@ -512,9 +512,9 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
     @mcp.tool()
     async def list_connectors() -> str:
         """Every configured connector, whether it is enabled, and what it can be
-        asked to do: `capabilities` lists which of the seven capability tools
-        that connector serves. Read it before calling one, rather than
-        discovering the gap as a refusal."""
+        asked to do: `capabilities` lists the connector's internal capability
+        maps. Read it before calling one, rather than discovering the gap as a
+        refusal. The place_order map serves frozen candidate execution only."""
         if (stale := _gate()) is not None:
             return stale
         return json.dumps(hub.status(), default=str)
@@ -535,9 +535,9 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
 
     @mcp.tool()
     async def get_approval(approval_id: str) -> str:
-        """Status of a write intent you enqueued: place_order, cancel_order, or
-        a write through call_connector. This is how you learn whether the owner
-        approved it and what the broker then answered."""
+        """Status of a cancel_order or raw connector write you enqueued. This
+        is how you learn whether the owner approved it and what the broker then
+        answered."""
         if (stale := _gate()) is not None:
             return stale
         rec = hub.approvals.get(hub.account_key, approval_id)
@@ -545,7 +545,7 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
             return json.dumps({"is_error": True, "error": f"no approval {approval_id!r}"})
         return json.dumps(rec.public(), default=str)
 
-    # ---- the seven capability tools ------------------------------------
+    # ---- the six model-facing capability tools -------------------------
     #
     # One vocabulary, learned once, spoken to any broker. Each tool resolves
     # to (connector, tool, args) through that connector's own map and then
@@ -661,72 +661,10 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
             default=str)
 
     @mcp.tool()
-    async def place_order(symbol: str, side: str, quantity: int,
-                          limit_price: float, stop_price: float,
-                          time_in_force: str,
-                          connector_id: str = "", account: str = "",
-                          signal_id: str = "") -> str:
-        """Place an order, or ask the owner for permission to. WHICH ONE
-        HAPPENED IS IN THE RESPONSE: branch on `approval_required`, never on
-        an assumption.
-
-        `approval_required: true` means NOTHING reached the broker. You get an
-        `approval_id`, a `status`, and an `expires_at` after which the request
-        lapses untouched. Poll `get_approval(approval_id)` for the outcome.
-        When the owner (or, inside their autopilot envelope, the mandate) says
-        yes, the edge executes the arguments captured HERE, so there is no
-        second chance to change them.
-
-        No `approval_required` means the order WAS placed, right then, and what
-        you are holding under `data` is the broker's own answer, order
-        reference and all. Do not call again on the belief that it was merely
-        queued: that is how one intent becomes two real orders on a real
-        account.
-
-        Which of the two you get is the owner's configuration, not your
-        choice: it depends on whether this connector's approval policy covers
-        the tool your order maps to. Do not assume either.
-
-        This model-facing tool places limit entries only. `side` is canonical:
-        pass `buy` or `sell`, never the broker's own spelling. `quantity` must
-        be a positive whole-share count. `limit_price` and `stop_price` must
-        both be positive values in the account's currency. `time_in_force` is
-        the connector's declared canonical value. The edge resolves each value
-        through the connector map before it hashes or sends the broker
-        arguments. A stop is mandatory because it establishes the supervision
-        level and exit warrant for the resulting position.
-
-        `connector_id` may be omitted when exactly one enabled broker declares
-        this capability. `account` may be omitted only when the owner allows
-        exactly ONE account for writes; anything less certain is refused by the
-        guardrails naming the accounts you may choose between. That refusal is
-        deliberate: an order that names no account lands on the broker's
-        default, which may be an account the owner allows you to read and never
-        to act on.
-
-        `signal_id` is the id of a Nakagai signal this order claims to execute.
-        Pass it whenever one exists. The platform resolves it, freezes the
-        evidence onto the approval so the owner sees what you are acting on,
-        and checks it against the autopilot envelope: an order citing nothing
-        never auto-executes, it waits for a human tap.
-        """
-        return json.dumps(
-            await _capability_call("place_order", connector_id,
-                                   {"symbol": symbol, "side": side,
-                                    "order_type": "limit", "quantity": quantity,
-                                    "limit_price": limit_price,
-                                    "stop_price": stop_price,
-                                    "time_in_force": time_in_force,
-                                    "account": account},
-                                   required=("symbol", "side", "quantity",
-                                             "limit_price", "stop_price", "time_in_force"),
-                                   signal_id=signal_id), default=str)
-
-    @mcp.tool()
     async def cancel_order(order_id: str, connector_id: str = "",
                            account: str = "") -> str:
         """Cancel a working order, or ask the owner for permission to. Branch on
-        `approval_required` exactly as for `place_order`.
+        `approval_required` in the response.
 
         `approval_required: true` means the cancel is only requested: poll
         `get_approval(approval_id)`, and expect the broker to hear about it
@@ -739,9 +677,9 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         never a guarantee about what already happened there.
 
         `order_id` is the `order_id` from `list_orders` on the same connector;
-        ids are not portable between brokers. `connector_id` and `account`
-        follow the same rules as `place_order`, and a cancel is a write, so the
-        account (when the broker's map needs one) must be write-allowed.
+        ids are not portable between brokers. `connector_id` may be omitted
+        only when one connector declares this capability. A cancel is a write,
+        so the account, when the broker's map needs one, must be write-allowed.
         """
         return json.dumps(
             await _capability_call("cancel_order", connector_id,
