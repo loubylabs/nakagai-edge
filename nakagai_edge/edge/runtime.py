@@ -763,7 +763,8 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         leave it empty when the judgment leaned on none. These are opaque
         identifier strings to the edge: it never interprets one and never
         derives an order field from one. The platform compiler alone owns
-        symbol, side, size, entry, and stop.
+        symbol, side, size, entry, and stop. Cite only ids the platform
+        handed you in this wake; never invent one.
         """
         if denial := _candidate_decision_denial(candidate_id):
             return json.dumps(denial)
@@ -869,7 +870,8 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         leave it empty when the judgment leaned on none. These are opaque
         identifier strings to the edge: it never interprets one and never
         derives an order field from one. The platform compiler alone owns
-        symbol, side, size, entry, and stop.
+        symbol, side, size, entry, and stop. Cite only ids the platform
+        handed you in this wake; never invent one.
         """
         if denial := _candidate_decision_denial(candidate_id):
             return json.dumps(denial)

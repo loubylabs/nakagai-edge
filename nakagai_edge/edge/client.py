@@ -70,7 +70,7 @@ def _candidate_decision_body(rationale: str, memory_ids: list[str] | None) -> di
     talking to a platform that predates the field sends the exact same wire
     request it always has. Only a non-empty list changes what goes out.
     """
-    body = {"rationale": rationale}
+    body: dict[str, object] = {"rationale": rationale}
     if memory_ids:
         body["memory_ids"] = list(memory_ids)
     return body

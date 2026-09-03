@@ -628,7 +628,12 @@ async def test_accept_candidate_sends_a_populated_memory_ids_list(tmp_path, monk
 
 async def test_accept_candidate_refuses_more_than_ten_memory_ids_locally(tmp_path):
     """Refused before any checkin or broker contact: an oversized list is a
-    local mistake, not a reason to touch the broker first."""
+    local mistake, not a reason to touch the broker first.
+
+    Uses _ReadyReporter, not the no-op _Reporter, so a cap check that slipped
+    below the portfolio refresh would still show up here: `reporter.calls`
+    pins that snapshot_and_push itself was never reached, not just that the
+    two HTTP paths this fixture happens to stub came back empty."""
     requests = []
 
     def handler(req):
@@ -647,7 +652,8 @@ async def test_accept_candidate_refuses_more_than_ten_memory_ids_locally(tmp_pat
     client = PlatformClient("https://api.test", "t",
                             transport=httpx.MockTransport(handler))
     hub = Hub()
-    mcp = create_edge_mcp(state, hub, client, EdgeAudit(state), _Reporter(),
+    reporter = _ReadyReporter()
+    mcp = create_edge_mcp(state, hub, client, EdgeAudit(state), reporter,
                           Brake(state, hub, client, EdgeAudit(state)))
 
     result = await mcp.call_tool("accept_candidate", {
@@ -659,6 +665,7 @@ async def test_accept_candidate_refuses_more_than_ten_memory_ids_locally(tmp_pat
     assert "10" in doc["error"]
     assert requests == []
     assert hub.calls == []
+    assert reporter.calls == []
 
 
 async def test_accept_candidate_rejects_local_map_mismatch_without_connector_contact(
