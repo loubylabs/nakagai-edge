@@ -27,9 +27,10 @@ prior event. Default to abstain when a material fact is missing, contradictory,
 stale, or outside this skill's scope.
 
 When the judgment leaned on something the desk remembers about its owner,
-name those rows in `memory_ids`; when it did not, omit the argument. Cite
-only ids the platform handed you in this wake, never one you invented: an
-unrecognized id costs the whole vote.
+name those rows in `memory_ids`; when it did not, omit the argument. Those
+ids are the `id` values on rows returned by `get_memory`, never something
+read off the candidate event. Cite only ids the platform handed you in this
+wake, never one you invented: an unrecognized id costs the whole vote.
 
 ## One-event loop
 

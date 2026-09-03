@@ -118,6 +118,7 @@ def test_candidate_trader_skill_bounds_one_terminal_decision(wheel):
         "stop after one durable decision",
         "name those rows in `memory_ids`",
         "when it did not, omit the argument",
+        "the `id` values on rows returned by `get_memory`",
         "never one you invented",
         "Accepting does not authorize changing any prepared field.",
         "Local policy or the brake can still refuse execution.",
