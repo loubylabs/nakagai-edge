@@ -43,7 +43,7 @@ jobs:
           # pulls the wheel off PyPI.
           uv build --wheel -o dist/
           uv run --isolated --no-project --with dist/nakagai_edge-*.whl \
-            python -c "from importlib.metadata import version; from nakagai_edge.edge.skills import list_skills; import nakagai_edge.edge.runtime; import nakagai_edge.cli; expected=['candidate-trader','check-the-evidence','connect-edge','daily-brief','halt','nakagai-chat','pair-agent','verify','verify-edge']; assert version('nakagai-edge') == '0.5.5'; assert list_skills() == expected; print('ok: 0.5.5 and all nine skills ship')"
+            python -c "from importlib.metadata import version; from nakagai_edge.edge.skills import list_skills; import nakagai_edge.edge.runtime; import nakagai_edge.cli; expected=['candidate-trader','check-the-evidence','connect-edge','daily-brief','halt','nakagai-chat','pair-agent','verify','verify-edge']; assert version('nakagai-edge') == '0.5.6'; assert list_skills() == expected; print('ok: 0.5.6 and all nine skills ship')"
 
   publish:
     name: publish to PyPI

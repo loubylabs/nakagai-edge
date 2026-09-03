@@ -190,6 +190,8 @@ def test_unconfigured_event_poll_omits_candidate_wake_attestation():
 
 
 def test_candidate_decision_routes_put_only_rationale_in_the_body():
+    """No memory_ids argument at all: the body an edge sent before the field
+    existed, unchanged."""
     seen = []
 
     def handler(request):
@@ -207,6 +209,50 @@ def test_candidate_decision_routes_put_only_rationale_in_the_body():
          {"rationale": "fresh broker evidence"}),
         ("/api/agent/candidates/candidate-1/abstain",
          {"rationale": "setup expired"}),
+    ]
+
+
+def test_candidate_decision_omits_memory_ids_from_the_body_when_empty():
+    """An empty list must produce the exact same wire body as no list at
+    all, so a platform that predates the field sees nothing different."""
+    seen = []
+
+    def handler(request):
+        seen.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={"candidate_id": "candidate-1",
+                                         "decision": "accepted"})
+
+    client = PlatformClient("https://api.test", "nk_agent_t",
+                            transport=_transport(handler))
+    client.accept_candidate("candidate-1", "fresh broker evidence", [])
+    client.abstain_candidate("candidate-1", "setup expired", memory_ids=[])
+
+    assert seen == [
+        ("/api/agent/candidates/candidate-1/accept",
+         {"rationale": "fresh broker evidence"}),
+        ("/api/agent/candidates/candidate-1/abstain",
+         {"rationale": "setup expired"}),
+    ]
+
+
+def test_candidate_decision_sends_a_populated_memory_ids_list():
+    seen = []
+
+    def handler(request):
+        seen.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={"candidate_id": "candidate-1",
+                                         "decision": "accepted"})
+
+    client = PlatformClient("https://api.test", "nk_agent_t",
+                            transport=_transport(handler))
+    client.accept_candidate("candidate-1", "matches a stated fact", ["mem-1", "mem-2"])
+    client.abstain_candidate("candidate-1", "conflicts with a guess", ["mem-3"])
+
+    assert seen == [
+        ("/api/agent/candidates/candidate-1/accept",
+         {"rationale": "matches a stated fact", "memory_ids": ["mem-1", "mem-2"]}),
+        ("/api/agent/candidates/candidate-1/abstain",
+         {"rationale": "conflicts with a guess", "memory_ids": ["mem-3"]}),
     ]
 
 
