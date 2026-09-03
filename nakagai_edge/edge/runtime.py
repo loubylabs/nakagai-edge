@@ -180,6 +180,28 @@ def _safe_candidate(response: dict) -> dict:
     return {field: response[field] for field in fields if field in response}
 
 
+# The platform validates and stores this list too; the cap here exists so an
+# oversized list is refused locally, in one turn, rather than accepted here
+# and then bounced by the platform after a checkin and a broker read already
+# ran for accept_candidate.
+MAX_CANDIDATE_MEMORY_IDS = 10
+
+
+def _bounded_memory_ids(memory_ids: list[str] | None) -> list[str]:
+    """Normalize a decision's Memory-row trail, capped at ten entries.
+
+    These are opaque identifier strings to the edge: it never interprets them
+    and never derives an order field from one. The platform compiler alone
+    owns symbol, side, size, entry, and stop.
+    """
+    ids = list(memory_ids or [])
+    if len(ids) > MAX_CANDIDATE_MEMORY_IDS:
+        raise ValueError(
+            f"memory_ids carries {len(ids)} entries; a candidate decision "
+            f"may lean on at most {MAX_CANDIDATE_MEMORY_IDS}")
+    return ids
+
+
 def _candidate_broker_account(state: EdgeState):
     """The sole locally write-tiered candidate connector and account."""
     candidates = []
@@ -728,16 +750,26 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
             return json.dumps({"is_error": True, "error": str(e)})
 
     @mcp.tool()
-    async def accept_candidate(candidate_id: str, rationale: str) -> str:
+    async def accept_candidate(candidate_id: str, rationale: str,
+                               memory_ids: list[str] | None = None) -> str:
         """Accept one platform candidate. The platform owns every order field.
 
         This tool refreshes broker evidence, relays broker-authored equity and
         signed day profit and loss, validates the frozen response, and submits
         its exact connector call through local guardrails and approvals.
+
+        `memory_ids` names, if any, the Memory rows this judgment leaned on
+        (owner-stated facts or the desk's own guesses), up to 10; omit it or
+        leave it empty when the judgment leaned on none. These are opaque
+        identifier strings to the edge: it never interprets one and never
+        derives an order field from one. The platform compiler alone owns
+        symbol, side, size, entry, and stop. Cite only ids the platform
+        handed you in this wake; never invent one.
         """
         if denial := _candidate_decision_denial(candidate_id):
             return json.dumps(denial)
         try:
+            memory_ids = _bounded_memory_ids(memory_ids)
             readiness_errors = []
             if not candidate_entries_armed(state):
                 readiness_errors.append(
@@ -775,7 +807,7 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
                         "platform did not accept fresh broker evidence")
             except (EdgeClientError, httpx.HTTPError, ValueError) as error:
                 readiness_errors.append(f"broker evidence check-in failed: {error}")
-            response = client.accept_candidate(candidate_id, rationale)
+            response = client.accept_candidate(candidate_id, rationale, memory_ids)
             _terminal_candidate(candidate_id, "accepted", response)
             if response.get("mechanical_status") == "blocked":
                 if (response.get("prepared_order") is not None
@@ -829,12 +861,23 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
             return json.dumps({"is_error": True, "error": str(error)})
 
     @mcp.tool()
-    async def abstain_candidate(candidate_id: str, rationale: str) -> str:
-        """Abstain from one platform candidate without contacting a broker."""
+    async def abstain_candidate(candidate_id: str, rationale: str,
+                                memory_ids: list[str] | None = None) -> str:
+        """Abstain from one platform candidate without contacting a broker.
+
+        `memory_ids` names, if any, the Memory rows this judgment leaned on
+        (owner-stated facts or the desk's own guesses), up to 10; omit it or
+        leave it empty when the judgment leaned on none. These are opaque
+        identifier strings to the edge: it never interprets one and never
+        derives an order field from one. The platform compiler alone owns
+        symbol, side, size, entry, and stop. Cite only ids the platform
+        handed you in this wake; never invent one.
+        """
         if denial := _candidate_decision_denial(candidate_id):
             return json.dumps(denial)
         try:
-            response = client.abstain_candidate(candidate_id, rationale)
+            memory_ids = _bounded_memory_ids(memory_ids)
+            response = client.abstain_candidate(candidate_id, rationale, memory_ids)
             _terminal_candidate(candidate_id, "abstained", response)
             return json.dumps(
                 _safe_candidate(response),

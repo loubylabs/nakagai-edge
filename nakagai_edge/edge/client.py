@@ -63,6 +63,19 @@ def _detail(resp: httpx.Response) -> str:
         return resp.text
 
 
+def _candidate_decision_body(rationale: str, memory_ids: list[str] | None) -> dict:
+    """The accept/abstain request body.
+
+    `memory_ids` is omitted from the body entirely when empty, so an edge
+    talking to a platform that predates the field sends the exact same wire
+    request it always has. Only a non-empty list changes what goes out.
+    """
+    body: dict[str, object] = {"rationale": rationale}
+    if memory_ids:
+        body["memory_ids"] = list(memory_ids)
+    return body
+
+
 def pair(platform_url: str, code: str, *, transport=None) -> dict:
     with httpx.Client(base_url=platform_url.rstrip("/"), timeout=15.0,
                       transport=transport) as c:
@@ -179,15 +192,17 @@ class PlatformClient:
             headers=headers,
             timeout=httpx.Timeout(15.0, read=float(timeout_s) + 10.0)))
 
-    def accept_candidate(self, candidate_id: str, rationale: str) -> dict:
+    def accept_candidate(self, candidate_id: str, rationale: str,
+                         memory_ids: list[str] | None = None) -> dict:
         return self._check(self._client.post(
             f"/api/agent/candidates/{candidate_id}/accept",
-            json={"rationale": rationale}))
+            json=_candidate_decision_body(rationale, memory_ids)))
 
-    def abstain_candidate(self, candidate_id: str, rationale: str) -> dict:
+    def abstain_candidate(self, candidate_id: str, rationale: str,
+                          memory_ids: list[str] | None = None) -> dict:
         return self._check(self._client.post(
             f"/api/agent/candidates/{candidate_id}/abstain",
-            json={"rationale": rationale}))
+            json=_candidate_decision_body(rationale, memory_ids)))
 
     def report_candidate_outcome(
             self, candidate_id: str, *, mechanical_status: str,

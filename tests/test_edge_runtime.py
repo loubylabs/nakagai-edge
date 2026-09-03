@@ -263,7 +263,7 @@ async def test_agent_checkin_platform_error_returns_is_error_json(tmp_path):
     assert "revoked" in doc["error"]
 
 
-async def test_candidate_tools_publish_only_candidate_id_and_rationale(tmp_path):
+async def test_candidate_tools_publish_candidate_id_rationale_and_memory_ids(tmp_path):
     state = _state(tmp_path)
     client = PlatformClient("https://api.test", "t",
                             transport=httpx.MockTransport(lambda r: httpx.Response(500)))
@@ -277,7 +277,7 @@ async def test_candidate_tools_publish_only_candidate_id_and_rationale(tmp_path)
     assert "place_order" not in tools
     for name in ("accept_candidate", "abstain_candidate"):
         assert set(tools[name].input_schema["properties"]) == {
-            "candidate_id", "rationale"}
+            "candidate_id", "rationale", "memory_ids"}
         assert set(tools[name].input_schema["required"]) == {
             "candidate_id", "rationale"}
 
@@ -551,6 +551,121 @@ async def test_accept_candidate_refreshes_broker_evidence_then_submits_exact_ord
         "status": "pending",
     }
     assert "prepared_order" not in doc
+
+
+async def test_accept_candidate_sends_a_populated_memory_ids_list(tmp_path, monkeypatch):
+    from nakagai_edge.edge import runtime
+
+    calls = []
+    broker_args = dict(BROKER_ORDER)
+
+    def handler(req):
+        calls.append((req.url.path, json.loads(req.content) if req.content else None))
+        if req.url.path == "/api/agent/checkin":
+            return httpx.Response(200, json={"ok": True})
+        if req.url.path.endswith("/accept"):
+            return httpx.Response(200, json={
+                "candidate_id": "candidate-1", "decision": "accepted",
+                "mechanical_status": "prepared", "mechanical_reason": "",
+                "approval_id": "", "signal_id": "signal-1",
+                "canonical_order": dict(CANONICAL_ORDER),
+                "prepared_order": {
+                    "connector_id": "robinhood-trading",
+                    "account_id": "broker-account",
+                    "tool": "place_equity_order", "args": broker_args,
+                    "args_hash": args_hash(broker_args),
+                },
+            })
+        raise AssertionError(req.url.path)
+
+    class Hub:
+        account_key = "ag1"
+
+        def __init__(self):
+            self.calls = []
+
+        async def call(self, connector_id, tool, args, **kwargs):
+            self.calls.append((connector_id, tool, args, kwargs))
+            return {"approval_required": True, "approval_id": "approval-1",
+                    "status": "pending", "expires_at": 123.0, "is_write": True}
+
+    class Reporter:
+        async def snapshot_and_push(self, **kwargs):
+            return {"connectors": [{
+                "id": "robinhood-trading", "status": "ok", "accounts": [{
+                    "account_number": "broker-account", "status": "ok",
+                    "positions": [], "open_orders": [],
+                }],
+            }]}
+
+    state = _state(tmp_path)
+    _candidate_scope(state)
+    spec = _candidate_spec()
+    spec.guardrails.accounts.allow = ["broker-account"]
+    monkeypatch.setattr(runtime, "broker_specs", lambda _root: [spec])
+
+    async def evidence(_hub, _spec, account):
+        return {"status": "ok", "equity": 100_000.0, "day_pnl": -250.5}
+
+    monkeypatch.setattr(runtime, "balance_evidence", evidence)
+    client = PlatformClient("https://api.test", "t",
+                            transport=httpx.MockTransport(handler))
+    hub = Hub()
+    audit = EdgeAudit(state)
+    mcp = create_edge_mcp(state, hub, client, audit, Reporter(),
+                          Brake(state, hub, client, audit))
+
+    result = await mcp.call_tool("accept_candidate", {
+        "candidate_id": "candidate-1", "rationale": "matches a stated fact",
+        "memory_ids": ["mem-7"]})
+    doc = json.loads(result.content[0].text)
+
+    accept_call = next(body for path, body in calls if path.endswith("/accept"))
+    assert accept_call == {"rationale": "matches a stated fact",
+                           "memory_ids": ["mem-7"]}
+    assert doc["decision"] == "accepted"
+
+
+async def test_accept_candidate_refuses_more_than_ten_memory_ids_locally(tmp_path):
+    """Refused before any checkin or broker contact: an oversized list is a
+    local mistake, not a reason to touch the broker first.
+
+    Uses _ReadyReporter, not the no-op _Reporter, so a cap check that slipped
+    below the portfolio refresh would still show up here: `reporter.calls`
+    pins that snapshot_and_push itself was never reached, not just that the
+    two HTTP paths this fixture happens to stub came back empty."""
+    requests = []
+
+    def handler(req):
+        requests.append(req.url.path)
+        raise AssertionError("an oversized memory_ids list must never be acted on")
+
+    class Hub:
+        account_key = "ag1"
+        calls = []
+
+        async def call(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+
+    state = _state(tmp_path)
+    _candidate_scope(state)
+    client = PlatformClient("https://api.test", "t",
+                            transport=httpx.MockTransport(handler))
+    hub = Hub()
+    reporter = _ReadyReporter()
+    mcp = create_edge_mcp(state, hub, client, EdgeAudit(state), reporter,
+                          Brake(state, hub, client, EdgeAudit(state)))
+
+    result = await mcp.call_tool("accept_candidate", {
+        "candidate_id": "candidate-1", "rationale": "too many beliefs cited",
+        "memory_ids": [f"mem-{i}" for i in range(11)]})
+    doc = json.loads(result.content[0].text)
+
+    assert doc["is_error"] is True
+    assert "10" in doc["error"]
+    assert requests == []
+    assert hub.calls == []
+    assert reporter.calls == []
 
 
 async def test_accept_candidate_rejects_local_map_mismatch_without_connector_contact(
@@ -860,6 +975,113 @@ async def test_abstain_candidate_never_contacts_a_connector(tmp_path):
         "candidate_id": "candidate-1", "decision": "abstained"}
     assert requests == [("/api/agent/candidates/candidate-1/abstain",
                          {"rationale": "evidence conflicts"})]
+    assert hub.calls == []
+
+
+async def test_abstain_candidate_omits_memory_ids_when_empty(tmp_path):
+    """An edge talking to an older platform must send the same request it
+    always has: memory_ids absent from the wire body, not an empty list."""
+    requests = []
+
+    def handler(req):
+        requests.append((req.url.path, json.loads(req.content)))
+        return httpx.Response(200, json={"candidate_id": "candidate-1",
+                                         "decision": "abstained"})
+
+    class Hub:
+        account_key = "ag1"
+        calls = []
+
+        async def call(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+
+    state = _state(tmp_path)
+    _candidate_scope(state)
+    client = PlatformClient("https://api.test", "t",
+                            transport=httpx.MockTransport(handler))
+    hub = Hub()
+    mcp = create_edge_mcp(state, hub, client, EdgeAudit(state), _Reporter(),
+                          Brake(state, hub, client, EdgeAudit(state)))
+
+    result = await mcp.call_tool("abstain_candidate", {
+        "candidate_id": "candidate-1", "rationale": "no memory rows",
+        "memory_ids": []})
+
+    assert json.loads(result.content[0].text) == {
+        "candidate_id": "candidate-1", "decision": "abstained"}
+    assert requests == [("/api/agent/candidates/candidate-1/abstain",
+                         {"rationale": "no memory rows"})]
+    assert "memory_ids" not in requests[0][1]
+
+
+async def test_abstain_candidate_sends_a_populated_memory_ids_list(tmp_path):
+    requests = []
+
+    def handler(req):
+        requests.append((req.url.path, json.loads(req.content)))
+        return httpx.Response(200, json={"candidate_id": "candidate-1",
+                                         "decision": "abstained"})
+
+    class Hub:
+        account_key = "ag1"
+        calls = []
+
+        async def call(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+
+    state = _state(tmp_path)
+    _candidate_scope(state)
+    client = PlatformClient("https://api.test", "t",
+                            transport=httpx.MockTransport(handler))
+    hub = Hub()
+    mcp = create_edge_mcp(state, hub, client, EdgeAudit(state), _Reporter(),
+                          Brake(state, hub, client, EdgeAudit(state)))
+
+    result = await mcp.call_tool("abstain_candidate", {
+        "candidate_id": "candidate-1", "rationale": "conflicts with a stated fact",
+        "memory_ids": ["mem-1", "mem-2"]})
+
+    assert json.loads(result.content[0].text) == {
+        "candidate_id": "candidate-1", "decision": "abstained"}
+    assert requests == [("/api/agent/candidates/candidate-1/abstain",
+                         {"rationale": "conflicts with a stated fact",
+                          "memory_ids": ["mem-1", "mem-2"]})]
+    assert hub.calls == []
+
+
+async def test_abstain_candidate_refuses_more_than_ten_memory_ids_locally(tmp_path):
+    """The platform validates this list too, but the edge refuses an
+    oversized list itself rather than let the platform reject the whole
+    vote."""
+    requests = []
+
+    def handler(req):
+        requests.append(req.url.path)
+        raise AssertionError("an oversized memory_ids list must never reach the wire")
+
+    class Hub:
+        account_key = "ag1"
+        calls = []
+
+        async def call(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+
+    state = _state(tmp_path)
+    _candidate_scope(state)
+    client = PlatformClient("https://api.test", "t",
+                            transport=httpx.MockTransport(handler))
+    hub = Hub()
+    mcp = create_edge_mcp(state, hub, client, EdgeAudit(state), _Reporter(),
+                          Brake(state, hub, client, EdgeAudit(state)))
+
+    result = await mcp.call_tool("abstain_candidate", {
+        "candidate_id": "candidate-1", "rationale": "too many beliefs cited",
+        "memory_ids": [f"mem-{i}" for i in range(11)]})
+    doc = json.loads(result.content[0].text)
+
+    assert doc["is_error"] is True
+    assert "10" in doc["error"]
+    assert requests == []
     assert hub.calls == []
 
 
