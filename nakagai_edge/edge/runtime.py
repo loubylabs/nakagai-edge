@@ -1069,9 +1069,10 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
                 # can look like from here.
                 default = prop.get("default")
                 defaults[arg] = default
+            base_type = str if prop.get("type") == "string" else Any
             params.append(inspect.Parameter(
                 arg, inspect.Parameter.KEYWORD_ONLY, default=default,
-                annotation=Annotated[Any, WithJsonSchema(prop)]))
+                annotation=Annotated[base_type, WithJsonSchema(prop)]))
         # `-> str` like every tool above it, and for the same reason MCPServer
         # cares: the return annotation is what decides whether a result comes
         # back structured. A synthesized signature that omitted it would hand

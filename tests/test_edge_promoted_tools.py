@@ -78,11 +78,50 @@ _nested_platform = MCPServer("nested-platform-fake")
 _nested_calls: list[dict] = []
 
 
+class _AccountPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    starting_equity: float = Field(gt=0)
+    risk_pct: float = Field(gt=0)
+
+
+class _BenchmarkPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str
+    symbol: str | None
+
+
+_sweep_platform = MCPServer("sweep-platform-fake")
+_sweep_calls: list[dict] = []
+
+
 @_nested_platform.tool()
 def research_with_policy(execution: _ExecutionPolicy, note: str = "daily") -> str:
     """Exercise a generated root $defs schema through real MCP dispatch."""
     args = {"execution": execution.model_dump(), "note": note}
     _nested_calls.append(args)
+    return json.dumps(args)
+
+
+@_sweep_platform.tool()
+def run_sweep(target_play: str, specs_json: str, account: _AccountPolicy,
+              execution: _ExecutionPolicy, benchmark: _BenchmarkPolicy,
+              idempotency_key: str, holdout_months: int = 3, top_k: int = 5,
+              label: str = "") -> str:
+    """Exercise the sweep's string and typed-object boundary through MCP."""
+    args = {
+        "target_play": target_play,
+        "specs_json": specs_json,
+        "account": account.model_dump(),
+        "execution": execution.model_dump(),
+        "benchmark": benchmark.model_dump(),
+        "idempotency_key": idempotency_key,
+        "holdout_months": holdout_months,
+        "top_k": top_k,
+        "label": label,
+    }
+    _sweep_calls.append(args)
     return json.dumps(args)
 
 
@@ -340,6 +379,70 @@ async def test_a_promoted_call_reaches_the_platform_with_what_was_asked(edge):
     # `call_connector` would not have sent it either.
     assert platform_mcp.calls == [
         ("get_signals", {"include_suppressed": False, "since": "2026-08-01"})]
+
+
+@pytest.mark.parametrize("spec_json", [
+    '[{"version":2}]',
+    '{"version":2}',
+    "true",
+    "false",
+    "null",
+    "ordinary text",
+], ids=["array", "object", "true", "false", "null", "ordinary"])
+async def test_promoted_string_arguments_reach_the_platform_byte_for_byte(
+        edge, spec_json):
+    await edge.call("validate_rule_spec", spec_json=spec_json)
+
+    assert platform_mcp.calls == [("validate_rule_spec", {"spec_json": spec_json})]
+
+
+async def test_run_sweep_preserves_specs_json_with_typed_policies_and_defaults(
+        tmp_path):
+    _sweep_calls.clear()
+    specs_json = (
+        '[{"version":2,"name":"adx_pullback","timeframe":"1h",'
+        '"long":{"all":[{"lhs":{"ind":"adx","n":14},"op":">",'
+        '"rhs":25}]},"risk":{"stop":{"kind":"atr","n":14,'
+        '"mult":2.0},"target":{"kind":"rr","rr":2.0}}}]'
+    )
+    account = {"starting_equity": 100_000.0, "risk_pct": 0.01}
+    execution = {
+        "initial_equity": 100_000.0,
+        "fees": {"commission_bps": 1.5, "slippage_bps": 2.0},
+    }
+    benchmark = {"kind": "equal_weight_request_symbols", "symbol": None}
+    guardrails = {**SHIPPED_GUARDRAILS, "allow_writes": True}
+
+    async with _promoted_edge(
+            tmp_path, upstream=_sweep_platform, guardrails=guardrails) as edge:
+        before = len(edge.audit.pending())
+        doc = await edge.call(
+            "run_sweep",
+            target_play="adx_pullback",
+            specs_json=specs_json,
+            account=account,
+            execution=execution,
+            benchmark=benchmark,
+            idempotency_key="sweep-string-forwarding",
+        )
+        events = edge.audit.pending()[before:]
+
+    expected = {
+        "target_play": "adx_pullback",
+        "specs_json": specs_json,
+        "account": account,
+        "execution": execution,
+        "benchmark": benchmark,
+        "idempotency_key": "sweep-string-forwarding",
+        "holdout_months": 3,
+        "top_k": 5,
+        "label": "",
+    }
+    assert doc["is_error"] is False
+    assert doc["data"] == expected
+    assert _sweep_calls == [expected]
+    assert [event["kind"] for event in events] == ["call"]
+    assert events[0]["detail"]["capability"] == "promoted:run_sweep"
 
 
 async def test_a_promoted_call_goes_through_the_guardrail_door(edge):
