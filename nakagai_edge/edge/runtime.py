@@ -20,6 +20,7 @@ import httpx
 
 from nakagai_edge.capability import (CAPABILITIES, OUTBOUND_ORDER_FIELDS,
                                      CapabilityError, extract, resolve)
+from nakagai_edge.mcp_schema import SchemaInliningError, inline_local_refs
 from nakagai_edge.edge.audit import EdgeAudit
 from nakagai_edge.edge.brake import BRAKE_INTERVAL_S, Brake, normalize_quote
 from nakagai_edge.edge.candidate import (
@@ -1040,16 +1041,26 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         promoted with an argument silently missing; `call_connector` still
         reaches it.
         """
-        props = (schema or {}).get("properties")
+        normalized = inline_local_refs(schema or {})
+        supported_root = {"description", "properties", "required", "title", "type"}
+        if (set(normalized) - supported_root
+                or normalized.get("type", "object") != "object"):
+            return None
+        props = normalized.get("properties")
         if not isinstance(props, dict):
-            props = {}
-        required = set((schema or {}).get("required") or [])
+            return None
+        required_list = normalized.get("required") or []
+        if (not isinstance(required_list, list)
+                or not all(isinstance(arg, str) for arg in required_list)
+                or not set(required_list) <= set(props)):
+            return None
+        required = set(required_list)
         params, defaults = [], {}
         for arg, prop in props.items():
             if (not isinstance(arg, str) or not arg.isidentifier()
-                    or keyword.iskeyword(arg) or arg.startswith("_")):
+                    or keyword.iskeyword(arg) or arg.startswith("_")
+                    or not isinstance(prop, dict)):
                 return None
-            prop = prop if isinstance(prop, dict) else {}
             default = inspect.Parameter.empty
             if arg not in required:
                 # The platform's own default, so the published schema keeps
@@ -1083,11 +1094,18 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
                         and type(v) is type(defaults[k]))}
 
     def _register_forwarder(name: str, descriptor: dict) -> None:
-        built = _forward_signature(descriptor.get("inputSchema") or {})
+        try:
+            built = _forward_signature(descriptor.get("inputSchema") or {})
+        except (SchemaInliningError, TypeError) as error:
+            logging.getLogger("nakagai.edge").warning(
+                "platform tool %r not promoted: unsupported input schema (%s); "
+                "call_connector(%r, %r, ...) still reaches it",
+                name, str(error)[:200], PLATFORM_CONNECTOR, name)
+            return
         if built is None:
             logging.getLogger("nakagai.edge").warning(
-                "platform tool %r not promoted: its input schema names an "
-                "argument this cannot express as a parameter; "
+                "platform tool %r not promoted: its input schema has a root "
+                "constraint or argument name this cannot express as a parameter; "
                 "call_connector(%r, %r, ...) still reaches it",
                 name, PLATFORM_CONNECTOR, name)
             return
