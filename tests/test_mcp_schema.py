@@ -199,3 +199,69 @@ def test_acyclic_reference_expansion_is_bounded():
 
     with pytest.raises(ValueError, match="expansion limit"):
         _inline(schema)
+
+
+def test_wide_scalar_annotation_fanout_counts_every_expanded_entry():
+    defs: dict[str, dict] = {"Level0": {"type": "integer", "enum": list(range(5_000))}}
+    for level in range(1, 9):
+        prior = f"#/$defs/Level{level - 1}"
+        defs[f"Level{level}"] = {"anyOf": [{"$ref": prior}, {"$ref": prior}]}
+    schema = {
+        "$defs": defs,
+        "type": "object",
+        "properties": {"x": {"$ref": "#/$defs/Level8"}},
+    }
+
+    with pytest.raises(ValueError, match="expansion limit"):
+        _inline(schema)
+
+
+def test_repeated_wide_string_payload_is_bounded_during_fanout():
+    defs: dict[str, dict] = {"Level0": {"type": "string", "enum": ["x" * 5_000]}}
+    for level in range(1, 9):
+        prior = f"#/$defs/Level{level - 1}"
+        defs[f"Level{level}"] = {"anyOf": [{"$ref": prior}, {"$ref": prior}]}
+    schema = {
+        "$defs": defs,
+        "type": "object",
+        "properties": {"x": {"$ref": "#/$defs/Level8"}},
+    }
+
+    with pytest.raises(ValueError, match="payload limit"):
+        _inline(schema)
+
+
+@pytest.mark.parametrize(
+    ("kind", "message"),
+    [("missing", "missing"), ("non-schema", "not a schema"), ("cyclic", "cyclic")],
+)
+def test_reference_bearing_errors_truncate_long_local_names(kind, message):
+    name = "x" * 400
+    ref = f"#/$defs/{name}"
+    if kind == "missing":
+        defs = {}
+    elif kind == "non-schema":
+        defs = {name: "not a schema"}
+    else:
+        defs = {name: {"$ref": ref}}
+    schema = {
+        "$defs": defs,
+        "type": "object",
+        "properties": {"x": {"$ref": ref}},
+    }
+
+    with pytest.raises(ValueError) as caught:
+        _inline(schema)
+
+    assert message in str(caught.value)
+    assert len(str(caught.value)) <= 200
+
+
+def test_oversized_reference_fails_with_a_fixed_bounded_diagnostic():
+    ref = "#/$defs/" + "x" * 5_000
+    schema = {"type": "object", "properties": {"x": {"$ref": ref}}}
+
+    with pytest.raises(ValueError, match="reference length limit") as caught:
+        _inline(schema)
+
+    assert len(str(caught.value)) <= 200
