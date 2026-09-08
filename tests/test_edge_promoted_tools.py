@@ -17,6 +17,8 @@ from dataclasses import dataclass
 
 import httpx
 import pytest
+from mcp.server.mcpserver import MCPServer
+from pydantic import BaseModel, ConfigDict, Field
 
 pytest.importorskip("mcp")
 
@@ -56,6 +58,32 @@ PLATFORM_ENTRY = {
     "enabled": True,
     "guardrails": SHIPPED_GUARDRAILS,
 }
+
+
+class _FeePolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    commission_bps: float = Field(ge=0)
+    slippage_bps: float = Field(ge=0)
+
+
+class _ExecutionPolicy(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    initial_equity: float = Field(gt=0)
+    fees: _FeePolicy
+
+
+_nested_platform = MCPServer("nested-platform-fake")
+_nested_calls: list[dict] = []
+
+
+@_nested_platform.tool()
+def research_with_policy(execution: _ExecutionPolicy, note: str = "daily") -> str:
+    """Exercise a generated root $defs schema through real MCP dispatch."""
+    args = {"execution": execution.model_dump(), "note": note}
+    _nested_calls.append(args)
+    return json.dumps(args)
 
 
 @pytest.fixture
@@ -108,7 +136,8 @@ class _Edge:
 
 
 @contextlib.asynccontextmanager
-async def _promoted_edge(tmp_path, *, guardrails=SHIPPED_GUARDRAILS):
+async def _promoted_edge(tmp_path, *, guardrails=SHIPPED_GUARDRAILS,
+                         upstream=platform_mcp.mcp):
     """A real edge server with the platform's tools already promoted."""
     from tests.fixtures.inproc import connected_session
 
@@ -119,7 +148,7 @@ async def _promoted_edge(tmp_path, *, guardrails=SHIPPED_GUARDRAILS):
     async def connect(spec):
         if down["now"]:
             raise ConnectorError("no route to the platform")
-        return connected_session(platform_mcp.mcp)
+        return connected_session(upstream)
 
     hub = ConnectorHub(state.root, connect=connect,
                        approvals=RemoteApprovalQueue(client, state, "ag1"))
@@ -167,6 +196,115 @@ async def test_a_promoted_tool_publishes_the_platforms_own_argument_schema(edge)
     write = next(t for t in await edge.mcp.list_tools()
                  if t.name == "set_autoexecute_allowlist")
     assert write.input_schema["required"] == ["reason"]
+
+
+async def test_nested_generated_schema_is_self_contained_and_forwards_objects(tmp_path):
+    _nested_calls.clear()
+    execution = {
+        "initial_equity": 25_000.0,
+        "fees": {"commission_bps": 1.5, "slippage_bps": 2.0},
+    }
+
+    guardrails = {**SHIPPED_GUARDRAILS, "allow_writes": True}
+    async with _promoted_edge(
+            tmp_path, upstream=_nested_platform, guardrails=guardrails) as edge:
+        spec = next(
+            tool for tool in await edge.mcp.list_tools()
+            if tool.name == "research_with_policy"
+        )
+        assert "$defs" not in spec.input_schema
+        assert spec.input_schema["properties"]["execution"] == {
+            "additionalProperties": False,
+            "properties": {
+                "initial_equity": {
+                    "exclusiveMinimum": 0,
+                    "title": "Initial Equity",
+                    "type": "number",
+                },
+                "fees": {
+                    "additionalProperties": False,
+                    "properties": {
+                        "commission_bps": {
+                            "minimum": 0,
+                            "title": "Commission Bps",
+                            "type": "number",
+                        },
+                        "slippage_bps": {
+                            "minimum": 0,
+                            "title": "Slippage Bps",
+                            "type": "number",
+                        },
+                    },
+                    "required": ["commission_bps", "slippage_bps"],
+                    "title": "_FeePolicy",
+                    "type": "object",
+                },
+            },
+            "required": ["initial_equity", "fees"],
+            "title": "_ExecutionPolicy",
+            "type": "object",
+        }
+
+        doc = await edge.call("research_with_policy", execution=execution)
+
+    assert doc["is_error"] is False
+    assert doc["data"] == {"execution": execution, "note": "daily"}
+    assert _nested_calls == [{"execution": execution, "note": "daily"}]
+
+
+async def test_unsupported_root_schema_skips_one_tool_and_promotes_the_next(
+        tmp_path, caplog):
+    class _SchemaHub:
+        account_key = "ag1"
+
+        async def list_tools(self, connector_id):
+            assert connector_id == PLATFORM
+            return {"tools": [
+                {
+                    "name": "root_composed",
+                    "description": "Cannot be represented by a Python signature.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                        "allOf": [{"required": ["value"]}],
+                    },
+                },
+                {
+                    "name": "plain_after_bad",
+                    "description": "Must still be promoted.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"value": {"type": "string"}},
+                    },
+                },
+                {
+                    "name": "boolean_property_schema",
+                    "description": "Cannot become WithJsonSchema metadata.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"value": True},
+                    },
+                },
+            ]}
+
+    state = _state(tmp_path, SHIPPED_GUARDRAILS)
+    client = _dead_platform()
+    hub = _SchemaHub()
+    audit = EdgeAudit(state)
+    mcp = create_edge_mcp(
+        state, hub, client, audit, _Reporter(), Brake(state, hub, client, audit)
+    )
+
+    with caplog.at_level("WARNING", logger="nakagai.edge"):
+        await mcp.promote_platform_tools()
+
+    names = {tool.name for tool in await mcp.list_tools()}
+    assert "root_composed" not in names
+    assert "plain_after_bad" in names
+    assert "boolean_property_schema" not in names
+    assert "root_composed" in caplog.text
+    assert "boolean_property_schema" in caplog.text
+    assert "call_connector" in caplog.text
 
 
 async def test_collisions_resolve_to_the_local_tool(edge):
