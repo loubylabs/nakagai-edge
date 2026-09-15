@@ -1264,10 +1264,7 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
             "stacked_timeframes": ["15m"], "provenance": "live",
         },
         score=10.0,
-        score_breakdown={
-            "confluence": 1.0, "stacked": 1.0, "rr": 1.0,
-            "proven_pf": 1.0, "proven": True,
-        },
+        score_breakdown={"confluence": 1.0, "stacked": 1.0, "rr": 1.0},
         play_title="ICT",
         expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
     )

@@ -24,6 +24,6 @@ npm run dev
 
 Check `http://127.0.0.1:8321/api/health` and `http://127.0.0.1:3100/login`. Browser routes require a real Supabase session. Create a disposable `verify-<date>@nakag.ai` identity through the approved test project and remove it after verification. Never use production identities or founder workspace state.
 
-Verify the changed story through the UI and its matching API or MCP surface. For MCP, call `get_mandate` first. `run_backtest` and `sync_data` require explicit symbols. Bootstrap `get_signals` with `since="today"` on a new agent cursor.
+Verify the changed story through the UI and its matching API or MCP surface. For MCP, call `get_mandate` first. Bootstrap `get_signals` with `since="today"` on a new agent cursor.
 
 Run the focused automated tests after the walkthrough. Stop only the processes started for this run and remove the scratch directory when finished.

@@ -5,7 +5,9 @@ the only place a broker credential is ever written to disk. Your agent talks to
 exactly one MCP endpoint, the edge, and never sees a token. The platform never
 sees one either.
 
-Version 0.5.8 is the current release. Platform tool promotion preserves declared
+Version 0.5.9 is the current release. It drops the platform's retired backtest and
+data-sync tools from the bundled skills and the check-in docstring, since the
+platform no longer serves them. Platform tool promotion preserves declared
 string arguments byte-for-byte, including JSON-looking strings, and publishes
 nested object arguments as self-contained schemas. It expands bounded local schema
 references before building the forwarded signature, while an unsupported schema
@@ -71,7 +73,7 @@ call, the platform placed the trade. The fix is a custody split:
 `http://127.0.0.1:8330/mcp/`, and finds the whole surface there: the edge's own
 tools (the broker vocabulary, approvals, the brake, check-in and chat) beside
 the platform's own tools, which the edge promotes to first-class names when it
-starts. `get_signals`, `get_mandate`, `get_roster`, `run_backtest` and the rest
+starts. `get_signals`, `get_mandate`, `get_roster`, `run_screen` and the rest
 are called by name, not through a generic escape hatch.
 
 ## Quickstart

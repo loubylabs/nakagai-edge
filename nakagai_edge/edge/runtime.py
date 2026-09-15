@@ -716,7 +716,7 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
                             day_pnl: float | None = None) -> str:
         """Record a heartbeat for the owner's activity feed and get the current
         mandate back. Call once per session: `status` is one of
-        scanning|research|backtesting|idle|alert, `note` a one-line summary of
+        scanning|research|idle|alert, `note` a one-line summary of
         what you're doing or found. You are identified by your agent token -
         there is no name to pass.
 
