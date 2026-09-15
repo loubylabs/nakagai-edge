@@ -11,7 +11,7 @@ do not stop after writing client configuration. Pairing gets you an
 Two topologies:
 
 - **Direct**: you dial the platform's own MCP at `https://api.nakag.ai/mcp/`.
-  Right for signals, research, strategies, backtests. No broker access.
+  Right for signals, research, strategies, screens. No broker access.
 - **Through an edge**: you dial one localhost endpoint
   (`http://127.0.0.1:8330/mcp/`) served by a user-run `nakagai-edge`, which
   proxies the platform tools AND holds the broker credentials. Required for
