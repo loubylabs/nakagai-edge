@@ -5,9 +5,9 @@ the only place a broker credential is ever written to disk. Your agent talks to
 exactly one MCP endpoint, the edge, and never sees a token. The platform never
 sees one either.
 
-Version 0.5.9 is the current release. It drops the platform's retired backtest and
-data-sync tools from the bundled skills and the check-in docstring, since the
-platform no longer serves them. Platform tool promotion preserves declared
+Version 0.5.10 is the current release. Account refusals name only the refused
+account, and a broker whose account list is empty takes no write until its owner
+confirms one. Platform tool promotion preserves declared
 string arguments byte-for-byte, including JSON-looking strings, and publishes
 nested object arguments as self-contained schemas. It expands bounded local schema
 references before building the forwarded signature, while an unsupported schema
@@ -433,7 +433,7 @@ guardrails, approval queue, and audit record.
 **Three read-only classifications, each of which fails silently.** An
 unclassified tool counts as a write (`unknown_is_write`, fail closed), and
 `check_accounts` denies a write that names no account whenever account tiers
-exist. That pair is right for an agent and wrong for the edge acting on its own
+exist, and every write on a broker with no tiers at all. That pair is right for an agent and wrong for the edge acting on its own
 behalf, so any tool the edge dials for itself has to be classified read-only,
 either by the downstream server's own `readOnlyHint` or by the owner's
 `read_only_tools` glob:

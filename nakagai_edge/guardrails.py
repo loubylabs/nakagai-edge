@@ -91,9 +91,16 @@ def check_accounts(spec: ConnectorSpec, args: dict, is_write: bool = False,
     whose value is not a str/int scalar counts as not named: fail closed.
     `annotate_tools` probes tools with empty args, so it alone skips the
     presence rule via `enforce_account_presence`.
+
+    A broker with neither list configured takes no write: an account row the
+    owner has not confirmed yet permits no order. No refusal names an account
+    other than the one the call named.
     """
     accounts = spec.guardrails.accounts
     if not accounts.allow and not accounts.read:
+        if is_write and spec.role == "broker":
+            return (f"connector {spec.id!r} has no account confirmed for trading; "
+                    f"confirm one in Nakagai's Settings")
         return ""
     permitted = set(accounts.allow)
     if not is_write:
@@ -108,14 +115,12 @@ def check_accounts(spec: ConnectorSpec, args: dict, is_write: bool = False,
                 return (f"account {value!r} is read-only for connector "
                         f"{spec.id!r}: it may be viewed, never acted on")
             return (f"account {value!r} is not in the allowlist for "
-                    f"connector {spec.id!r} "
-                    f"(allowed: {', '.join(accounts.allow + accounts.read)})")
+                    f"connector {spec.id!r}")
     if (is_write and not named and enforce_account_presence
             and accounts.require_account_arg):
         return (f"write names no account for connector {spec.id!r}: accounts "
                 f"are tiered here, so a write must say which account it acts on "
-                f"instead of falling to the broker's default "
-                f"(allowed: {', '.join(accounts.allow)})")
+                f"instead of falling to the broker's default")
     return ""
 
 

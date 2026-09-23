@@ -645,8 +645,8 @@ async def test_a_read_does_not_infer_when_the_tiers_hold_two_accounts(tmp_path):
 
 
 async def test_with_no_tiers_the_account_comes_from_the_brokers_own_list(tmp_path):
-    """No tiers configured means the owner stated no preference, so a broker
-    holding exactly one account has answered the question itself."""
+    """No tiers configured means the owner confirmed no account, so for a read
+    a broker holding exactly one account has answered the question itself."""
     hub = MapHub(specs=_tiered([], []))
     doc = await _call(_server(_state(tmp_path), hub), "get_balance")
 

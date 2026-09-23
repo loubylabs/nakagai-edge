@@ -40,6 +40,9 @@ def configured_hub(tmp_path, queue: RecordingQueue) -> ConnectorHub:
         "guardrails": {
             "read_only_tools": ["echo"], "allow_writes": True,
             "approvals": {"require_for": ["place_*"]},
+            # A broker takes writes only for a confirmed account; these calls
+            # name none, so the account key requirement is off here.
+            "accounts": {"allow": ["1"], "require_account_arg": False},
         },
     }]}))
     return ConnectorHub(tmp_path, connect=connect_to(echo_server), approvals=queue)
