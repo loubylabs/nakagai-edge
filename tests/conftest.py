@@ -66,17 +66,3 @@ def pytest_sessionfinish(session, exitstatus):
         _runtime.cleanup()
     finally:
         _runtime = None
-
-
-@pytest.fixture
-def platform_database():
-    """A short-lived direct handle for test setup through durable stores."""
-    if _runtime is None:
-        raise RuntimeError("platform database requested without platform integration")
-    from nakagai_platform.api.db import Database
-
-    database = Database.from_env()
-    try:
-        yield database
-    finally:
-        database.close()

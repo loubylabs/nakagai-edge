@@ -85,7 +85,7 @@ class FileTokenStorage:
 
 
 def has_oauth_tokens(root: Path, connector_id: str) -> bool:
-    """Whether `nakagai connectors login <id>` has been run for this connector."""
+    """Whether `nakagai-edge login <id>` has been run for this connector."""
     path = token_path(root, connector_id)
     if not path.exists():
         return False
@@ -139,16 +139,12 @@ def no_tokens_message(spec: ConnectorSpec) -> str:
     """What to tell the operator when a connector has no OAuth tokens yet.
 
     Agents read this string and the web UI displays it, so it has to name a
-    command that will actually work. `connectors login` refuses a broker
-    outright: broker credentials live only on the edge (docs/internal/EDGE.md),
-    so for a broker that advice is a dead end. The role comes off the spec, the
-    same registry field `_connector_role` in cli.py reads.
+    command that will actually work. The edge login is the only connector
+    login there is: the platform has none, because OAuth tokens live only on
+    the edge.
     """
-    if spec.role == "broker":
-        command = f"uv run nakagai-edge login {spec.id}"
-    else:
-        command = f"uv run nakagai connectors login {spec.id}"
-    return f"connector {spec.id!r} has no OAuth tokens; run `{command}` first"
+    return (f"connector {spec.id!r} has no OAuth tokens; "
+            f"run `uv run nakagai-edge login {spec.id}` first")
 
 
 def build_http_client(spec: ConnectorSpec, root: Path):
