@@ -2,11 +2,12 @@
 
 Run on the operator's machine, once per connector:
 
-    uv run nakagai connectors login robinhood-trading
+    uv run nakagai-edge login robinhood-trading
 
 Opens the provider's consent page, catches the redirect on a throwaway
-localhost listener, and writes tokens to `secrets/tokens/<id>.json`. The API
-server afterwards refreshes those tokens on its own; it never needs a browser.
+localhost listener, and writes tokens to `secrets/tokens/<id>.json` under the
+edge root. The edge afterwards refreshes those tokens on its own; it never
+needs a browser.
 """
 
 import asyncio

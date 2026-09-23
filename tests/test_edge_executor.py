@@ -1,6 +1,7 @@
 """The edge's write path: intent → platform grant → artifact verification →
 execute → report. Tampered artifacts and stale grants must never execute."""
 
+import copy
 import json
 import time
 
@@ -1191,11 +1192,12 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
         "quantity": 10, "limit_price": 118.40, "stop_price": 116.10,
         "time_in_force": "gtc", "account": "463605220",
     }
-    connector = {
-        **ROBINHOOD_CONNECTOR,
-        "id": "broker",
-        "url": "https://example.test/mcp",
-    }
+    # The house row is a template: it carries no accounts. The owner's account
+    # rulebook (below) names the one account the agent may trade.
+    template = copy.deepcopy(ROBINHOOD_CONNECTOR)
+    template.update(id="broker", url="https://example.test/mcp")
+    for tier in ("allow", "read"):
+        template["guardrails"]["accounts"].pop(tier, None)
 
     # ---- platform: copilot mandate, a seeded signal, the signing key ----
     plat = tmp_path / "platform"
@@ -1231,7 +1233,14 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
 
     # Connector and signal setup share the same durable database the running
     # platform reads. A file registry is no longer an input to PlatformHub.
-    ConnectorStore(mandate_db).add(connector)
+    connectors = ConnectorStore(mandate_db)
+    connectors.add(template)
+    wid = str(mandate_ctx.wid)
+    connectors.adopt(wid, "broker")
+    connectors.confirm(wid, "broker", allow=["463605220"], read=[], ttl_s=900)
+    # The merged document (template plus rulebook) is what the edge runs.
+    [connector] = connectors.account_rows(wid)
+    assert connector["guardrails"]["accounts"]["allow"] == ["463605220"]
     SignalStore(mandate_db).append([{
         "id": signal_id, "bar_ts": "2026-07-13T14:55:00+00:00",
         "detected_ts": "2026-07-13T14:55:00+00:00", "symbol": "NVDA",
@@ -1273,7 +1282,7 @@ async def test_full_edge_loop_closes_on_the_owners_tap(tmp_path, monkeypatch):
         candidate["id"], agent_id=agent_id,
         rationale="The bounded setup is valid.",
     )
-    connector_spec = ConnectorStore(mandate_db).specs()["broker"]
+    connector_spec = connectors.account_spec(wid, "broker")
     tool, broker_args = resolve(
         "place_order", connector_spec.capabilities["place_order"],
         canonical_order,

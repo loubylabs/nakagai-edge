@@ -6,10 +6,7 @@ import time
 import pytest
 import yaml
 
-pytest.importorskip("nakagai_platform")
-
-from nakagai_platform.cli import main as platform_main  # noqa: E402
-from nakagai_edge.cli import main as edge_main  # noqa: E402
+from nakagai_edge.cli import main as edge_main
 
 
 @pytest.fixture
@@ -441,141 +438,6 @@ def test_setup_default_mode_honors_an_explicit_port(edge_root, monkeypatch, caps
     assert calls == [(edge_root, 9999)]
 
 
-# --- connectors login: roots correctly, refuses brokers ---------------------
-
-def _add_signal_connector(database):
-    from nakagai_platform.api.connectors import ConnectorStore
-
-    ConnectorStore(database).add({
-        "id": "yfinance-signals",
-        "kind": "mcp-http",
-        "role": "signals",
-        "url": "https://signals.test/mcp",
-        "enabled": True,
-    })
-
-
-def test_connectors_login_roots_at_settings_not_cwd(
-        tmp_path, monkeypatch, capsys, platform_database):
-    seen = {}
-    workspace = tmp_path / "workspace"
-    _add_signal_connector(platform_database)
-
-    async def fake_login(root, connector_id):
-        seen["root"] = root
-        return {"ok": True, "connector": connector_id, "tool_count": 1}
-
-    monkeypatch.setattr("nakagai_edge.oauth_login.login", fake_login)
-    monkeypatch.setenv("NAKAGAI_ROOT", str(workspace))
-    monkeypatch.setenv("NAKAGAI_EDGE_ROOT", str(tmp_path / "edge"))
-
-    rc = platform_main(["connectors", "login", "yfinance-signals"])
-    assert rc == 0
-    assert seen["root"] == workspace
-
-
-def test_connectors_login_refuses_a_broker_connector(
-        tmp_path, monkeypatch, capsys, platform_database):
-    """The load-bearing assertion: broker credentials never touch the
-    platform, whether or not this machine happens to have a paired edge.
-
-    `fake_login` records instead of raising: `_gateway_run` catches every
-    exception and turns it into rc=1, so a raising fake would pass this test
-    even if the guard were deleted. The `calls == []` assertion is the one
-    that actually enforces "never invoked".
-    """
-    workspace = tmp_path / "workspace"
-    monkeypatch.setenv("NAKAGAI_ROOT", str(workspace))
-    monkeypatch.setenv("NAKAGAI_EDGE_ROOT", str(tmp_path / "edge"))
-
-    calls = []
-
-    async def fake_login(root, connector_id):
-        calls.append((root, connector_id))
-        return {"ok": True, "connector": connector_id, "tool_count": 1}
-
-    monkeypatch.setattr("nakagai_edge.oauth_login.login", fake_login)
-
-    rc = platform_main(["connectors", "login", "robinhood-trading"])
-    out = capsys.readouterr().out
-    assert rc == 1
-    assert "nakagai-edge login robinhood-trading" in out
-    assert calls == []
-
-
-def test_connectors_login_refuses_a_broker_even_when_edge_is_paired(
-        tmp_path, monkeypatch, capsys, platform_database):
-    """The refusal must not depend on whether an edge is paired: a broker
-    login on the platform is wrong either way."""
-    from nakagai_edge.edge.state import EdgeState
-
-    workspace = tmp_path / "workspace"
-    edge = tmp_path / "edge"
-    EdgeState(edge).save_agent("http://platform.test", "ag1", "nk_agent_x")
-    monkeypatch.setenv("NAKAGAI_ROOT", str(workspace))
-    monkeypatch.setenv("NAKAGAI_EDGE_ROOT", str(edge))
-
-    calls = []
-
-    async def fake_login(root, connector_id):
-        calls.append((root, connector_id))
-        return {"ok": True, "connector": connector_id, "tool_count": 1}
-
-    monkeypatch.setattr("nakagai_edge.oauth_login.login", fake_login)
-
-    rc = platform_main(["connectors", "login", "robinhood-trading"])
-    out = capsys.readouterr().out
-    assert rc == 1
-    assert "nakagai-edge login robinhood-trading" in out
-    assert calls == []
-
-
-def test_connectors_login_refuses_an_unknown_connector_id(
-        tmp_path, monkeypatch, capsys, platform_database):
-    """An id the registry does not list might be a broker we cannot see, so
-    it must refuse rather than fall through to a platform login."""
-    workspace = tmp_path / "workspace"
-    monkeypatch.setenv("NAKAGAI_ROOT", str(workspace))
-    monkeypatch.setenv("NAKAGAI_EDGE_ROOT", str(tmp_path / "edge"))
-
-    calls = []
-
-    async def fake_login(root, connector_id):
-        calls.append((root, connector_id))
-        return {"ok": True, "connector": connector_id, "tool_count": 1}
-
-    monkeypatch.setattr("nakagai_edge.oauth_login.login", fake_login)
-
-    rc = platform_main(["connectors", "login", "not-a-real-connector"])
-    assert rc == 1
-    assert calls == []
-
-
-def test_connectors_login_refuses_when_the_registry_cannot_be_read(
-        tmp_path, monkeypatch, capsys, platform_database):
-    """A registry that fails to parse must refuse too, same fail-closed
-    posture as an unknown id: we cannot confirm the role isn't broker."""
-    workspace = tmp_path / "workspace"
-    monkeypatch.setenv("NAKAGAI_ROOT", str(workspace))
-    monkeypatch.setenv("NAKAGAI_EDGE_ROOT", str(tmp_path / "edge"))
-
-    calls = []
-
-    async def fake_login(root, connector_id):
-        calls.append((root, connector_id))
-        return {"ok": True, "connector": connector_id, "tool_count": 1}
-
-    monkeypatch.setattr("nakagai_edge.oauth_login.login", fake_login)
-    monkeypatch.setattr(
-        "nakagai_platform.api.connectors.ConnectorStore.list",
-        lambda self: (_ for _ in ()).throw(RuntimeError("registry unavailable")),
-    )
-
-    rc = platform_main(["connectors", "login", "robinhood-trading"])
-    assert rc == 1
-    assert calls == []
-
-
 # --- the "no tokens" error names the login that will actually work ----------
 
 def _oauth_spec(connector_id, role):
@@ -585,28 +447,18 @@ def _oauth_spec(connector_id, role):
                          auth={"mode": "oauth"})
 
 
-def test_no_tokens_message_for_a_broker_points_at_the_edge_login(tmp_path):
-    """This string surfaces to agents and is displayed in the web UI. Sending
-    the user to `connectors login` for a broker is a dead end: that command
-    hard-refuses brokers, because broker credentials live only on the edge."""
+@pytest.mark.parametrize("connector_id, role",
+                         [("robinhood-trading", "broker"), ("notion-docs", "data")])
+def test_no_tokens_message_points_at_the_edge_login(tmp_path, connector_id, role):
+    """This string surfaces to agents and is displayed in the web UI, so it
+    must name a command that exists. The edge login is the only one: the
+    platform has no connector login, so OAuth tokens (a broker's above all)
+    are only ever written on the edge, never on the platform."""
     from nakagai_edge.auth import build_http_client
 
     with pytest.raises(ValueError) as e:
-        build_http_client(_oauth_spec("robinhood-trading", "broker"), tmp_path)
+        build_http_client(_oauth_spec(connector_id, role), tmp_path)
 
     msg = str(e.value)
-    assert "nakagai-edge login robinhood-trading" in msg
+    assert f"nakagai-edge login {connector_id}" in msg
     assert "connectors login" not in msg
-
-
-def test_no_tokens_message_for_a_non_broker_keeps_the_connectors_login(tmp_path):
-    """For everything that is not a broker, `connectors login` is still the
-    right command, and still the one that works."""
-    from nakagai_edge.auth import build_http_client
-
-    with pytest.raises(ValueError) as e:
-        build_http_client(_oauth_spec("notion-docs", "data"), tmp_path)
-
-    msg = str(e.value)
-    assert "nakagai connectors login notion-docs" in msg
-    assert "edge login" not in msg
