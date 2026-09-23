@@ -359,9 +359,11 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
           not consulted: those accounts may be viewed, never acted on.
         * A READ infers from `allow` and `read` together, again only when the
           two hold exactly one account between them.
-        * With NO tiers configured at all, the owner has stated no preference,
+        * With NO tiers configured at all, the owner has confirmed no account,
           so a broker holding exactly one account has answered the question
-          itself and that account is used.
+          itself and that account is used. That fills a read; a write still
+          meets `check_accounts`, which refuses every write on a broker with
+          no confirmed account.
 
         The broker's own list is never consulted while tiers exist, in either
         direction. Tiers are the owner's statement of authority and a broker's

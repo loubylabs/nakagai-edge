@@ -80,9 +80,10 @@ class AccountFilter(BaseModel):
 
     Two tiers. `allow` is full access: reads and writes alike. `read` is the
     display tier: a read-classified call may name the account, a write never
-    may. Numbers, not actions. Both empty means no account restriction.
+    may. Numbers, not actions. Both empty leaves reads unrestricted, and a
+    `role: broker` connector then takes no write: no account is confirmed.
     """
-    allow: list[str] = Field(default_factory=list)  # [] = no account restriction
+    allow: list[str] = Field(default_factory=list)  # full-access tier
     read: list[str] = Field(default_factory=list)   # read-only tier
     require_account_arg: bool = True  # a write must NAME an account when tiers exist
     arg_names: list[str] = Field(

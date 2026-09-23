@@ -1094,7 +1094,8 @@ async def test_edge_enqueue_still_works_with_a_cited_signal_id(tmp_path):
         "url": "https://echo.test/mcp", "enabled": True,
         "guardrails": {"read_only_tools": ["get_*", "echo", "search"],
                        "allow_writes": True,
-                       "approvals": {"require_for": ["place_*"]}},
+                       "approvals": {"require_for": ["place_*"]},
+                       "accounts": {"allow": ["1"]}},
     }]}))
 
     hub = ConnectorHub(state.root, connect=connect_to(echo_server), approvals=queue)
