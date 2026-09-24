@@ -5,8 +5,10 @@ the only place a broker credential is ever written to disk. Your agent talks to
 exactly one MCP endpoint, the edge, and never sees a token. The platform never
 sees one either.
 
-Version 0.5.11 is the current release. Its platform-integration tests follow
-account-owned broker rulebooks and the retired platform login. Account refusals name only the refused
+Version 0.5.12 is the current release. Its platform-integration tests follow
+account-owned broker rulebooks and the retired platform login, and open the
+platform's withheld autopilot rung to prove an edge check-in clears the arm
+precheck. Account refusals name only the refused
 account, and a broker whose account list is empty takes no write until its owner
 confirms one. Platform tool promotion preserves declared
 string arguments byte-for-byte, including JSON-looking strings, and publishes

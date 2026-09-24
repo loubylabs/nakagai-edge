@@ -172,7 +172,7 @@ async def test_edge_checkin_discards_half_an_equity_report(
 
 
 async def test_edge_agent_can_arm_autopilot_after_checking_in_with_equity(
-        tmp_path, platform_root, platform_app):
+        tmp_path, platform_root, platform_app, monkeypatch):
     """The acceptance test for the whole branch. With the loss dial at its
     3.0 default and no equity ever reported, arming autopilot 422s: the breaker
     would be on and unenforceable. Once an EDGE agent relays equity through
@@ -181,9 +181,16 @@ async def test_edge_agent_can_arm_autopilot_after_checking_in_with_equity(
     fix, an edge owner had no way to ever clear the 422 short of zeroing the
     dial - precisely the failure this branch exists to eliminate.
     """
+    from nakagai_platform import mandate
     from nakagai_platform.api.db import Database
     from nakagai_platform.api.tenancy import resolve_workspace
     from nakagai_platform.mandate_store import MandateStore
+
+    # The platform withholds autopilot from every account while it is scoped
+    # to owners who run their own agent, which is the topology this test
+    # drives. Open the rung for the run; `raising=False` keeps the test valid
+    # against a platform that predates the withholding.
+    monkeypatch.setattr(mandate, "UNAVAILABLE_PRESETS", frozenset(), raising=False)
 
     owner = TestClient(platform_app)
     # An identity, because arming is a per-account act and the platform now
