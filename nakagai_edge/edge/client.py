@@ -15,6 +15,8 @@ CHAT_PROTOCOL_HEADER = "X-Nakagai-Chat-Protocol"
 CANDIDATE_PROTOCOL_VERSION = "1"
 CANDIDATE_PROTOCOL_HEADER = "X-Nakagai-Candidate-Protocol"
 CANDIDATE_WAKE_HEADER = "X-Nakagai-Candidate-Wake"
+PROPOSAL_PROTOCOL_VERSION = "1"
+PROPOSAL_PROTOCOL_HEADER = "X-Nakagai-Proposal-Protocol"
 
 
 class EdgeClientError(Exception):
@@ -147,6 +149,19 @@ class PlatformClient:
         return self._check(self._client.post("/api/agent/approvals", json={
             "connector_id": connector_id, "tool": tool, "args": args,
             "signal_id": signal_id, "candidate_id": candidate_id}))
+
+    def granted_proposals(self) -> list[dict]:
+        # Owner-granted orders an outside agent proposed, for THIS edge to
+        # adopt. The header is the protocol evidence: the platform accepts a
+        # proposal only while an edge has recently said it can carry one out.
+        headers = {**self._chat_headers(),
+                   PROPOSAL_PROTOCOL_HEADER: PROPOSAL_PROTOCOL_VERSION}
+        body = self._check(self._client.get(
+            "/api/agent/proposals/granted", headers=headers))
+        items = body.get("proposals") if isinstance(body, dict) else None
+        if not isinstance(items, list):
+            raise EdgeClientError("granted proposals response is malformed")
+        return items
 
     def get_approval(self, approval_id: str) -> dict:
         return self._check(self._client.get(f"/api/agent/approvals/{approval_id}"))

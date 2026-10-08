@@ -18,6 +18,7 @@ from nakagai_edge.edge.candidate import (
     flush_candidate_outcomes,
 )
 from nakagai_edge.edge.portfolio import position_rows
+from nakagai_edge.edge.proposals import adopt_granted_proposals
 from nakagai_edge.edge.remote import (
     acknowledge_execution_report,
     drop_intent,
@@ -71,6 +72,8 @@ def _verify(
         (artifact.get("args_hash") == intent["args_hash"], "args_hash mismatch"),
         (artifact.get("candidate_id", "") == intent.get("candidate_id", ""),
          "candidate_id mismatch"),
+        (artifact.get("proposal_id", "") == intent.get("proposal_id", ""),
+         "proposal_id mismatch"),
         (not intent.get("account")
          or artifact.get("account") == intent["account"], "account mismatch"),
         (float(artifact.get("expires_at", 0)) > time.time(), "artifact expired"),
@@ -424,6 +427,12 @@ def _candidate_outcome(state: EdgeState, client: PlatformClient,
     )
 
 
+def _frozen(intent: dict) -> bool:
+    """A candidate or proposal intent: an order frozen before the owner's
+    grant, which stays durable under its exact broker id until a fill."""
+    return bool(intent.get("candidate_id") or intent.get("proposal_id"))
+
+
 def _alert_candidate(client: PlatformClient, reason: str) -> None:
     try:
         client.agent_checkin("alert", reason)
@@ -433,7 +442,7 @@ def _alert_candidate(client: PlatformClient, reason: str) -> None:
 
 def _execution_report(result, order_id: str, *, missing_order_id: bool) -> dict:
     reason = (
-        "candidate broker result has no declared order id; "
+        "frozen order broker result has no declared order id; "
         "fill attribution is impossible"
         if missing_order_id else ""
     )
@@ -488,12 +497,16 @@ async def poll_once(hub, state: EdgeState, client: PlatformClient,
         if _deliver_pending_execution_report(
                 state, client, audit, approval_id, intent):
             resolved += 1
-            if (not intent.get("candidate_id")
+            if (not _frozen(intent)
                     and not str(intent.get("broker_order_id") or "")):
                 drop_intent(state, approval_id)
     try:
         flush_candidate_outcomes(state, client)
     except Exception:  # noqa: BLE001 (one corrupt report cannot stop the executor)
+        pass
+    try:
+        adopt_granted_proposals(state, client, audit)
+    except Exception:  # noqa: BLE001 (nothing adopted; the next pass retries)
         pass
     for approval_id, intent in list(intents(state).items()):
         if isinstance(intent, dict) and intent.get("phase") == "submitted":
@@ -584,6 +597,26 @@ async def poll_once(hub, state: EdgeState, client: PlatformClient,
                 resolved += 1
                 continue
 
+        if intent.get("proposal_id"):
+            # Adoption checked the brake, but a pass that could not read the
+            # approval leaves the intent for a later one; check it again here.
+            from nakagai_edge.edge.brake import armed
+            if not armed(state):
+                error = "local brake is disarmed; proposal grant refused"
+                try:
+                    audit.record("denial", intent["connector_id"], intent["tool"],
+                                 {"approval_id": approval_id, "error": error,
+                                  "proposal_id": intent["proposal_id"]})
+                except Exception:  # noqa: BLE001 (journal is best-effort here)
+                    pass
+                try:
+                    client.report_execution(approval_id, ok=False, error=error)
+                except Exception:  # noqa: BLE001 (the broker was never contacted)
+                    pass
+                drop_intent(state, approval_id)
+                resolved += 1
+                continue
+
         try:
             result = await hub.call(intent["connector_id"], intent["tool"],
                                     intent["args"], account_key=hub.account_key,
@@ -615,12 +648,13 @@ async def poll_once(hub, state: EdgeState, client: PlatformClient,
                     approval_id=approval_id, urgent=unknown,
                     outcome_unknown=unknown)
         else:
-            # Broker acceptance is a submitted order, not a fill. Candidate
-            # entries stay durable under their exact broker id until the fill
-            # journal sees that same order in a declared filled state.
+            # Broker acceptance is a submitted order, not a fill. Candidate and
+            # proposal entries stay durable under their exact broker id until
+            # the fill journal sees that same order in a declared filled state.
             candidate_id = str(intent.get("candidate_id") or "")
+            frozen = _frozen(intent)
             order_id = placed_order_id(hub, intent, result)
-            missing_order_id = bool(candidate_id and not order_id)
+            missing_order_id = bool(frozen and not order_id)
             execution_report = _execution_report(
                 result, order_id, missing_order_id=missing_order_id)
             try:
@@ -636,6 +670,7 @@ async def poll_once(hub, state: EdgeState, client: PlatformClient,
                     disarm_candidate_entries(
                         state, candidate_id=candidate_id,
                         approval_id=approval_id, reason=reason)
+                if frozen:
                     _alert_candidate(client, reason)
                 try:
                     audit.record(
@@ -648,13 +683,14 @@ async def poll_once(hub, state: EdgeState, client: PlatformClient,
                 submitted = intents(state).get(approval_id) or {}
                 if missing_order_id:
                     reason = execution_report["error"]
-                    disarm_candidate_entries(
-                        state, candidate_id=candidate_id,
-                        approval_id=approval_id, reason=reason)
+                    if candidate_id:
+                        disarm_candidate_entries(
+                            state, candidate_id=candidate_id,
+                            approval_id=approval_id, reason=reason)
                     _alert_candidate(client, reason)
                 acknowledged = _deliver_pending_execution_report(
                     state, client, audit, approval_id, submitted)
-                if acknowledged and not candidate_id and not order_id:
+                if acknowledged and not frozen and not order_id:
                     drop_intent(state, approval_id)
         current = intents(state).get(approval_id)
         if not isinstance(current, dict) or current.get("phase") != "submitted":
