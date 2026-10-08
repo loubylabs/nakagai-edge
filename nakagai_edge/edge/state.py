@@ -10,8 +10,9 @@
     cache/candidate-wake.json    bounded listener-owned candidate write scope
     cache/candidate-outcomes.json    mechanical outcomes awaiting platform ack
     cache/candidate-entries-off.json    persistent local entry disarm
-    cache/proposals-adopted.json    approvals adopted from granted proposals,
-                        so one grant becomes at most one local intent
+    cache/proposals-adopted.json    approval and proposal ids adopted from
+                        granted proposals, so one proposal becomes at most one
+                        local intent
     results/audit.jsonl local audit journal, shipped in batches
     edge.pid            the serving daemon: pid, port, start, version.
                         pid 0 once it has stopped: the claim is released,

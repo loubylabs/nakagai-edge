@@ -6,13 +6,16 @@ re-resolves the canonical order through its OWN place_order map, and requires
 its own sole order-capable broker and account, before it writes the intent the
 unchanged executor then verifies again and executes.
 
-Protocol 1 carries one order shape: a buy limit with a protective stop below
-the limit. Anything else is refused here even when the signature is good.
+Protocol 1 carries one order shape: a good-till-cancelled buy limit with a
+protective stop below the limit. Anything else is refused here even when the
+signature is good.
 
-One grant becomes at most one local intent, ever. The executor drops an intent
-once it has reported, and a report the platform never received leaves that
-approval listed as granted; a durable ledger of adopted approval ids is what
-stops the next pass from adopting, and so submitting, the same order twice."""
+One proposal becomes at most one local intent, ever. The executor drops an
+intent once it has reported, and a report the platform never received leaves
+that approval listed as granted; a second grant could also name a proposal
+already adopted. A durable ledger of every adopted approval id and proposal id
+is what stops either from submitting the same order twice. It is never pruned:
+an entry is one owner-approved order, and forgetting one reopens that door."""
 
 import json
 import logging
@@ -30,10 +33,10 @@ log = logging.getLogger("nakagai.edge")
 _ITEM = {"approval_id", "proposal_id", "connector_id", "tool", "args",
          "args_hash", "canonical_order", "account", "expires_at", "artifact"}
 
-# An adopted id is kept until its artifact has been expired this long. An
-# expired artifact can never pass verification, so forgetting it after that
-# cannot let it execute.
-_LEDGER_RETAIN_S = 86_400
+# An unreadable ledger blocks every pickup until the owner repairs it; say so
+# at most this often, not on every 5 s executor pass.
+_LEDGER_ALERT_INTERVAL_S = 3600
+_ledger_alerted: dict[str, float] = {}
 
 
 class _LedgerUnreadable(Exception):
@@ -41,7 +44,7 @@ class _LedgerUnreadable(Exception):
 
 
 def _adopted(state: EdgeState) -> dict:
-    """approval_id -> artifact expiry. Unreadable means adopt nothing."""
+    """approval_id -> {proposal_id, expires_at}. Unreadable means adopt nothing."""
     path = state.proposals_adopted_path
     if not path.exists():
         return {}
@@ -49,9 +52,26 @@ def _adopted(state: EdgeState) -> dict:
         doc = json.loads(path.read_text())
     except (json.JSONDecodeError, OSError) as error:
         raise _LedgerUnreadable(str(error)) from error
-    if not isinstance(doc, dict):
-        raise _LedgerUnreadable("ledger is not an object")
+    if not isinstance(doc, dict) or not all(
+            isinstance(entry, dict) and isinstance(entry.get("proposal_id"), str)
+            and entry["proposal_id"] for entry in doc.values()):
+        raise _LedgerUnreadable("ledger is not an object of adopted proposals")
     return doc
+
+
+def _alert_unreadable_ledger(state: EdgeState, client, error: str) -> None:
+    reason = ("proposal ledger is unreadable, so no granted proposal is "
+              f"adopted until it is repaired: {error}")
+    log.warning("%s", reason)
+    key = str(state.root)
+    now = time.time()
+    if now - _ledger_alerted.get(key, float("-inf")) < _LEDGER_ALERT_INTERVAL_S:
+        return
+    try:
+        client.agent_checkin("alert", reason)
+    except Exception:  # noqa: BLE001 (the next pass alerts again)
+        return
+    _ledger_alerted[key] = now
 
 
 def _expiry(art: dict) -> float | None:
@@ -82,8 +102,9 @@ def _refusal(state: EdgeState, item: dict, sole) -> str:
     canonical = item["canonical_order"]
     if not isinstance(canonical, dict) or set(canonical) != set(OUTBOUND_ORDER_FIELDS):
         return "canonical_order is not the exact outbound shape"
-    if canonical.get("side") != "buy" or canonical.get("order_type") != "limit":
-        return "proposal protocol 1 carries only a buy limit order"
+    if (canonical.get("side") != "buy" or canonical.get("order_type") != "limit"
+            or canonical.get("time_in_force") != "gtc"):
+        return "proposal protocol 1 carries only a good-till-cancelled buy limit"
     limit, stop = canonical.get("limit_price"), canonical.get("stop_price")
     if not (_is_price(limit) and _is_price(stop) and stop < limit):
         return "a proposed buy limit needs a protective stop below the limit"
@@ -115,7 +136,7 @@ def _refusal(state: EdgeState, item: dict, sole) -> str:
     return next((why for ok, why in checks if not ok), "")
 
 
-def adopt_granted_proposals(hub, state: EdgeState, client, audit) -> int:
+def adopt_granted_proposals(state: EdgeState, client, audit) -> int:
     """Turn new owner-granted proposals into local intents. Returns how many."""
     from nakagai_edge.edge.brake import armed
     from nakagai_edge.edge.runtime import _candidate_broker_account
@@ -125,8 +146,7 @@ def adopt_granted_proposals(hub, state: EdgeState, client, audit) -> int:
     try:
         adopted = _adopted(state)
     except _LedgerUnreadable as error:
-        log.warning("proposal ledger is unreadable, so no proposal is adopted: %s",
-                    error)
+        _alert_unreadable_ledger(state, client, str(error))
         return 0
     items = client.granted_proposals()
     held = intents(state)
@@ -142,7 +162,10 @@ def adopt_granted_proposals(hub, state: EdgeState, client, audit) -> int:
                 or approval_id in held or approval_id in adopted):
             continue
         why = _refusal(state, item, sole) or (
-            "" if armed(state) else "local brake is disarmed")
+            "proposal was already adopted under another approval"
+            if any(entry["proposal_id"] == item["proposal_id"]
+                   for entry in adopted.values())
+            else "" if armed(state) else "local brake is disarmed")
         if why:
             try:
                 audit.record("denial", str(item.get("connector_id", "")),
@@ -159,10 +182,8 @@ def adopt_granted_proposals(hub, state: EdgeState, client, audit) -> int:
         # The ledger is written first: a crash between the two writes leaves a
         # grant that never executes, which the platform expires, rather than
         # one that could be adopted twice.
-        adopted = {aid: exp for aid, exp in adopted.items()
-                   if not isinstance(exp, (int, float))
-                   or exp + _LEDGER_RETAIN_S > now}
-        adopted[approval_id] = _expiry(item["artifact"])
+        adopted[approval_id] = {"proposal_id": item["proposal_id"],
+                                "expires_at": _expiry(item["artifact"])}
         state._write_private(state.proposals_adopted_path, adopted)
         held[approval_id] = {
             "connector_id": item["connector_id"], "tool": item["tool"],

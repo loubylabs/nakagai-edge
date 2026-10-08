@@ -505,7 +505,7 @@ async def poll_once(hub, state: EdgeState, client: PlatformClient,
     except Exception:  # noqa: BLE001 (one corrupt report cannot stop the executor)
         pass
     try:
-        adopt_granted_proposals(hub, state, client, audit)
+        adopt_granted_proposals(state, client, audit)
     except Exception:  # noqa: BLE001 (nothing adopted; the next pass retries)
         pass
     for approval_id, intent in list(intents(state).items()):

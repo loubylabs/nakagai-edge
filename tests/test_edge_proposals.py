@@ -89,6 +89,7 @@ class Platform:
         self.reports: list[tuple[str, dict]] = []
         self.pickups: list[httpx.Request] = []
         self.report_status = 200
+        self.checkins: list[dict] = []
 
     def handler(self, req):
         path = req.url.path
@@ -108,6 +109,7 @@ class Platform:
                 "artifact": item["artifact"], "expires_at": item["expires_at"],
                 "signal_id": ""})
         if path == "/api/agent/checkin":
+            self.checkins.append(json.loads(req.content))
             return httpx.Response(200, json={"ok": True})
         return httpx.Response(404, json={"detail": "?"})
 
@@ -164,7 +166,7 @@ def test_payload_always_carries_proposal_id():
 def test_adopt_writes_intent_for_a_valid_grant(tmp_path):
     state, client, platform, audit = _setup(tmp_path, [_item()])
 
-    assert adopt_granted_proposals(Hub(), state, client, audit) == 1
+    assert adopt_granted_proposals(state, client, audit) == 1
 
     intent = intents(state)["a1"]
     assert intent["proposal_id"] == PROPOSAL
@@ -199,7 +201,7 @@ async def test_adopted_grant_executes_once_through_the_unchanged_executor(tmp_pa
 def test_adopt_refuses_bad_signature(tmp_path):
     other_priv, _ = generate_keypair()
     state, client, platform, audit = _setup(tmp_path, [_item(priv=other_priv)])
-    assert adopt_granted_proposals(Hub(), state, client, audit) == 0
+    assert adopt_granted_proposals(state, client, audit) == 0
     assert "signature verification failed" in _refused(state, platform)
 
 
@@ -207,7 +209,7 @@ def test_adopt_refuses_a_tampered_artifact(tmp_path):
     item = _item()
     item["artifact"]["args_hash"] = "0" * 64
     state, client, platform, audit = _setup(tmp_path, [item])
-    assert adopt_granted_proposals(Hub(), state, client, audit) == 0
+    assert adopt_granted_proposals(state, client, audit) == 0
     assert "signature verification failed" in _refused(state, platform)
 
 
@@ -234,42 +236,43 @@ async def test_adopt_refuses_a_canonical_order_the_local_map_rejects(tmp_path):
 
 
 @pytest.mark.parametrize("change, why", [
-    ({"side": "sell"}, "only a buy limit"),
+    ({"side": "sell"}, "only a good-till-cancelled buy limit"),
     ({"order_type": "market", "limit_price": None, "stop_price": None},
-     "only a buy limit"),
+     "only a good-till-cancelled buy limit"),
+    ({"time_in_force": "day"}, "only a good-till-cancelled buy limit"),
     ({"stop_price": 212.0}, "stop below the limit"),
     ({"stop_price": None}, "stop below the limit"),
 ])
 def test_adopt_refuses_anything_but_a_stopped_buy_limit(tmp_path, change, why):
     canonical = {**CANONICAL, **change}
     state, client, platform, audit = _setup(tmp_path, [_item(canonical=canonical)])
-    assert adopt_granted_proposals(Hub(), state, client, audit) == 0
+    assert adopt_granted_proposals(state, client, audit) == 0
     assert why in _refused(state, platform)
 
 
 def test_adopt_refuses_wrong_agent(tmp_path):
     state, client, platform, audit = _setup(tmp_path, [_item(agent_id="ag2")])
-    assert adopt_granted_proposals(Hub(), state, client, audit) == 0
+    assert adopt_granted_proposals(state, client, audit) == 0
     assert "agent_id mismatch" in _refused(state, platform)
 
 
 def test_adopt_refuses_expired_artifact(tmp_path):
     state, client, platform, audit = _setup(tmp_path, [_item(expires_in=-10)])
-    assert adopt_granted_proposals(Hub(), state, client, audit) == 0
+    assert adopt_granted_proposals(state, client, audit) == 0
     assert "artifact expired" in _refused(state, platform)
 
 
 def test_adopt_refuses_a_signed_proposal_id_mismatch(tmp_path):
     state, client, platform, audit = _setup(
         tmp_path, [_item(signed_proposal_id="e" * 32)])
-    assert adopt_granted_proposals(Hub(), state, client, audit) == 0
+    assert adopt_granted_proposals(state, client, audit) == 0
     assert "proposal_id mismatch" in _refused(state, platform)
 
 
 def test_adopt_refuses_a_grant_naming_a_candidate(tmp_path):
     state, client, platform, audit = _setup(
         tmp_path, [_item(candidate_id="candidate-1")])
-    assert adopt_granted_proposals(Hub(), state, client, audit) == 0
+    assert adopt_granted_proposals(state, client, audit) == 0
     assert "cannot name a candidate" in _refused(state, platform)
 
 
@@ -277,7 +280,7 @@ def test_adopt_refuses_an_extra_or_missing_field(tmp_path):
     item = _item()
     item["notional"] = 633.75
     state, client, platform, audit = _setup(tmp_path, [item])
-    assert adopt_granted_proposals(Hub(), state, client, audit) == 0
+    assert adopt_granted_proposals(state, client, audit) == 0
     assert "missing or additional fields" in _refused(state, platform)
 
 
@@ -286,7 +289,7 @@ def test_adopt_refuses_another_account(tmp_path):
     _, other_args = resolve("place_order", SPEC.capability("place_order"), canonical)
     item = _item(args=other_args, canonical=canonical)
     state, client, platform, audit = _setup(tmp_path, [item])
-    assert adopt_granted_proposals(Hub(), state, client, audit) == 0
+    assert adopt_granted_proposals(state, client, audit) == 0
     assert "account mismatch" in _refused(state, platform)
 
 
@@ -306,7 +309,7 @@ async def test_brake_disarmed_after_adoption_refuses_before_the_broker(tmp_path)
     from nakagai_edge.edge.brake import set_local_disarm
 
     state, client, platform, audit = _setup(tmp_path, [_item()])
-    assert adopt_granted_proposals(Hub(), state, client, audit) == 1
+    assert adopt_granted_proposals(state, client, audit) == 1
     set_local_disarm(state, all_positions=True)
     hub = Hub()
 
@@ -323,7 +326,7 @@ def test_adopt_refuses_stale_policy(tmp_path, monkeypatch):
     real = time.time
     monkeypatch.setattr(time, "time", lambda: real() + 1000)  # past the policy TTL
 
-    assert adopt_granted_proposals(Hub(), state, client, audit) == 0
+    assert adopt_granted_proposals(state, client, audit) == 0
 
     assert intents(state) == {}
     assert platform.reports == []
@@ -335,15 +338,15 @@ def test_adopt_refuses_without_a_sole_order_capable_broker(tmp_path):
     second = {**_connector(), "id": "demo-2"}
     bundle = {**_bundle(), "connectors": {"connectors": [_connector(), second]}}
     apply_bundle(state, bundle, "v2")
-    assert adopt_granted_proposals(Hub(), state, client, audit) == 0
+    assert adopt_granted_proposals(state, client, audit) == 0
     assert "no sole order-capable broker" in _refused(state, platform)
 
 
 def test_adopt_is_idempotent(tmp_path):
     state, client, platform, audit = _setup(tmp_path, [_item()])
-    assert adopt_granted_proposals(Hub(), state, client, audit) == 1
+    assert adopt_granted_proposals(state, client, audit) == 1
     before = intents(state)
-    assert adopt_granted_proposals(Hub(), state, client, audit) == 0
+    assert adopt_granted_proposals(state, client, audit) == 0
     assert intents(state) == before
     assert platform.reports == []
 
@@ -372,22 +375,56 @@ async def test_a_lost_report_never_adopts_the_same_grant_twice(tmp_path):
     assert intents(state) == {}
 
 
-def test_an_unreadable_ledger_adopts_nothing(tmp_path):
+async def test_a_second_grant_for_an_adopted_proposal_never_submits_twice(tmp_path):
+    # The first grant executed and its intent is gone; the platform then lists
+    # a different approval for the same proposal. The broker sees one order.
+    state, client, platform, audit = _setup(tmp_path, [_item("a1")])
+    hub = Hub(result={"is_error": False, "data": {"accepted": True}})
+    await poll_once(hub, state, client, audit)
+    assert len(hub.calls) == 1
+    state.intents_path.unlink()                    # as if reconciled and dropped
+    platform.items = [_item("a2")]
+
+    assert adopt_granted_proposals(state, client, audit) == 0
+    await poll_once(hub, state, client, audit)
+
+    assert len(hub.calls) == 1
+    assert intents(state) == {}
+    refusals = [r for aid, r in platform.reports if aid == "a2"]
+    assert refusals and all(r["ok"] is False for r in refusals)
+    assert "already adopted under another approval" in refusals[0]["error"]
+
+
+def test_the_ledger_records_the_proposal_id(tmp_path):
+    state, client, platform, audit = _setup(tmp_path, [_item()])
+    assert adopt_granted_proposals(state, client, audit) == 1
+    ledger = json.loads(state.proposals_adopted_path.read_text())
+    assert ledger["a1"]["proposal_id"] == PROPOSAL
+
+
+@pytest.mark.parametrize("torn", ["{torn", '{"a1": 1.0}', "[]"])
+def test_an_unreadable_ledger_adopts_nothing_and_alerts_the_owner(tmp_path, torn):
     state, client, platform, audit = _setup(tmp_path, [_item()])
     state.proposals_adopted_path.parent.mkdir(parents=True, exist_ok=True)
-    state.proposals_adopted_path.write_text("{torn")
+    state.proposals_adopted_path.write_text(torn)
 
-    assert adopt_granted_proposals(Hub(), state, client, audit) == 0
+    assert adopt_granted_proposals(state, client, audit) == 0
+    assert adopt_granted_proposals(state, client, audit) == 0
 
     assert intents(state) == {}
     assert platform.reports == []
+    assert platform.pickups == []
+    # One alert, not one per 5 s pass.
+    assert len(platform.checkins) == 1
+    assert platform.checkins[0]["status"] == "alert"
+    assert "proposal ledger is unreadable" in platform.checkins[0]["note"]
 
 
 async def test_verify_rejects_proposal_id_mismatch(tmp_path):
     # The local intent and the platform's current artifact disagree about the
     # proposal: a re-signed grant for another proposal cannot execute this one.
     state, client, platform, audit = _setup(tmp_path, [_item()])
-    assert adopt_granted_proposals(Hub(), state, client, audit) == 1
+    assert adopt_granted_proposals(state, client, audit) == 1
     platform.items = [_item(proposal_id="e" * 32)]
     hub = Hub()
 
