@@ -622,7 +622,7 @@ async def test_missing_order_id_preserves_urgent_submitted_truth_and_disarms(
     await poll_once(hub, state, client, EdgeAudit(state))
 
     reason = (
-        "candidate broker result has no declared order id; "
+        "frozen order broker result has no declared order id; "
         "fill attribution is impossible"
     )
     assert reports == [{

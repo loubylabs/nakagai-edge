@@ -10,6 +10,8 @@
     cache/candidate-wake.json    bounded listener-owned candidate write scope
     cache/candidate-outcomes.json    mechanical outcomes awaiting platform ack
     cache/candidate-entries-off.json    persistent local entry disarm
+    cache/proposals-adopted.json    approvals adopted from granted proposals,
+                        so one grant becomes at most one local intent
     results/audit.jsonl local audit journal, shipped in batches
     edge.pid            the serving daemon: pid, port, start, version.
                         pid 0 once it has stopped: the claim is released,
@@ -67,6 +69,10 @@ class EdgeState:
     @property
     def candidate_entries_off_path(self) -> Path:
         return self.root / "cache" / "candidate-entries-off.json"
+
+    @property
+    def proposals_adopted_path(self) -> Path:
+        return self.root / "cache" / "proposals-adopted.json"
 
     @property
     def audit_path(self) -> Path:
