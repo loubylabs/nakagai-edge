@@ -5,7 +5,19 @@ the only place a broker credential is ever written to disk. Your agent talks to
 exactly one MCP endpoint, the edge, and never sees a token. The platform never
 sees one either.
 
-Version 0.5.12 is the current release. Its platform-integration tests follow
+Version 0.6.0 is the current release. It speaks proposal protocol 1: when an
+outside agent proposes an order on the platform and the owner approves it, the
+edge picks up the signed grant, verifies the signature, re-derives the order
+through its own `place_order` map, sole broker and sole allowed account, and
+submits it once. Protocol 1 carries only a good-till-cancelled buy limit with a
+protective stop below the limit. Any mismatch, an expired grant, a disarmed
+brake, or a rulebook changed since the grant refuses before the broker is
+contacted, and the platform is told why. A durable local ledger means one
+proposal is submitted at most once, even across a lost report or a second
+grant. The edge's pickup is what tells the platform it can carry a proposal
+out, so an older edge never receives one.
+
+Its platform-integration tests follow
 account-owned broker rulebooks and the retired platform login, and open the
 platform's withheld autopilot rung to prove an edge check-in clears the arm
 precheck. Account refusals name only the refused
@@ -22,8 +34,8 @@ stop. A listener-owned local scope enforces that boundary for the wake. The
 same candidate decision tools and read-only inspection remain available, while
 every other write is refused until the wake ends or expires. The agent cannot
 alter a prepared order field. The platform compiles the order, and local policy
-or the brake can still refuse execution. Frozen candidate execution is the
-only order entry. A raw `call_connector` request whose tool exactly matches the
+or the brake can still refuse execution. Frozen orders are the only order
+entry: a candidate the platform compiled, or a proposal the owner approved. A raw `call_connector` request whose tool exactly matches the
 selected connector's declared `capabilities.place_order.tool` is refused before
 dispatch with `canonical_order_required`. Other raw connector operations remain
 available.
