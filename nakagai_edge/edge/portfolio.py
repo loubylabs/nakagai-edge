@@ -13,7 +13,6 @@ never does arithmetic on them.
 
 import asyncio
 import logging
-import math
 import time
 from pathlib import Path
 
@@ -43,18 +42,6 @@ def _status(*statuses: str) -> str:
 def _error(label: str, error: Exception | str) -> str:
     detail = str(error)
     return f"{label}: {detail}" if detail else label
-
-
-def _finite(value, *, positive: bool = False) -> float | None:
-    if isinstance(value, bool):
-        return None
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    if not math.isfinite(number) or (positive and number <= 0):
-        return None
-    return number
 
 
 def broker_specs(root) -> list:
@@ -160,19 +147,6 @@ async def connector_snapshot(hub, spec) -> dict:
     return entry
 
 
-def account_snapshot_readable(
-        doc: dict, connector_id: str, account: str) -> bool:
-    """Whether one freshly assembled portfolio account is authoritative."""
-    for connector in doc.get("connectors") or []:
-        if connector.get("id") != connector_id or connector.get("status") != "ok":
-            continue
-        for row in connector.get("accounts") or []:
-            if (str(row.get("account_number") or "") == account
-                    and row.get("status") == "ok"):
-                return True
-    return False
-
-
 async def listed_accounts(hub, spec) -> list[dict]:
     """The broker's accounts, normalized one row at a time.
 
@@ -235,38 +209,6 @@ async def _figures(hub, spec, account: str) -> dict:
     if not isinstance(figures, dict):
         raise ValueError("get_balance response is not the mapped object")
     return figures
-
-
-async def balance_evidence(hub, spec, account: str) -> dict:
-    """Canonical broker equity and signed day P&L for the existing check-in.
-
-    This helper is deliberately separate from the display snapshot. Task 3
-    calls it immediately before candidate acceptance and relays its two values
-    through `agent_checkin`, preserving that endpoint as the platform's one
-    equity authority. `ok` requires finite positive equity and finite signed
-    day P&L. A connector that does not declare get_balance is unsupported; a
-    missing map field or unusable broker value is unreadable.
-    """
-    try:
-        cap = spec.capability("get_balance")
-    except CapabilityError:
-        return {"status": "unsupported", "equity": None, "day_pnl": None}
-    try:
-        tool, args = resolve("get_balance", cap, {"account": account})
-        payload = (await hub.call(
-            spec.id, tool, args, account_key=hub.account_key
-        )).get("data")
-        figures = first(payload, cap.items) if cap.items else payload
-    except Exception:  # noqa: BLE001 (the caller needs a bounded readiness fact)
-        return {"status": "unreadable", "equity": None, "day_pnl": None}
-    if not isinstance(figures, dict):
-        return {"status": "unreadable", "equity": None, "day_pnl": None}
-    values = read_partial("get_balance", cap, figures)
-    equity = _finite(values.get("equity"), positive=True)
-    day_pnl = _finite(values.get("day_pnl"))
-    if equity is None or day_pnl is None:
-        return {"status": "unreadable", "equity": None, "day_pnl": None}
-    return {"status": "ok", "equity": equity, "day_pnl": day_pnl}
 
 
 async def position_rows(hub, spec, account: str) -> tuple[str, list, str]:
@@ -380,8 +322,7 @@ class PortfolioReporter:
         self._last_doc: dict | None = None
         self._lock = asyncio.Lock()
 
-    async def snapshot_and_push(self, *, force: bool = False,
-                                require_ack: bool = False) -> dict:
+    async def snapshot_and_push(self) -> dict:
         # Imported here, not at module scope: brake.py is the one place the
         # disarm switches actually live, and snapshot_and_push is the one
         # portfolio caller close enough to the loop to read them fresh each
@@ -389,7 +330,7 @@ class PortfolioReporter:
         from nakagai_edge.edge.brake import armed, disarmed_positions
         async with self._lock:
             now = time.time()
-            if (not force and self._last_doc is not None
+            if (self._last_doc is not None
                     and now - self._last_run < REFRESH_MIN_INTERVAL_S):
                 return self._last_doc
             doc = {"connectors": mark_guarded(
@@ -400,13 +341,9 @@ class PortfolioReporter:
             self._last_run = time.time()
             self._last_doc = doc
             try:
-                acknowledged = await asyncio.to_thread(
+                await asyncio.to_thread(
                     self._client.report_portfolio, doc["connectors"])
-                if require_ack and acknowledged.get("ok") is not True:
-                    raise ValueError("platform did not acknowledge fresh portfolio evidence")
             except Exception as e:  # noqa: BLE001 (a down platform must not hurt the edge)
-                if require_ack:
-                    raise
                 log.warning("portfolio snapshot not reported to the platform "
                             "this cycle: %s", e)
             return doc

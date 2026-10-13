@@ -18,19 +18,14 @@ from typing import Annotated, Any
 
 import httpx
 
-from nakagai_edge.capability import (CAPABILITIES, OUTBOUND_ORDER_FIELDS,
-                                     CapabilityError, extract, resolve)
+from nakagai_edge.capability import CAPABILITIES, CapabilityError, extract, resolve
 from nakagai_edge.mcp_schema import SchemaInliningError, inline_local_refs
 from nakagai_edge.edge.audit import EdgeAudit
 from nakagai_edge.edge.brake import BRAKE_INTERVAL_S, Brake, normalize_quote
-from nakagai_edge.edge.candidate import (
-    CandidateWakeScope, candidate_entries_armed, deliver_candidate_outcome)
 from nakagai_edge.edge.client import EdgeClientError, PlatformClient
 from nakagai_edge.edge.executor import poll_once
 from nakagai_edge.edge.fills import FILLS_INTERVAL_S, FillsReporter
-from nakagai_edge.edge.portfolio import (PORTFOLIO_INTERVAL_S, PortfolioReporter,
-                                         account_snapshot_readable,
-                                         balance_evidence, broker_specs)
+from nakagai_edge.edge.portfolio import PORTFOLIO_INTERVAL_S, PortfolioReporter
 from nakagai_edge.edge.remote import RemoteApprovalQueue
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.supervision import (
@@ -39,7 +34,6 @@ from nakagai_edge.edge.supervision import (
 )
 from nakagai_edge.edge.sync import (POLICY_TTL_S, SYNC_INTERVAL_S, policy_fresh,
                                     schema_error, sync_once)
-from nakagai_edge.signing import args_hash
 
 EXECUTOR_INTERVAL_S = 5
 AUDIT_SHIP_INTERVAL_S = 30
@@ -52,7 +46,6 @@ PLATFORM_CONNECTOR = "nakagai-mcp"
 # is the only event reader and the linked tools carry the wire contract.
 RESERVED_PLATFORM_TOOLS = {
     "await_events", "list_peers", "claim_message", "send_message", "request_peer",
-    "accept_candidate", "abstain_candidate",
 }
 
 
@@ -64,7 +57,8 @@ STALE_POLICY = {"is_error": True, "error":
 CANONICAL_ORDER_REQUIRED = {
     "is_error": True,
     "code": "canonical_order_required",
-    "error": "raw order calls are retired; orders require a frozen execution candidate",
+    "error": ("raw order calls are retired; orders reach your broker only as an "
+              "order proposal your owner approves on the platform (propose_order)"),
 }
 
 
@@ -88,135 +82,6 @@ def _given(value) -> bool:
     if isinstance(value, (str, list, tuple, dict)):
         return bool(value)
     return True
-
-
-def _prepared_order(candidate_id: str, response: dict, evidence_spec,
-                    evidence_account: str) -> dict:
-    """Validate one frozen platform envelope without re-parsing the order.
-
-    Connector maps and local guardrails own order validation. This boundary
-    checks the generic authority fields and the hash over the exact arguments
-    that will be stored and submitted.
-    """
-    if not isinstance(response, dict):
-        raise ValueError("candidate acceptance returned no decision object")
-    expected_response = {
-        "candidate_id", "decision", "mechanical_status", "mechanical_reason",
-        "approval_id", "signal_id", "canonical_order", "prepared_order",
-    }
-    missing_response = expected_response - set(response)
-    if missing_response == {"signal_id"}:
-        raise ValueError("candidate acceptance signal_id must be a nonempty string")
-    if missing_response == {"canonical_order"}:
-        raise ValueError("candidate acceptance returned no canonical_order")
-    if set(response) != expected_response:
-        raise ValueError("candidate acceptance has missing or additional fields")
-    if response.get("candidate_id") != candidate_id:
-        raise ValueError("candidate acceptance returned a different candidate_id")
-    if response.get("decision") != "accepted":
-        raise ValueError("candidate acceptance did not return accepted")
-    if response.get("mechanical_status") != "prepared":
-        if response.get("mechanical_status") == "blocked":
-            raise ValueError("blocked candidate response cannot carry a prepared order")
-        raise ValueError("candidate acceptance did not return a prepared order")
-    signal_id = response.get("signal_id")
-    if not isinstance(signal_id, str) or not signal_id.strip():
-        raise ValueError("candidate acceptance signal_id must be a nonempty string")
-    canonical = response.get("canonical_order")
-    if not isinstance(canonical, dict) or set(canonical) != set(OUTBOUND_ORDER_FIELDS):
-        raise ValueError("accepted candidate returned no exact canonical_order")
-    prepared = response.get("prepared_order")
-    if not isinstance(prepared, dict):
-        raise ValueError("accepted candidate returned no prepared_order")
-    expected = {"connector_id", "account_id", "tool", "args", "args_hash"}
-    if set(prepared) != expected:
-        raise ValueError("prepared_order has missing or additional fields")
-    for field in ("connector_id", "account_id", "tool", "args_hash"):
-        if not isinstance(prepared[field], str) or not prepared[field].strip():
-            raise ValueError(f"prepared_order {field} must be a nonempty string")
-    if not isinstance(prepared["args"], dict) or not prepared["args"]:
-        raise ValueError("prepared_order args must be a nonempty object")
-    if prepared["args_hash"] != args_hash(prepared["args"]):
-        raise ValueError("prepared_order args hash mismatch")
-    if prepared["connector_id"] != evidence_spec.id:
-        raise ValueError(
-            "prepared_order connector does not match the broker evidence connector")
-    if prepared["account_id"] != evidence_account:
-        raise ValueError(
-            "prepared_order account does not match the broker evidence account")
-    order = evidence_spec.capability("place_order")
-    try:
-        local_tool, local_args = resolve("place_order", order, canonical)
-    except CapabilityError as error:
-        raise ValueError(f"canonical_order failed the local capability map: {error}") from error
-    if prepared["tool"] != order.tool or prepared["tool"] != local_tool:
-        raise ValueError(
-            "prepared_order tool does not match the evidence connector place_order tool")
-    if prepared["args"] != local_args or prepared["args_hash"] != args_hash(local_args):
-        raise ValueError(
-            "prepared_order does not match canonical_order through the local capability map")
-    account_arg = order.args.get("account")
-    if (not account_arg
-            or str(prepared["args"].get(account_arg) or "") != evidence_account):
-        raise ValueError(
-            "prepared_order order account does not match the broker evidence account")
-    return {**prepared, "signal_id": signal_id}
-
-
-def _terminal_candidate(candidate_id: str, decision: str, response: dict) -> dict:
-    """Require a decision response to name the request it settles."""
-    if not isinstance(response, dict):
-        raise ValueError("candidate decision returned no decision object")
-    if response.get("candidate_id") != candidate_id:
-        raise ValueError("candidate decision returned a different candidate_id")
-    if response.get("decision") != decision:
-        raise ValueError(f"candidate decision did not return {decision}")
-    return response
-
-
-def _safe_candidate(response: dict) -> dict:
-    """Server decision metadata safe to return to the model."""
-    fields = ("candidate_id", "decision", "mechanical_status",
-              "mechanical_reason", "approval_id", "status")
-    return {field: response[field] for field in fields if field in response}
-
-
-# The platform validates and stores this list too; the cap here exists so an
-# oversized list is refused locally, in one turn, rather than accepted here
-# and then bounced by the platform after a checkin and a broker read already
-# ran for accept_candidate.
-MAX_CANDIDATE_MEMORY_IDS = 10
-
-
-def _bounded_memory_ids(memory_ids: list[str] | None) -> list[str]:
-    """Normalize a decision's Memory-row trail, capped at ten entries.
-
-    These are opaque identifier strings to the edge: it never interprets them
-    and never derives an order field from one. The platform compiler alone
-    owns symbol, side, size, entry, and stop.
-    """
-    ids = list(memory_ids or [])
-    if len(ids) > MAX_CANDIDATE_MEMORY_IDS:
-        raise ValueError(
-            f"memory_ids carries {len(ids)} entries; a candidate decision "
-            f"may lean on at most {MAX_CANDIDATE_MEMORY_IDS}")
-    return ids
-
-
-def _candidate_broker_account(state: EdgeState):
-    """The sole locally write-tiered candidate connector and account."""
-    candidates = []
-    for spec in broker_specs(state.root):
-        if "place_order" not in spec.capabilities:
-            continue
-        allowed = list(spec.guardrails.accounts.allow)
-        if len(allowed) == 1:
-            candidates.append((spec, allowed[0]))
-    if len(candidates) != 1:
-        raise ValueError(
-            "candidate acceptance requires exactly one order-capable broker "
-            "with exactly one full-access account")
-    return candidates[0]
 
 
 def build_hub(state: EdgeState, client: PlatformClient):
@@ -244,48 +109,12 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
     from pydantic import WithJsonSchema
 
     mcp = MCPServer("nakagai-edge")
-    candidate_scope = CandidateWakeScope(state)
-
-    def _candidate_decision_denial(candidate_id: str) -> dict | None:
-        active = candidate_scope.current()
-        if active is not None and active["candidate_id"] == candidate_id:
-            return None
-        if active is None:
-            error = "candidate decisions require an active execution candidate wake"
-        else:
-            error = (f"candidate wake is bounded to {active['candidate_id']!r}; "
-                     f"decision for {candidate_id!r} is denied")
-        return {"is_error": True, "error": error}
-
-    def _candidate_direct_write_denial() -> dict | None:
-        if candidate_scope.current() is None:
-            return None
-        return {
-            "is_error": True,
-            "error": ("execution candidate wake permits read-only inspection; "
-                      "only accept_candidate or abstain_candidate may write "
-                      "until the candidate wake ends"),
-        }
-
-    def _report_candidate_refusal(candidate_id: str, reason: str,
-                                  approval_id: str = "") -> bool:
-        bounded = str(reason).strip()[:1000] or "local candidate refusal"
-        return deliver_candidate_outcome(
-            state, client, candidate_id,
-            mechanical_status="blocked",
-            mechanical_reason=bounded,
-            approval_id=approval_id,
-            urgent=False,
-            outcome_unknown=False,
-        )
 
     def _gate() -> str | None:
         return None if policy_fresh(state, POLICY_TTL_S) else freshness_error()
 
     async def _guarded(connector_id: str, tool: str, args: dict, *,
-                       signal_id: str = "", capability: str = "",
-                       candidate_id: str = "", intent_account: str = "",
-                       require_approval: bool = False) -> dict:
+                       capability: str = "") -> dict:
         """The one door every connector call goes through, semantic or raw.
 
         `capability` is the name the semantic tools came in under. It is
@@ -305,13 +134,8 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
             out = await hub.call(
                 connector_id, tool, args,
                 account_key=hub.account_key,
-                signal_id=signal_id,
-                candidate_id=candidate_id,
-                intent_account=intent_account,
-                require_approval=require_approval,
             )
-            kind = "call" if not out.get("approval_required") else "intent"
-            audit.record(kind, connector_id, tool,
+            audit.record("call", connector_id, tool,
                          {"is_write": out.get("is_write"), **origin})
             return out
         except GuardrailDenied as e:
@@ -324,25 +148,25 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
     def _pick_connector(capability: str, connector_id: str) -> str:
         """The connector to serve this capability, or raise.
 
-        Ambiguity is an error naming the candidates. Picking one would make
-        which broker received an order depend on registry ordering, which is
-        not a decision an agent can review or an owner can predict.
+        Ambiguity is an error naming the brokers that qualify. Picking one
+        would make which broker received an order depend on registry ordering,
+        which is not a decision an agent can review or an owner can predict.
         """
         if connector_id:
             return connector_id
         specs = hub.load_specs()
-        candidates = sorted(s.id for s in specs.values()
-                            if s.enabled and s.role == "broker"
-                            and capability in s.capabilities)
-        if len(candidates) == 1:
-            return candidates[0]
-        if not candidates:
+        eligible = sorted(s.id for s in specs.values()
+                          if s.enabled and s.role == "broker"
+                          and capability in s.capabilities)
+        if len(eligible) == 1:
+            return eligible[0]
+        if not eligible:
             raise CapabilityError(
                 f"no enabled broker declares {capability!r}; name one with "
                 f"connector_id, or add the capability to its registry entry")
         raise CapabilityError(
-            f"{len(candidates)} brokers declare {capability!r} "
-            f"({', '.join(candidates)}); name one with connector_id")
+            f"{len(eligible)} brokers declare {capability!r} "
+            f"({', '.join(eligible)}); name one with connector_id")
 
     async def _infer_account(capability: str, spec) -> str:
         """The account a call acts on when the agent named none, or "".
@@ -386,7 +210,6 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
     async def _capability_call(capability: str, connector_id: str = "",
                                args: dict | None = None, *,
                                required: tuple[str, ...] = (),
-                               signal_id: str = "",
                                internal: bool = False) -> dict:
         """One semantic call: pick the connector, resolve, dial, read back.
 
@@ -465,8 +288,7 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
                 audit.record("denial", cid, "",
                              {"reason": str(e), "capability": capability})
             return {"is_error": True, "error": str(e), "capability": capability}
-        out = await _guarded(cid, tool, broker_args, signal_id=signal_id,
-                             capability=capability)
+        out = await _guarded(cid, tool, broker_args, capability=capability)
         # Provenance first, the call's own answer second: an envelope always
         # wins its own fields, and provenance only fills what an error payload
         # left blank.
@@ -496,9 +318,10 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         (list_accounts, get_balance, list_positions, get_quote, list_orders,
         cancel_order) do the same work in one shared vocabulary and are what
         you want unless a broker offers something they do not cover. A
-        connector's declared raw order tool is refused here because only the
-        frozen candidate executor may submit an order. Other writes enqueue
-        for human approval on the platform; poll get_approval for the outcome."""
+        connector's declared raw order tool is refused here: an order reaches
+        the broker only as an order proposal the owner approves on the
+        platform (propose_order). A write the local guardrails send for
+        approval is refused the same way."""
         try:
             args = json.loads(args_json or "{}")
         except json.JSONDecodeError as e:
@@ -539,7 +362,7 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         """Every configured connector, whether it is enabled, and what it can be
         asked to do: `capabilities` lists the connector's internal capability
         maps. Read it before calling one, rather than discovering the gap as a
-        refusal. The place_order map serves frozen candidate execution only."""
+        refusal. The place_order map serves owner-approved proposals only."""
         if (stale := _gate()) is not None:
             return stale
         return json.dumps(hub.status(), default=str)
@@ -560,9 +383,8 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
 
     @mcp.tool()
     async def get_approval(approval_id: str) -> str:
-        """Status of a cancel_order or raw connector write you enqueued. This
-        is how you learn whether the owner approved it and what the broker then
-        answered."""
+        """Status of one approval on the platform, by id: whether the owner
+        approved it and what the broker then answered."""
         if (stale := _gate()) is not None:
             return stale
         rec = hub.approvals.get(hub.account_key, approval_id)
@@ -575,7 +397,7 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
     # One vocabulary, learned once, spoken to any broker. Each tool resolves
     # to (connector, tool, args) through that connector's own map and then
     # goes down `_guarded` like everything else: same guardrail
-    # classification, same approval enqueue, same audit record. These decide
+    # classification, same approval policy, same audit record. These decide
     # WHAT to call and never WHETHER it is allowed.
 
     @mcp.tool()
@@ -688,18 +510,13 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
     @mcp.tool()
     async def cancel_order(order_id: str, connector_id: str = "",
                            account: str = "") -> str:
-        """Cancel a working order, or ask the owner for permission to. Branch on
-        `approval_required` in the response.
+        """Cancel a working order. On success `data` holds the broker's own
+        answer. A connector whose guardrails require the owner's approval for
+        a cancel refuses it here; the owner cancels at the broker instead.
 
-        `approval_required: true` means the cancel is only requested: poll
-        `get_approval(approval_id)`, and expect the broker to hear about it
-        only once the owner approves. Otherwise the cancel went through as you
-        asked and `data` holds the broker's own answer.
-
-        Either way, treat the order as still live until `list_orders` says
-        otherwise. An order can fill while a cancel is in flight, and it can
-        fill while one waits for a human; a cancel is a request to the broker,
-        never a guarantee about what already happened there.
+        Treat the order as still live until `list_orders` says otherwise. An
+        order can fill while a cancel is in flight; a cancel is a request to
+        the broker, never a guarantee about what already happened there.
 
         `order_id` is the `order_id` from `list_orders` on the same connector;
         ids are not portable between brokers. `connector_id` may be omitted
@@ -728,10 +545,8 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         measured against the prior session's close). Report BOTH or neither;
         one without the other is discarded.
 
-        autopilot's daily-loss circuit breaker runs on these and nothing else.
-        Nakagai never pulls them from your broker. While the dial is on and no
-        recent report exists, autopilot will not auto-execute: it declines to a
-        human tap rather than trade blind to the account's drawdown.
+        Nakagai never pulls them from your broker; this report is the only way
+        the platform learns them.
 
         Not gated on local policy freshness: this call goes straight to the
         platform rather than reading anything cached, so a stale local policy
@@ -744,149 +559,11 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         `ok: true`. A claim loss is ordinary coordination, so read its retry_at
         hint and leave the work to the agent that holds the claim.
         """
-        if denial := _candidate_direct_write_denial():
-            return json.dumps(denial)
         try:
             out = client.agent_checkin(status, note, account_equity, day_pnl)
             return json.dumps(out, default=str)
         except (EdgeClientError, httpx.HTTPError) as e:
             return json.dumps({"is_error": True, "error": str(e)})
-
-    @mcp.tool()
-    async def accept_candidate(candidate_id: str, rationale: str,
-                               memory_ids: list[str] | None = None) -> str:
-        """Accept one platform candidate. The platform owns every order field.
-
-        This tool refreshes broker evidence, relays broker-authored equity and
-        signed day profit and loss, validates the frozen response, and submits
-        its exact connector call through local guardrails and approvals.
-
-        `memory_ids` names, if any, the Memory rows this judgment leaned on
-        (owner-stated facts or the desk's own guesses), up to 10; omit it or
-        leave it empty when the judgment leaned on none. These are opaque
-        identifier strings to the edge: it never interprets one and never
-        derives an order field from one. The platform compiler alone owns
-        symbol, side, size, entry, and stop. Cite only ids the platform
-        handed you in this wake; never invent one.
-        """
-        if denial := _candidate_decision_denial(candidate_id):
-            return json.dumps(denial)
-        try:
-            memory_ids = _bounded_memory_ids(memory_ids)
-            readiness_errors = []
-            if not candidate_entries_armed(state):
-                readiness_errors.append(
-                    "local candidate entries are disarmed after an urgent outcome")
-            snapshot = None
-            try:
-                snapshot = await reporter.snapshot_and_push(
-                    force=True, require_ack=True)
-            except Exception as error:  # noqa: BLE001 (decision still must persist)
-                readiness_errors.append(f"portfolio refresh failed: {error}")
-            spec = account = None
-            try:
-                spec, account = _candidate_broker_account(state)
-            except ValueError as error:
-                readiness_errors.append(str(error))
-            if (snapshot is not None and spec is not None and account is not None
-                    and not account_snapshot_readable(snapshot, spec.id, account)):
-                readiness_errors.append(
-                    "fresh positions and open orders were not readable for the candidate account")
-            evidence = None
-            if not readiness_errors and spec is not None and account is not None:
-                evidence = await balance_evidence(hub, spec, account)
-                if evidence.get("status") != "ok":
-                    readiness_errors.append(
-                        "candidate acceptance requires readable broker equity and day P&L")
-            note = ("candidate broker evidence refreshed" if not readiness_errors
-                    else "candidate broker evidence unreadable")
-            try:
-                checked = client.agent_checkin(
-                    "research", note,
-                    evidence["equity"] if not readiness_errors else None,
-                    evidence["day_pnl"] if not readiness_errors else None)
-                if checked.get("ok") is not True:
-                    readiness_errors.append(
-                        "platform did not accept fresh broker evidence")
-            except (EdgeClientError, httpx.HTTPError, ValueError) as error:
-                readiness_errors.append(f"broker evidence check-in failed: {error}")
-            response = client.accept_candidate(candidate_id, rationale, memory_ids)
-            _terminal_candidate(candidate_id, "accepted", response)
-            if response.get("mechanical_status") == "blocked":
-                if (response.get("prepared_order") is not None
-                        or response.get("canonical_order") is not None):
-                    reason = "blocked candidate response also carried a prepared order"
-                    reported = _report_candidate_refusal(candidate_id, reason)
-                    return json.dumps({
-                        **_safe_candidate(response), "is_error": True,
-                        "error": reason, "outcome_reported": reported,
-                    }, default=str)
-                return json.dumps(_safe_candidate(response), default=str)
-            if readiness_errors:
-                reason = "; ".join(readiness_errors)
-                reported = _report_candidate_refusal(candidate_id, reason)
-                return json.dumps({
-                    **_safe_candidate(response), "mechanical_status": "blocked",
-                    "mechanical_reason": reason, "is_error": True,
-                    "error": reason, "outcome_reported": reported,
-                }, default=str)
-            try:
-                prepared = _prepared_order(
-                    candidate_id, response, spec, account)
-            except ValueError as error:
-                reason = str(error)
-                reported = _report_candidate_refusal(candidate_id, reason)
-                return json.dumps({
-                    **_safe_candidate(response), "mechanical_status": "blocked",
-                    "mechanical_reason": reason, "is_error": True,
-                    "error": reason, "outcome_reported": reported,
-                }, default=str)
-            submitted = await _guarded(
-                prepared["connector_id"], prepared["tool"], prepared["args"],
-                signal_id=prepared["signal_id"],
-                candidate_id=candidate_id,
-                intent_account=prepared["account_id"], require_approval=True)
-            safe = _safe_candidate(response)
-            if submitted.get("is_error"):
-                reason = submitted.get("error", "local refusal")
-                reported = _report_candidate_refusal(candidate_id, reason)
-                return json.dumps({**safe, "is_error": True,
-                                   "mechanical_status": "blocked",
-                                   "mechanical_reason": reason,
-                                   "error": reason,
-                                   "outcome_reported": reported},
-                                  default=str)
-            for field in ("approval_id", "status"):
-                if field in submitted:
-                    safe[field] = submitted[field]
-            return json.dumps(safe, default=str)
-        except (EdgeClientError, httpx.HTTPError, ValueError) as error:
-            return json.dumps({"is_error": True, "error": str(error)})
-
-    @mcp.tool()
-    async def abstain_candidate(candidate_id: str, rationale: str,
-                                memory_ids: list[str] | None = None) -> str:
-        """Abstain from one platform candidate without contacting a broker.
-
-        `memory_ids` names, if any, the Memory rows this judgment leaned on
-        (owner-stated facts or the desk's own guesses), up to 10; omit it or
-        leave it empty when the judgment leaned on none. These are opaque
-        identifier strings to the edge: it never interprets one and never
-        derives an order field from one. The platform compiler alone owns
-        symbol, side, size, entry, and stop. Cite only ids the platform
-        handed you in this wake; never invent one.
-        """
-        if denial := _candidate_decision_denial(candidate_id):
-            return json.dumps(denial)
-        try:
-            memory_ids = _bounded_memory_ids(memory_ids)
-            response = client.abstain_candidate(candidate_id, rationale, memory_ids)
-            _terminal_candidate(candidate_id, "abstained", response)
-            return json.dumps(
-                _safe_candidate(response),
-                default=str)
-        except (EdgeClientError, httpx.HTTPError, ValueError) as error:
-            return json.dumps({"is_error": True, "error": str(error)})
 
     @mcp.tool()
     async def list_peers() -> str:
@@ -901,8 +578,6 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
     async def claim_message(message_seq: int) -> str:
         """Claim an actionable message before working when it requires a
         claim. A conflict is a normal result that names the live claimant."""
-        if denial := _candidate_direct_write_denial():
-            return json.dumps(denial)
         try:
             return json.dumps(client.claim_message(message_seq), default=str)
         except (EdgeClientError, httpx.HTTPError) as e:
@@ -914,8 +589,6 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         """Send a linked message to one room. Use the source message sequence
         in `reply_to_seq` and a stable `idempotency_key` when retrying. Never
         gated: even halted, you may say you are halted."""
-        if denial := _candidate_direct_write_denial():
-            return json.dumps(denial)
         try:
             out = client.send_message(text, room_id, idempotency_key, reply_to_seq)
             return json.dumps(out, default=str)
@@ -927,8 +600,6 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
                            source_seq: int = 0) -> str:
         """Request owner-visible help from selected peers for a source
         message. Use a stable `idempotency_key` when retrying."""
-        if denial := _candidate_direct_write_denial():
-            return json.dumps(denial)
         try:
             out = client.request_peer(agent_ids, text, idempotency_key, source_seq)
             return json.dumps(out, default=str)
@@ -944,8 +615,6 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         when their containing row is `ok`. You never supply numbers; this tool
         makes the edge go look for itself. Rate-limited: within 15s of the last
         sweep you get that snapshot back unchanged."""
-        if denial := _candidate_direct_write_denial():
-            return json.dumps(denial)
         if (stale := _gate()) is not None:
             return stale
         try:

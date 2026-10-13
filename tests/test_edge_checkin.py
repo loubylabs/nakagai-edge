@@ -4,14 +4,12 @@ This is the test that was missing and let the edge check-in gap through: it
 drives a check-in through the REAL edge MCP shim (create_edge_mcp's
 agent_checkin tool) over a PlatformClient whose HTTP transport is bridged, in
 process, into a real platform FastAPI app - the same custody split described
-in docs/internal/EDGE.md, minus sockets. It proves the branch's whole premise:
-an edge owner on autopilot's default 3.0 loss dial can report equity through
-their edge agent and then arm, exactly like a direct MCP agent can.
+in docs/internal/EDGE.md, minus sockets. It proves an edge owner can report
+equity through their edge agent, exactly like a direct MCP agent can.
 """
 
 import json
 import uuid
-from datetime import datetime, timezone
 
 import httpx
 import pytest
@@ -57,9 +55,8 @@ def _bridged_platform_client(app, token: str) -> PlatformClient:
 
 
 class _Reporter:
-    """Stub for PortfolioReporter: these tests exercise the check-in tool and
-    the autopilot loss-dial gate, not the portfolio path, so a no-op
-    stand-in keeps their intent unchanged."""
+    """Stub for PortfolioReporter: these tests exercise the check-in tool,
+    not the portfolio path, so a no-op stand-in keeps their intent unchanged."""
 
     async def snapshot_and_push(self):
         return {"connectors": []}
@@ -121,12 +118,9 @@ def _enroll(app, *, name="edge-shim", user=APPROVER["X-User"]) -> str:
 
 async def test_edge_checkin_lands_where_the_platform_can_read_it(
         tmp_path, platform_root, platform_app):
-    """The whole point of this branch: an equity report relayed by an EDGE
-    agent, through its shim's own agent_checkin tool, must be readable by
-    risk_inputs.read_equity_inputs() on the platform, exactly like a direct
-    MCP agent's report."""
-    from nakagai_platform.risk_inputs import read_equity_inputs
-
+    """An equity report relayed by an EDGE agent, through its shim's own
+    agent_checkin tool, lands in the owner's activity history as the same
+    check-in event a direct MCP agent's report produces."""
     owner = f"equity-owner-{uuid.uuid4().hex}@nakag.ai"
     token = _enroll(platform_app, user=owner)
     platform_client = _bridged_platform_client(platform_app, token)
@@ -139,24 +133,21 @@ async def test_edge_checkin_lands_where_the_platform_can_read_it(
     out = json.loads(text)
     assert out["ok"] is True
 
-    history = _history(owner)
-    report = read_equity_inputs(
-        history=history, now=datetime.now(timezone.utc), max_age_s=1e308)
-    assert report.equity == 100_000.0
-    assert report.day_pnl == -1_500.0
-
-    # And it landed under the edge agent's own name/id, not a synthetic one.
-    event = history.read(limit=1, category="agents")[0]
+    # It landed under the edge agent's own name/id, not a synthetic one,
+    # carrying the equity pair.
+    event = _history(owner).read(limit=1, category="agents")[0]
     assert event.actor_label == "edge-shim"
     assert event.kind == "checkin"
+    assert event.summary == "watching NVDA"
+    assert event.details["status"] == "scanning"
+    assert event.details["account_equity"] == 100_000.0
+    assert event.details["day_pnl"] == -1_500.0
 
 
 async def test_edge_checkin_discards_half_an_equity_report(
         tmp_path, platform_root, platform_app):
     """Both fields or nothing, over the edge path too: equity alone has no
-    baseline and would read as a flat day."""
-    from nakagai_platform.risk_inputs import read_equity_inputs
-
+    baseline and would read as a flat day. The beat itself is still recorded."""
     owner = f"half-report-owner-{uuid.uuid4().hex}@nakag.ai"
     token = _enroll(platform_app, user=owner)
     platform_client = _bridged_platform_client(platform_app, token)
@@ -165,91 +156,8 @@ async def test_edge_checkin_discards_half_an_equity_report(
     await mcp.call_tool("agent_checkin", {
         "status": "scanning", "account_equity": 100_000.0})   # no day_pnl
 
-    report = read_equity_inputs(
-        history=_history(owner), now=datetime.now(timezone.utc), max_age_s=1e308)
-    assert report.equity is None
-    assert report.day_pnl is None
-
-
-async def test_edge_agent_can_arm_autopilot_after_checking_in_with_equity(
-        tmp_path, platform_root, platform_app, monkeypatch):
-    """The acceptance test for the whole branch. With the loss dial at its
-    3.0 default and no equity ever reported, arming autopilot 422s: the breaker
-    would be on and unenforceable. Once an EDGE agent relays equity through
-    its own shim's agent_checkin tool, the exact same arm call succeeds. This
-    is what 'the breaker works in edge topology' actually means: before the
-    fix, an edge owner had no way to ever clear the 422 short of zeroing the
-    dial - precisely the failure this branch exists to eliminate.
-    """
-    from nakagai_platform import mandate
-    from nakagai_platform.api.db import Database
-    from nakagai_platform.api.tenancy import resolve_workspace
-    from nakagai_platform.mandate_store import MandateStore
-
-    # The platform withholds autopilot from every account while it is scoped
-    # to owners who run their own agent, which is the topology this test
-    # drives. Open the rung for the run; `raising=False` keeps the test valid
-    # against a platform that predates the withholding.
-    monkeypatch.setattr(mandate, "UNAVAILABLE_PRESETS", frozenset(), raising=False)
-
-    owner = TestClient(platform_app)
-    # An identity, because arming is a per-account act and the platform now
-    # refuses one that carries none. This used to send a bearer token and
-    # nothing else, which landed on the house "default" workspace: convenient
-    # for a harness, and exactly the anonymous write the platform closed.
-    # The Edge agent and mandate must belong to the same owner because
-    # latest_equity_report() reads that owner's tenant ActivityHistory.
-    owner_email = f"edge-owner-{uuid.uuid4().hex}@nakag.ai"
-    owner_headers = {"Authorization": "Bearer api-secret", "X-User": owner_email}
-
-    # Seed the mandate the way /api/mandate/arm itself resolves it: the same
-    # email through the same resolver, so this store and the route land on one
-    # workspace row.
-    db = Database.from_env()
-    # Autopilot stages orders, and the platform now refuses to persist a rung
-    # that stages orders for an account that is not Pro. This owner is invented
-    # per-run, so it starts on the free default and the save below would be
-    # refused. A comp grant is the cheapest way to say "this is a paying
-    # account" without inventing Stripe identity.
-    #
-    # It has to land BEFORE the resolver: WorkspaceContext carries the plan it
-    # read at resolution time, so granting after this line would leave the
-    # store holding a stale free context and refuse anyway.
-    db.grant_plan(owner_email, plan="pro", reason="edge autopilot fixture",
-                  granted_by="edge-tests")
-    ctx = resolve_workspace(db, "", owner_email)
-    store = MandateStore(platform_root, db, ctx)
-    doc = store.load()
-    doc["preset"] = "autopilot"
-    store.save(doc)
-
-    # No equity report yet, so the platform cannot price what it needs equity
-    # for and the arm precheck refuses.
-    #
-    # Assert the BEHAVIOUR, never the copy. The 422's detail is prose the
-    # platform composes for an owner to read, and it is free to improve it: it
-    # has widened once already, from naming only the daily-loss breaker to
-    # naming the risk caps that also need the figure. A substring match here
-    # turns every legitimate reword on that side into a red "the published edge
-    # and this platform disagree", which is a claim about the PAIRING and was
-    # false both times it fired.
-    #
-    # What this test is actually for is the transition: refused before a
-    # check-in, armed after one. A status code and the stored state say that,
-    # and they say it identically against any platform old or new enough to
-    # have the precheck at all.
-    before = owner.post("/api/mandate/arm", json={"armed": True}, headers=owner_headers)
-    assert before.status_code == 422
-    assert store.load()["autopilot_state"]["armed"] is False
-
-    token = _enroll(platform_app, name="edge-shim", user=owner_email)
-    platform_client = _bridged_platform_client(platform_app, token)
-    mcp = _edge_mcp(tmp_path / "edge", platform_client)
-    result = await mcp.call_tool("agent_checkin", {
-        "status": "scanning", "account_equity": 50_000.0, "day_pnl": -200.0})
-    text = result.content[0].text
-    assert json.loads(text)["ok"] is True
-
-    after = owner.post("/api/mandate/arm", json={"armed": True}, headers=owner_headers)
-    assert after.status_code == 200
-    assert after.json()["autopilot_state"]["armed"] is True
+    event = _history(owner).read(limit=1, category="agents")[0]
+    assert event.kind == "checkin"
+    assert event.details["status"] == "scanning"
+    assert "account_equity" not in event.details
+    assert "day_pnl" not in event.details

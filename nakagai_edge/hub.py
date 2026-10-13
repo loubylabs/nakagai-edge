@@ -405,32 +405,9 @@ class ConnectorHub:
         conn.last_used = time.monotonic()
         return {"connector": connector_id, "tools": annotate_tools(spec, conn.tools)}
 
-    def provenance(self, spec: ConnectorSpec, args: dict,
-                   signal_id: str) -> tuple[dict | None, float]:
-        """What this order claims to be: the signal Nakagai emitted under the cited
-        id, and the order's notional.
-
-        The base hub is what the edge runs, and the edge cannot answer this: it has
-        no signals/ directory, because signals are the platform's. (None, 0.0) is the
-        honest answer, not a stub. The platform re-derives provenance when the edge's
-        record reaches it (api/agent_routes.py:436), so nothing is lost. PlatformHub
-        overrides this for the platform's own enqueue path.
-        """
-        return None, 0.0
-
-    async def _maybe_auto_approve(self, record) -> tuple[Any | None, bool]:
-        """The mandate's verdict on this record, before a human is asked.
-
-        The base hub has no mandate, no equity report and no signing key, so it never
-        auto-approves. PlatformHub overrides this.
-        """
-        return None, False
-
     async def call(self, connector_id: str, tool: str, args: dict, *,
                    account_key: str, requested_by: str = "",
-                   approved: bool = False, signal_id: str = "",
-                   candidate_id: str = "", intent_account: str = "",
-                   require_approval: bool = False) -> dict:
+                   approved: bool = False, signal_id: str = "") -> dict:
         """Proxy one downstream tool call, after the guardrails clear it.
 
         `approved=True` is the post-human-decision path: the guardrails run again
@@ -440,8 +417,7 @@ class ConnectorHub:
 
         `signal_id` is the id of a signal Nakagai emitted that this order claims to
         execute. It is resolved and frozen onto the approval record for the audit
-        trail at every rung. Under autopilot it is also what the envelope checks: an
-        order citing nothing never auto-executes.
+        trail.
         """
         spec = self.spec(connector_id)
         spec.check_connectable()
@@ -457,66 +433,21 @@ class ConnectorHub:
                                  f"(has: {known})")
 
         verdict = evaluate(spec, tool, args, read_only_hint=self._hint_for(conn, tool))
-        if verdict.is_write:
-            from nakagai_edge.edge.candidate import CandidateWakeScope
-            from nakagai_edge.edge.state import EdgeState
-            active_candidate = CandidateWakeScope(EdgeState(self.root)).current()
-            if (active_candidate is not None
-                    and not approved
-                    and not (
-                        candidate_id == active_candidate["candidate_id"]
-                        and require_approval)):
-                raise GuardrailDenied(
-                    "execution candidate wake permits read-only inspection; "
-                    "this write is denied until the candidate wake ends")
         if verdict.decision == "deny":
             raise GuardrailDenied(verdict.reason)
-        if require_approval and verdict.decision != "approve":
-            raise GuardrailDenied(
-                "candidate orders require this exact connector tool to use the "
-                "existing approval policy")
         if verdict.decision == "approve" and not approved:
             queue = self.approvals
             if queue is None:
                 raise GuardrailDenied(
                     f"{verdict.reason}; no approval queue is configured. "
                     f"Remove this tool from approvals.require_for to allow it")
-            signal, notional = self.provenance(spec, args, signal_id)
-            found_account = next(
-                (str(args[name]) for name in spec.guardrails.accounts.arg_names
-                 if args.get(name)), "")
-            if intent_account and found_account != intent_account:
-                raise GuardrailDenied(
-                    "prepared candidate account does not match the guarded "
-                    "connector arguments")
             record = queue.enqueue(account_key, connector_id, tool, args,
                                    ttl_s=spec.guardrails.approvals.ttl_s,
                                    requested_by=requested_by,
-                                   signal_id=signal_id, signal=signal,
-                                   notional=notional, candidate_id=candidate_id,
-                                   intent_account=found_account)
-
-            # The mandate gets to decide before a human is asked. Inline, not a
-            # background sweeper: a sweeper would put a polling interval between
-            # "the agent saw the setup" and "the order reached the broker", which is
-            # the latency the autopilot rung exists to remove. It decides through
-            # self.decide(), the same door the owner's tap goes through, so a
-            # decline is never a denial: the record simply stays pending.
-            decided, declined = await self._maybe_auto_approve(record)
-            if decided is not None:
-                return {"connector": connector_id, "tool": tool,
-                        "is_write": verdict.is_write, "auto_approved": True,
-                        "approval_id": decided.id, "status": decided.status,
-                        "signal_id": decided.signal_id,
-                        "decided_by": decided.decided_by,
-                        "result": decided.result, "error": decided.error,
-                        "message": "the mandate approved this order inside your "
-                                   "autopilot envelope; nothing to poll"}
-
+                                   signal_id=signal_id)
             return {"connector": connector_id, "tool": tool, "is_write": verdict.is_write,
                     "approval_required": True, "approval_id": record.id,
                     "status": record.status, "expires_at": record.expires_at,
-                    "auto_declined": declined,
                     "message": f"{verdict.reason}. Poll get_approval({record.id!r}) "
                                f"for the outcome."}
 

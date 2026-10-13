@@ -206,21 +206,13 @@ def test_an_unreadable_anchor_file_does_not_raise(tmp_path):
 
 class Client:
     def __init__(self, fail=False):
-        self.batches, self.outcomes, self.alerts, self.fail = [], [], [], fail
+        self.batches, self.alerts, self.fail = [], [], fail
 
     def report_fills(self, fills):
         if self.fail:
             raise RuntimeError("platform down")
         self.batches.append(fills)
         return {"ok": True}
-
-    def report_candidate_outcome(self, candidate_id, **payload):
-        self.outcomes.append((candidate_id, payload))
-        return {
-            "candidate_id": candidate_id,
-            "mechanical_status": payload["mechanical_status"],
-            "approval_id": payload["approval_id"],
-        }
 
     def agent_checkin(self, status, note, **payload):
         self.alerts.append((status, note, payload))
@@ -247,7 +239,7 @@ async def test_the_first_sweep_anchors_and_ships_nothing(tmp_path):
     assert client.batches == []
 
 
-async def test_fill_sweep_completes_exact_submitted_candidate_before_anchoring(
+async def test_fill_sweep_completes_exact_submitted_proposal_before_anchoring(
         tmp_path):
     state = _rh_only(tmp_path)
     state._write_private(state.intents_path, {
@@ -260,7 +252,7 @@ async def test_fill_sweep_completes_exact_submitted_candidate_before_anchoring(
                 "limit_price": "112.35", "stop_price": "109.50",
                 "time_in_force": "day",
             },
-            "args_hash": "frozen", "candidate_id": "candidate-1",
+            "args_hash": "frozen", "proposal_id": "proposal-1",
             "account": "463605220", "phase": "submitted",
             "broker_order_id": "ord-1",
             "approval": {
@@ -285,7 +277,7 @@ async def test_fill_sweep_completes_exact_submitted_candidate_before_anchoring(
     from nakagai_edge.edge.supervision import load
     assert intents(state) == {}
     assert load(state)["approval-1"]["state"] == "armed"
-    assert client.outcomes == []
+    assert client.alerts == []
 
 
 async def test_fill_sweep_queries_declared_terminal_states_for_submitted_order(
@@ -301,7 +293,7 @@ async def test_fill_sweep_queries_declared_terminal_states_for_submitted_order(
                 "limit_price": "112.35", "stop_price": "109.50",
                 "time_in_force": "day",
             },
-            "args_hash": "frozen", "candidate_id": "candidate-1",
+            "args_hash": "frozen", "proposal_id": "proposal-1",
             "account": "463605220", "phase": "submitted",
             "broker_order_id": "ord-1", "approval": {},
             "broker_result": {"data": {"order_id": "ord-1"}},
@@ -329,7 +321,7 @@ async def test_fill_sweep_queries_declared_terminal_states_for_submitted_order(
 
     from nakagai_edge.edge.remote import intents
     assert intents(state) == {}
-    assert client.outcomes == []
+    assert client.alerts == []
     queried = [args.get("state") for _connector, tool, args in hub.calls
                if tool == "get_equity_orders"]
     assert queried == ["filled", "cancelled"]

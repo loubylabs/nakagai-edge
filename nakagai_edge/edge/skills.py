@@ -15,7 +15,6 @@ from importlib import resources
 
 _PACKAGE = "nakagai_edge.skills"
 SKILL_NAMES = (
-    "candidate-trader",
     "check-the-evidence",
     "connect-edge",
     "daily-brief",

@@ -1,13 +1,12 @@
 """A stand-in for the platform's own MCP server, as the edge dials it.
 
-It advertises the same twenty-six tools `nakagai_platform/mcp_server.py`
-serves, with their real signatures, because promotion is DERIVED from those
-schemas: a fixture that simplified them would prove the promotion works on a
-shape the platform never sends. Nine of the names collide with the edge's own
-tools on purpose (agent_checkin, call_connector, get_approval,
-get_connector_status, list_connector_tools, list_peers, claim_message,
-send_message, request_peer, accept_candidate, abstain_candidate); that
-collision is the point of half the tests.
+It advertises twenty-five tools `nakagai_platform/mcp_server.py` serves, with
+their real signatures, because promotion is DERIVED from those schemas: a
+fixture that simplified them would prove the promotion works on a shape the
+platform never sends. Nine of the names collide with the edge's own tools on
+purpose (agent_checkin, call_connector, get_approval, get_connector_status,
+list_connector_tools, list_peers, claim_message, send_message, request_peer);
+that collision is the point of half the tests.
 
 Every tool answers with the arguments it received and records them in `calls`,
 so a test can assert what actually arrived rather than that something did. A
@@ -46,18 +45,6 @@ def agent_checkin(status: str, note: str = "",
 async def await_events(timeout_s: float = 50, cursor: int = 0) -> str:
     """Long-poll for owner messages and signals."""
     return _echo("await_events", locals())
-
-
-@mcp.tool()
-def accept_candidate(candidate_id: str, rationale: str) -> str:
-    """Platform candidate route that must lose to the bounded local tool."""
-    return _echo("accept_candidate", locals())
-
-
-@mcp.tool()
-def abstain_candidate(candidate_id: str, rationale: str) -> str:
-    """Platform candidate route that must lose to the bounded local tool."""
-    return _echo("abstain_candidate", locals())
 
 
 @mcp.tool()
@@ -105,22 +92,17 @@ def get_scan_health() -> str:
 
 
 @mcp.tool()
-def get_autoexecute_allowlist() -> str:
-    """Which plays may auto-execute."""
-    return _echo("get_autoexecute_allowlist", {})
-
-
-@mcp.tool()
 def get_account_watchlist() -> str:
     """The symbols this account is scanning."""
     return _echo("get_account_watchlist", {})
 
 
 @mcp.tool()
-def set_autoexecute_allowlist(reason: str, add: list[str] | None = None,
-                              drop: list[str] | None = None) -> str:
-    """Change which plays may auto-execute. A write."""
-    return _echo("set_autoexecute_allowlist", locals())
+def edit_account_watchlist(reason: str, add: list[str] | None = None,
+                           drop: list[str] | None = None,
+                           notes: dict[str, str] | None = None) -> str:
+    """Edit the symbols this account researches. A write."""
+    return _echo("edit_account_watchlist", locals())
 
 
 @mcp.tool()

@@ -8,7 +8,6 @@ from nakagai_edge.approvals import ApprovalQueue, BaseApprovalQueue
 
 
 RECORD_METHODS = (
-    "decision_lock",
     "enqueue",
     "get",
     "list",
@@ -45,6 +44,16 @@ def test_every_record_method_requires_leading_account_key() -> None:
         assert "workspace" not in inspect.signature(method).parameters, method_name
 
 
+def test_no_queue_offers_an_unattended_lock() -> None:
+    """Only the owner decides, one record at a time through the claim CAS;
+    no queue offers a lock for deciding on the owner's behalf."""
+    from nakagai_edge.approvals import PgApprovalQueue
+
+    for queue in (BaseApprovalQueue, ApprovalQueue, PgApprovalQueue):
+        assert not [name for name in dir(queue) if "lock" in name.lower()
+                    and not name.startswith("_")], queue.__name__
+
+
 @pytest.mark.parametrize(
     ("method_name", "args", "kwargs"),
     [
@@ -79,13 +88,18 @@ def test_new_file_records_require_nonempty_account_key(tmp_path, account_key: st
         queue.enqueue(account_key, "broker", "place_order", {}, ttl_s=60)
 
 
-def test_candidate_id_survives_file_approval_persistence(tmp_path) -> None:
+def test_file_journal_replays_a_record_carrying_a_retired_field(tmp_path) -> None:
+    """A journal written before a field was retired still replays: only the
+    record's declared fields are read back."""
+    import json
+
     path = tmp_path / "approvals.jsonl"
-    queue = ApprovalQueue(path)
-    created = queue.enqueue("account-a", "broker", "place_order", {"qty": 1},
-                            ttl_s=60, candidate_id="candidate-1")
+    created = ApprovalQueue(path).enqueue(
+        "account-a", "broker", "place_order", {"qty": 1}, ttl_s=60)
+    line = {**created.to_dict(), "retired_field": "anything"}
+    path.write_text(json.dumps(line) + "\n")
 
     loaded = ApprovalQueue(path).get("account-a", created.id)
 
     assert loaded is not None
-    assert loaded.candidate_id == "candidate-1"
+    assert loaded.to_dict() == created.to_dict()

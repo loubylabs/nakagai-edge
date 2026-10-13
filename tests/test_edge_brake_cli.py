@@ -5,8 +5,6 @@ import json
 
 from nakagai_edge.cli import main
 from nakagai_edge.edge.brake import armed
-from nakagai_edge.edge.candidate import (
-    candidate_entries_armed, disarm_candidate_entries)
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.supervision import record
 
@@ -25,22 +23,6 @@ def test_brake_on_re_arms(tmp_path, monkeypatch):
     assert armed(EdgeState(tmp_path)) is True
 
 
-def test_brake_status_and_on_expose_and_clear_candidate_entry_disarm(
-        tmp_path, monkeypatch, capsys):
-    monkeypatch.setenv("NAKAGAI_EDGE_ROOT", str(tmp_path))
-    state = EdgeState(tmp_path)
-    disarm_candidate_entries(
-        state, candidate_id="candidate-1", approval_id="approval-1",
-        reason="supervision could not be verified")
-
-    assert main(["brake", "status"]) == 0
-    status = json.loads(capsys.readouterr().out)
-    assert status["candidate_entries_armed"] is False
-
-    assert main(["brake", "on"]) == 0
-    assert candidate_entries_armed(state) is True
-
-
 def test_brake_off_for_one_position_leaves_the_rest_armed(tmp_path, monkeypatch):
     monkeypatch.setenv("NAKAGAI_EDGE_ROOT", str(tmp_path))
     assert main(["brake", "off", "--position", "ap_1"]) == 0
@@ -51,6 +33,7 @@ def test_brake_status_prints_json(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("NAKAGAI_EDGE_ROOT", str(tmp_path))
     assert main(["brake", "status"]) == 0
     out = json.loads(capsys.readouterr().out)
+    assert set(out) == {"armed", "disarmed_positions", "ledger_fault", "positions"}
     assert out["armed"] is True
     assert out["positions"] == []
 

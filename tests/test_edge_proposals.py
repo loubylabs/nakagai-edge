@@ -64,11 +64,11 @@ def _bundle():
 
 def _item(approval_id="a1", *, args=ARGS, canonical=CANONICAL, agent_id="ag1",
           expires_in=900, proposal_id=PROPOSAL, signed_proposal_id=None,
-          candidate_id="", priv=PRIV, **overrides):
+          priv=PRIV, **overrides):
     payload = build_payload(
         approval_id=approval_id, agent_id=agent_id, connector_id="demo",
         tool=TOOL, args=args, account_arg_names=["account_number"],
-        ttl_s=expires_in, candidate_id=candidate_id,
+        ttl_s=expires_in,
         proposal_id=proposal_id if signed_proposal_id is None else signed_proposal_id)
     item = {
         "approval_id": approval_id, "proposal_id": proposal_id,
@@ -156,7 +156,8 @@ def test_payload_always_carries_proposal_id():
     p = build_payload(approval_id="a", agent_id="g", connector_id="c", tool="t",
                       args={"x": 1}, account_arg_names=[], ttl_s=60, now=0.0)
     assert p["proposal_id"] == ""
-    assert p["candidate_id"] == ""
+    assert set(p) == {"approval_id", "agent_id", "connector_id", "tool",
+                      "args_hash", "account", "expires_at", "proposal_id"}
     p = build_payload(approval_id="a", agent_id="g", connector_id="c", tool="t",
                       args={"x": 1}, account_arg_names=[], ttl_s=60, now=0.0,
                       proposal_id="f" * 32)
@@ -170,7 +171,6 @@ def test_adopt_writes_intent_for_a_valid_grant(tmp_path):
 
     intent = intents(state)["a1"]
     assert intent["proposal_id"] == PROPOSAL
-    assert intent["candidate_id"] == ""
     assert intent["signal_id"] == ""
     assert intent["connector_id"] == "demo"
     assert intent["tool"] == TOOL
@@ -269,11 +269,22 @@ def test_adopt_refuses_a_signed_proposal_id_mismatch(tmp_path):
     assert "proposal_id mismatch" in _refused(state, platform)
 
 
-def test_adopt_refuses_a_grant_naming_a_candidate(tmp_path):
-    state, client, platform, audit = _setup(
-        tmp_path, [_item(candidate_id="candidate-1")])
-    assert adopt_granted_proposals(state, client, audit) == 0
-    assert "cannot name a candidate" in _refused(state, platform)
+def test_adopt_accepts_a_grant_whose_signer_adds_a_retired_empty_key(tmp_path):
+    """A platform signing one more empty binding key than this edge builds (as
+    the platform did before a binding was retired) still verifies and adopts:
+    the signature covers every signed key, and no check demands or rejects
+    one the edge does not bind."""
+    payload = build_payload(
+        approval_id="a1", agent_id="ag1", connector_id="demo", tool=TOOL,
+        args=ARGS, account_arg_names=["account_number"], ttl_s=900,
+        proposal_id=PROPOSAL)
+    item = _item(artifact=sign_artifact(PRIV, {**payload, "retired_binding": ""}),
+                 expires_at=payload["expires_at"])
+    state, client, platform, audit = _setup(tmp_path, [item])
+
+    assert adopt_granted_proposals(state, client, audit) == 1
+    assert intents(state)["a1"]["proposal_id"] == PROPOSAL
+    assert platform.reports == []
 
 
 def test_adopt_refuses_an_extra_or_missing_field(tmp_path):

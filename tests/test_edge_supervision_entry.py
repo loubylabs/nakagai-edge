@@ -23,7 +23,7 @@ PLACE_ORDER = Capability(
         "symbol", "side", "order_type", "quantity", "limit_price",
         "stop_price", "time_in_force", "account")},
     # What the broker says BACK. `fill_price` is what the entry price is read
-    # from; it used to be guessed from a list of candidate key names compiled
+    # from; it used to be guessed from a list of possible key names compiled
     # into executor.py, which is the leak the capability layer exists to stop.
     fields={"order_id": ["order_id"], "fill_price": ["average_price"]},
     values={"side": {"buy": ["buy", "buy_to_open", "buy_to_cover"],

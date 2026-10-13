@@ -17,7 +17,6 @@ from nakagai_edge.approvals import (
 
 
 PG_RECORD_METHODS = (
-    "decision_lock",
     "enqueue",
     "get",
     "list",
@@ -38,8 +37,7 @@ PG_RECORD_METHODS = (
 )
 
 
-def pg_row(*, account_key: str = "account-a", status: str = "pending",
-           candidate_id="candidate-1") -> tuple:
+def pg_row(*, account_key: str = "account-a", status: str = "pending") -> tuple:
     now = datetime.now(UTC)
     values = {
         "id": "approval-a",
@@ -64,7 +62,6 @@ def pg_row(*, account_key: str = "account-a", status: str = "pending",
         "notional": 100.0,
         "rationale": None,
         "cleared_at": None,
-        "candidate_id": candidate_id,
     }
     return tuple(values[column] for column in PgApprovalQueue.COLUMNS)
 
@@ -95,8 +92,6 @@ class RecordingConnection:
         normalized = " ".join(sql.split()).lower()
         params = tuple(params)
         self.statements.append((normalized, params))
-        if "pg_try_advisory_xact_lock" in normalized:
-            return Result((True,))
         if "select count(*)" in normalized:
             return Result((0,))
         if "select status, decided_by" in normalized:
@@ -198,19 +193,6 @@ def test_pg_every_record_query_carries_account_predicate(operation) -> None:
     assert_account_scoped(database)
 
 
-def test_pg_decision_locks_are_distinct_per_account() -> None:
-    database = RecordingDatabase()
-    queue = PgApprovalQueue(database)
-
-    with queue.decision_lock("account-a"):
-        pass
-    with queue.decision_lock("account-b"):
-        pass
-
-    locks = [entry for entry in database.statements if "pg_try_advisory_xact_lock" in entry[0]]
-    assert [params[-1] for _, params in locks] == ["account-a", "account-b"]
-
-
 def test_pg_admission_counts_inside_the_account_transaction() -> None:
     database = RecordingDatabase()
     queue = PgApprovalQueue(database)
@@ -229,24 +211,30 @@ def test_pg_admission_counts_inside_the_account_transaction() -> None:
     assert_account_scoped(database)
 
 
-def test_pg_candidate_id_round_trips_through_insert_and_row_mapping() -> None:
+def test_pg_columns_are_exactly_the_approval_record() -> None:
+    record = ("connector_id", "tool", "args", "status", "requested_by",
+              "created_at", "expires_at", "decided_at", "decided_by", "reason",
+              "result", "error", "outcome_unknown", "agent_id", "artifact",
+              "signal_id", "signal", "notional", "rationale", "cleared_at")
+
+    assert PgApprovalQueue.COLUMNS == ("id", "account_key", *record)
+    assert PgApprovalQueue.DB_COLUMNS == ("id", "workspace_id", *record)
+    assert PgApprovalQueue.COLUMNS == Approval._FIELDS
+
+
+def test_pg_insert_names_only_the_declared_columns() -> None:
     database = RecordingDatabase()
     queue = PgApprovalQueue(database)
 
-    created = queue.enqueue("account-a", "broker", "place_order", {"symbol": "SPY"},
-                            ttl_s=60, candidate_id="candidate-1")
+    queue.enqueue("account-a", "broker", "place_order", {"symbol": "SPY"}, ttl_s=60)
 
-    insert = next((sql, params) for sql, params in database.statements
+    insert = next(sql for sql, _ in database.statements
                   if sql.startswith("insert into approvals"))
-    assert "candidate_id" in insert[0]
-    assert "candidate-1" in insert[1]
-    assert created.candidate_id == "candidate-1"
-
-
-def test_pg_absent_candidate_id_maps_to_the_declared_empty_string() -> None:
-    approval = PgApprovalQueue._row(pg_row(candidate_id=None))
-
-    assert approval.candidate_id == ""
+    named = insert.split("(", 1)[1].split(")", 1)[0]
+    assert [column.strip() for column in named.split(",")] == [
+        "id", "workspace_id", "connector_id", "tool", "args", "status",
+        "requested_by", "expires_at", "agent_id", "signal_id", "signal",
+        "notional"]
 
 
 @pytest.mark.parametrize(

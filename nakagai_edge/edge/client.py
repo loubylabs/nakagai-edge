@@ -1,6 +1,5 @@
 """Sync httpx client for the platform's /api/agent/* contract. Sync on purpose:
-enqueue is called from inside the hub's guardrail path (a sync method), and
-every other call sits in its own background thread/loop."""
+every call sits in its own background thread/loop or is pushed to one."""
 
 import hashlib
 import json
@@ -12,9 +11,6 @@ from nakagai_edge.identity import package_version
 
 CHAT_PROTOCOL_VERSION = "2"
 CHAT_PROTOCOL_HEADER = "X-Nakagai-Chat-Protocol"
-CANDIDATE_PROTOCOL_VERSION = "1"
-CANDIDATE_PROTOCOL_HEADER = "X-Nakagai-Candidate-Protocol"
-CANDIDATE_WAKE_HEADER = "X-Nakagai-Candidate-Wake"
 PROPOSAL_PROTOCOL_VERSION = "1"
 PROPOSAL_PROTOCOL_HEADER = "X-Nakagai-Proposal-Protocol"
 
@@ -65,19 +61,6 @@ def _detail(resp: httpx.Response) -> str:
         return resp.text
 
 
-def _candidate_decision_body(rationale: str, memory_ids: list[str] | None) -> dict:
-    """The accept/abstain request body.
-
-    `memory_ids` is omitted from the body entirely when empty, so an edge
-    talking to a platform that predates the field sends the exact same wire
-    request it always has. Only a non-empty list changes what goes out.
-    """
-    body: dict[str, object] = {"rationale": rationale}
-    if memory_ids:
-        body["memory_ids"] = list(memory_ids)
-    return body
-
-
 def pair(platform_url: str, code: str, *, transport=None) -> dict:
     with httpx.Client(base_url=platform_url.rstrip("/"), timeout=15.0,
                       transport=transport) as c:
@@ -89,7 +72,7 @@ def pair(platform_url: str, code: str, *, transport=None) -> dict:
 
 class PlatformClient:
     def __init__(self, platform_url: str, token: str, timeout: float = 15.0,
-                 *, candidate_wake: bool = False, transport=None) -> None:
+                 *, transport=None) -> None:
         self._client = httpx.Client(
             base_url=platform_url.rstrip("/"), timeout=timeout, transport=transport,
             # The version rides on every request rather than on one dedicated
@@ -109,7 +92,6 @@ class PlatformClient:
         # memory on purpose: a restart re-sends once, which costs one payload
         # and cannot disagree with the platform the way a cache file could.
         self._reported_tools: dict[str, str] = {}
-        self._candidate_wake = bool(candidate_wake)
 
     def close(self) -> None:
         self._client.close()
@@ -139,16 +121,6 @@ class PlatformClient:
             return etag, None
         body = self._check(resp)
         return resp.headers.get("etag", body.get("bundle_version", "")), body
-
-    def enqueue_approval(self, connector_id: str, tool: str, args: dict,
-                         signal_id: str = "", candidate_id: str = "") -> dict:
-        # signal_id is what the platform resolves to a frozen signal + notional
-        # and checks against the autopilot envelope: an order citing a signal
-        # Nakagai emitted, inside the owner's caps, comes back `granted` (signed)
-        # for the edge to execute. The platform decides; the edge never does.
-        return self._check(self._client.post("/api/agent/approvals", json={
-            "connector_id": connector_id, "tool": tool, "args": args,
-            "signal_id": signal_id, "candidate_id": candidate_id}))
 
     def granted_proposals(self) -> list[dict]:
         # Owner-granted orders an outside agent proposed, for THIS edge to
@@ -187,8 +159,8 @@ class PlatformClient:
         # POST /api/agent/checkin (see nakagai/api/agent_routes.py), which
         # runs the exact same body a direct MCP agent's agent_checkin tool
         # does (nakagai.mandate.record_checkin). This is the edge's only
-        # route to the autopilot daily-loss breaker's equity figure - the
-        # platform holds no broker credentials to read it itself.
+        # route to report account equity - the platform holds no broker
+        # credentials to read it itself.
         return self._chat_result(self._client.post(
             "/api/agent/checkin", headers=self._chat_headers(), json={
                 "status": status, "note": note, "account_equity": account_equity,
@@ -198,40 +170,10 @@ class PlatformClient:
         # The one PlatformClient call whose response is SUPPOSED to take up
         # to the hold cap: give httpx a read timeout past it, or every quiet
         # hold would surface as a transport error.
-        headers = {**self._chat_headers(),
-                   CANDIDATE_PROTOCOL_HEADER: CANDIDATE_PROTOCOL_VERSION}
-        if self._candidate_wake:
-            headers[CANDIDATE_WAKE_HEADER] = "1"
         return self._chat_result(self._client.get(
             "/api/agent/events", params={"after": after, "timeout_s": timeout_s},
-            headers=headers,
+            headers=self._chat_headers(),
             timeout=httpx.Timeout(15.0, read=float(timeout_s) + 10.0)))
-
-    def accept_candidate(self, candidate_id: str, rationale: str,
-                         memory_ids: list[str] | None = None) -> dict:
-        return self._check(self._client.post(
-            f"/api/agent/candidates/{candidate_id}/accept",
-            json=_candidate_decision_body(rationale, memory_ids)))
-
-    def abstain_candidate(self, candidate_id: str, rationale: str,
-                          memory_ids: list[str] | None = None) -> dict:
-        return self._check(self._client.post(
-            f"/api/agent/candidates/{candidate_id}/abstain",
-            json=_candidate_decision_body(rationale, memory_ids)))
-
-    def report_candidate_outcome(
-            self, candidate_id: str, *, mechanical_status: str,
-            mechanical_reason: str, approval_id: str = "", urgent: bool = False,
-            outcome_unknown: bool = False) -> dict:
-        return self._check(self._client.post(
-            f"/api/agent/candidates/{candidate_id}/outcome",
-            json={
-                "mechanical_status": mechanical_status,
-                "mechanical_reason": mechanical_reason,
-                "approval_id": approval_id,
-                "urgent": urgent,
-                "outcome_unknown": outcome_unknown,
-            }))
 
     def list_peers(self) -> dict:
         return self._chat_result(self._client.get(

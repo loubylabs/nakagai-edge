@@ -157,10 +157,10 @@ def find_running(state: EdgeState) -> tuple[RunningEdge | None, str]:
     # coast clear, because the common case for a missing pidfile is a daemon
     # started before this file existed, and it is almost always on
     # DEFAULT_PORT.
-    for candidate in (port, DEFAULT_PORT):
-        if candidate and port_listening(candidate):
+    for probe in (port, DEFAULT_PORT):
+        if probe and port_listening(probe):
             return None, (
-                f"something is serving 127.0.0.1:{candidate}, and there is no "
+                f"something is serving 127.0.0.1:{probe}, and there is no "
                 f"pidfile naming it, so this edge cannot prove that process is "
                 f"its own. A daemon started before this version predates the "
                 f"pidfile: stop it by hand, then `nakagai-edge run`.")
