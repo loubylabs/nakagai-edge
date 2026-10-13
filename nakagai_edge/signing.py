@@ -2,11 +2,10 @@
 
 The platform signs {approval_id, agent_id, connector_id, tool, args_hash,
 account, proposal_id, expires_at} when the owner grants an order an outside
-agent proposed. The signature covers every key the platform signed, so a
-key added or dropped by the signer still verifies, and nothing here requires
-a key beyond the bindings the edge checks. The edge verifies the signature
-and those bindings against the intent it holds before anything reaches a
-broker. An approval for order A can never
+agent proposed. The signature covers every key the platform signed. A key
+the edge does not bind is ignored; dropping a bound key (args_hash, say)
+fails the binding checks. The edge verifies the signature and those bindings
+against the intent it holds before anything reaches a broker. An approval for order A can never
 authorize order B, and a forged or expired artifact executes nothing.
 
 Keys are raw Ed25519, urlsafe-base64. The private seed lives only in the

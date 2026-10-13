@@ -114,7 +114,7 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         return None if policy_fresh(state, POLICY_TTL_S) else freshness_error()
 
     async def _guarded(connector_id: str, tool: str, args: dict, *,
-                       signal_id: str = "", capability: str = "") -> dict:
+                       capability: str = "") -> dict:
         """The one door every connector call goes through, semantic or raw.
 
         `capability` is the name the semantic tools came in under. It is
@@ -134,10 +134,8 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
             out = await hub.call(
                 connector_id, tool, args,
                 account_key=hub.account_key,
-                signal_id=signal_id,
             )
-            kind = "call" if not out.get("approval_required") else "intent"
-            audit.record(kind, connector_id, tool,
+            audit.record("call", connector_id, tool,
                          {"is_write": out.get("is_write"), **origin})
             return out
         except GuardrailDenied as e:
@@ -212,7 +210,6 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
     async def _capability_call(capability: str, connector_id: str = "",
                                args: dict | None = None, *,
                                required: tuple[str, ...] = (),
-                               signal_id: str = "",
                                internal: bool = False) -> dict:
         """One semantic call: pick the connector, resolve, dial, read back.
 
@@ -291,8 +288,7 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
                 audit.record("denial", cid, "",
                              {"reason": str(e), "capability": capability})
             return {"is_error": True, "error": str(e), "capability": capability}
-        out = await _guarded(cid, tool, broker_args, signal_id=signal_id,
-                             capability=capability)
+        out = await _guarded(cid, tool, broker_args, capability=capability)
         # Provenance first, the call's own answer second: an envelope always
         # wins its own fields, and provenance only fills what an error payload
         # left blank.
