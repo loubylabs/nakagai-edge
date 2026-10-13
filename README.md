@@ -5,7 +5,9 @@ the only place a broker credential is ever written to disk. Your agent talks to
 exactly one MCP endpoint, the edge, and never sees a token. The platform never
 sees one either.
 
-Version 0.6.0 is the current release. It speaks proposal protocol 1: when an
+Version 0.7.0 is the current release. Autopilot and execution candidates are
+removed: orders reach a broker only as owner-approved order proposals. It
+speaks proposal protocol 1: when an
 outside agent proposes an order on the platform and the owner approves it, the
 edge picks up the signed grant, verifies the signature, re-derives the order
 through its own `place_order` map, sole broker and sole allowed account, and
