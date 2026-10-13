@@ -34,20 +34,19 @@ def test_version_prints_and_exits_without_a_subcommand():
     assert package_version() in r.stdout
 
 
-@pytest.mark.parametrize(("wake_command", "expected", "runner_command"), [
-    ("agent run", True, ("agent", "run")),
-    ("", False, None),
-    ("   ", False, None),
-    ("\t  ", False, None),
-    ("''", False, None),
-    ('""', False, None),
-    ("'   '", False, None),
-    ('"\t"', False, None),
+@pytest.mark.parametrize(("wake_command", "runner_command"), [
+    ("agent run", ("agent", "run")),
+    ("", None),
+    ("   ", None),
+    ("\t  ", None),
+    ("''", None),
+    ('""', None),
+    ("'   '", None),
+    ('"\t"', None),
 ])
-def test_listen_configures_candidate_wake_attestation_from_parsed_command(
-        tmp_path, monkeypatch, wake_command, expected, runner_command):
+def test_listen_starts_a_wake_runner_only_for_a_parsed_command(
+        tmp_path, monkeypatch, wake_command, runner_command):
     monkeypatch.setenv("NAKAGAI_EDGE_ROOT", str(tmp_path))
-    configured = []
     runner_commands = []
 
     class Client:
@@ -62,17 +61,13 @@ def test_listen_configures_candidate_wake_attestation_from_parsed_command(
             return 0
 
     class Runner:
-        def __init__(self, command, state, **kwargs):
+        def __init__(self, command, **kwargs):
             runner_commands.append(tuple(command))
 
         def close(self):
             pass
 
-    def edge_client(state, *, candidate_wake=False):
-        configured.append(candidate_wake)
-        return Client()
-
-    monkeypatch.setattr("nakagai_edge.cli._edge_client", edge_client)
+    monkeypatch.setattr("nakagai_edge.cli._edge_client", lambda state: Client())
     monkeypatch.setattr("nakagai_edge.edge.listen.ChannelListener", Listener)
     monkeypatch.setattr("nakagai_edge.edge.wake.WakeRunner", Runner)
 
@@ -80,7 +75,6 @@ def test_listen_configures_candidate_wake_attestation_from_parsed_command(
     if wake_command:
         args.extend(["--wake-command", wake_command])
     assert main(args) == 0
-    assert configured == [expected]
     assert runner_commands == ([] if runner_command is None else [runner_command])
 
 

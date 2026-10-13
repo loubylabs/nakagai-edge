@@ -7,9 +7,6 @@
     cache/intents.json  write intents awaiting a grant or an exact broker fill
     cache/supervised.json    positions the brake watches, and their warrants
     cache/brake-off.json     local disarm; its presence never needs the network
-    cache/candidate-wake.json    bounded listener-owned candidate write scope
-    cache/candidate-outcomes.json    mechanical outcomes awaiting platform ack
-    cache/candidate-entries-off.json    persistent local entry disarm
     cache/proposals-adopted.json    approval and proposal ids adopted from
                         granted proposals, so one proposal becomes at most one
                         local intent
@@ -58,18 +55,6 @@ class EdgeState:
     @property
     def brake_off_path(self) -> Path:
         return self.root / "cache" / "brake-off.json"
-
-    @property
-    def candidate_wake_path(self) -> Path:
-        return self.root / "cache" / "candidate-wake.json"
-
-    @property
-    def candidate_outcomes_path(self) -> Path:
-        return self.root / "cache" / "candidate-outcomes.json"
-
-    @property
-    def candidate_entries_off_path(self) -> Path:
-        return self.root / "cache" / "candidate-entries-off.json"
 
     @property
     def proposals_adopted_path(self) -> Path:

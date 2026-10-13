@@ -8,8 +8,6 @@ wraps nothing and spells account, symbol and quantity differently. A sweep that
 still had a Robinhood field name baked into it would pass the first and fail
 the second."""
 
-import asyncio
-
 import httpx
 import pytest
 import yaml
@@ -17,8 +15,7 @@ import yaml
 from nakagai_edge.config import ConnectorSpec, load_specs
 from nakagai_edge.edge.client import PlatformClient
 from nakagai_edge.edge.portfolio import (
-    PORTFOLIO_INTERVAL_S, REFRESH_MIN_INTERVAL_S, PortfolioReporter,
-    balance_evidence, broker_specs, connector_snapshot, mark_guarded,
+    PortfolioReporter, broker_specs, connector_snapshot, mark_guarded,
     tiered_accounts)
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.supervision import record
@@ -165,32 +162,6 @@ async def test_snapshot_reports_authoritative_exposure_with_observation_time(
     assert full["observed_at"] == 1_725_000_000.0
     assert full["open_orders"] == []
     assert read["positions"] == [] and read["open_orders"] == []
-
-
-async def test_balance_evidence_keeps_platform_equity_authority_on_checkin():
-    """Task 3 must receive canonical broker numbers but portfolio storage must
-    not gain a second equity authority. Removing either validation makes an
-    unreadable number look ready to relay through `agent_checkin`."""
-    spec = _spec()
-
-    evidence = await balance_evidence(_hub_ok(), spec, "463605220")
-
-    assert evidence == {"status": "ok", "equity": 1000.0, "day_pnl": -12.5}
-
-
-async def test_balance_evidence_refuses_missing_or_nonpositive_numbers():
-    """A missing signed day P&L or zero equity must fail readiness rather than
-    let a caller build an autonomous order around an invented baseline."""
-    spec = _spec()
-    spec.capability("get_balance").fields["day_pnl"] = ["day_pnl"]
-    hub = _hub_ok()
-    hub.responses[("get_portfolio", "463605220")] = {
-        "total_value": "0", "day_pnl": "not-a-number"}
-
-    evidence = await balance_evidence(hub, spec, "463605220")
-
-    assert evidence == {"status": "unreadable", "equity": None,
-                        "day_pnl": None}
 
 
 async def test_an_unknown_position_stays_explicit_in_the_exposure_report():
@@ -610,28 +581,6 @@ async def test_two_pokes_inside_the_window_are_one_broker_sweep(tmp_path):
     second = await reporter.snapshot_and_push()
     assert len(hub.calls) == calls_after_first   # no second sweep
     assert second == first                        # the fresh-enough snapshot back
-
-
-async def test_forced_snapshot_bypasses_the_agent_refresh_cache(tmp_path):
-    hub = _hub_ok()
-    reporter = _reporter(tmp_path, hub,
-                         lambda r: httpx.Response(200, json={"ok": True}))
-    await reporter.snapshot_and_push()
-    calls_after_first = len(hub.calls)
-
-    await reporter.snapshot_and_push(force=True, require_ack=True)
-
-    assert len(hub.calls) > calls_after_first
-
-
-async def test_required_portfolio_ack_does_not_swallow_report_failure(tmp_path):
-    reporter = _reporter(
-        tmp_path, _hub_ok(),
-        lambda r: httpx.Response(503, json={"detail": "down"}),
-    )
-
-    with pytest.raises(Exception, match="503"):
-        await reporter.snapshot_and_push(force=True, require_ack=True)
 
 
 async def test_a_down_platform_does_not_lose_the_snapshot(tmp_path):

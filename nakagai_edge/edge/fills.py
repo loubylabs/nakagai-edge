@@ -1,5 +1,5 @@
 """The fill journal: what the broker's order history says, recorded locally,
-reconciled against submitted candidates, and shipped to the platform.
+reconciled against submitted entries, and shipped to the platform.
 
 This is the one path that declares an order filled. A submitted entry must
 match its exact broker order id here before supervision starts. An order id no

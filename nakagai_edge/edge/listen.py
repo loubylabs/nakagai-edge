@@ -141,10 +141,6 @@ RENDERERS = {
     # (_envelope's own fields win), and the detector name would vanish.
     "market_event": _named("symbol", "detector", "bar_ts", "timeframe",
                            "magnitude"),
-    "execution_candidate": _named(
-        "candidate_id", "signal_id", "symbol", "direction", "timeframe",
-        "play_title", "entry", "stop", "reward_to_risk", "corroboration",
-        "score", "created_at", "expires_at"),
     # This account's watchlist folded across a week: which tickers have a
     # multi-day shape. Every value in it is platform-computed, a ticker from
     # the security master, a shape from a closed vocabulary, or an integer, so

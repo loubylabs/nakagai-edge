@@ -141,7 +141,7 @@ def test_a_live_port_with_no_pidfile_refuses(state, monkeypatch):
     older than the pidfile. Refusing beats signalling a pid we cannot prove.
 
     DEFAULT_PORT is monkeypatched to this test's own listener rather than
-    left at the real 8330: the fallback candidate has to be something this
+    left at the real 8330: the fallback port has to be something this
     test controls, not whatever a real edge on the host happens to occupy.
     """
     sock, port = _listener()

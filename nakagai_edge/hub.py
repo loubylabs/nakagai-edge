@@ -420,9 +420,7 @@ class ConnectorHub:
 
     async def call(self, connector_id: str, tool: str, args: dict, *,
                    account_key: str, requested_by: str = "",
-                   approved: bool = False, signal_id: str = "",
-                   candidate_id: str = "", intent_account: str = "",
-                   require_approval: bool = False) -> dict:
+                   approved: bool = False, signal_id: str = "") -> dict:
         """Proxy one downstream tool call, after the guardrails clear it.
 
         `approved=True` is the post-human-decision path: the guardrails run again
@@ -448,24 +446,8 @@ class ConnectorHub:
                                  f"(has: {known})")
 
         verdict = evaluate(spec, tool, args, read_only_hint=self._hint_for(conn, tool))
-        if verdict.is_write:
-            from nakagai_edge.edge.candidate import CandidateWakeScope
-            from nakagai_edge.edge.state import EdgeState
-            active_candidate = CandidateWakeScope(EdgeState(self.root)).current()
-            if (active_candidate is not None
-                    and not approved
-                    and not (
-                        candidate_id == active_candidate["candidate_id"]
-                        and require_approval)):
-                raise GuardrailDenied(
-                    "execution candidate wake permits read-only inspection; "
-                    "this write is denied until the candidate wake ends")
         if verdict.decision == "deny":
             raise GuardrailDenied(verdict.reason)
-        if require_approval and verdict.decision != "approve":
-            raise GuardrailDenied(
-                "candidate orders require this exact connector tool to use the "
-                "existing approval policy")
         if verdict.decision == "approve" and not approved:
             queue = self.approvals
             if queue is None:
@@ -473,19 +455,11 @@ class ConnectorHub:
                     f"{verdict.reason}; no approval queue is configured. "
                     f"Remove this tool from approvals.require_for to allow it")
             signal, notional = self.provenance(spec, args, signal_id)
-            found_account = next(
-                (str(args[name]) for name in spec.guardrails.accounts.arg_names
-                 if args.get(name)), "")
-            if intent_account and found_account != intent_account:
-                raise GuardrailDenied(
-                    "prepared candidate account does not match the guarded "
-                    "connector arguments")
             record = queue.enqueue(account_key, connector_id, tool, args,
                                    ttl_s=spec.guardrails.approvals.ttl_s,
                                    requested_by=requested_by,
                                    signal_id=signal_id, signal=signal,
-                                   notional=notional, candidate_id=candidate_id,
-                                   intent_account=found_account)
+                                   notional=notional)
             return {"connector": connector_id, "tool": tool, "is_write": verdict.is_write,
                     "approval_required": True, "approval_id": record.id,
                     "status": record.status, "expires_at": record.expires_at,

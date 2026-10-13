@@ -185,9 +185,9 @@ def _reading(row: dict) -> tuple[str, float | None]:
     `symbol` and `quantity` are read straight off the row and nothing else is
     consulted, because portfolio._positions has already written the canonical
     pair over whatever the broker spelled them. This module used to walk a list
-    of candidate key names; a map that says where a field lives beats a reader
+    of guessed key names; a map that says where a field lives beats a reader
     guessing at it, and the guess quietly read the wrong field for any broker
-    whose own spelling happened to collide with a candidate.
+    whose own spelling happened to collide with a guess.
 
     A `quantity` that is not a real number is None, which is this module's word
     for unreadable and never for zero. Three shapes land here, and all three

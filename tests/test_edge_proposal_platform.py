@@ -75,9 +75,9 @@ def world(tmp_path, monkeypatch):
     from nakagai_platform.api.connectors import ConnectorStore
     from nakagai_platform.api.db import Database
     from nakagai_platform.api.tenancy import resolve_workspace_for_email
-    from nakagai_platform.candidate_approval import CandidateApprovalQueue
     from nakagai_platform.gateway.hub import PlatformHub
     from nakagai_platform.mandate_store import MandateStore
+    from nakagai_platform.order_proposals.approvals import ProposalApprovalQueue
     from nakagai_platform.order_proposals.models import Proposer
     from nakagai_platform.universe import master
     from nakagai_platform.universe.base import SecurityRecord
@@ -174,7 +174,7 @@ def world(tmp_path, monkeypatch):
     spec = sync("v1")
     broker = Broker(spec)
     broker.account_key = agent_id
-    hub = PlatformHub(plat, database, CandidateApprovalQueue(database))
+    hub = PlatformHub(plat, database, ProposalApprovalQueue(database))
     try:
         yield {
             "database": database, "root": plat, "hub": hub, "email": email,

@@ -534,7 +534,7 @@ class Brake:
         #
         # Indexing cap.args directly is safe here: exit_order_args returned a
         # payload, which it only does once all five order fields are declared.
-        # The account stays a LIST of candidates, because arg_names genuinely
+        # The account stays a LIST of possible names, because arg_names genuinely
         # is one and check_accounts hunts the same way.
         sent = {
             "connector_id": rec["connector_id"],

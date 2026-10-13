@@ -46,15 +46,13 @@ def _cmd_pair(args) -> int:
     return 0
 
 
-def _edge_client(state, *, candidate_wake: bool = False):
+def _edge_client(state):
     """The paired platform client, or None when this edge has never paired."""
     from nakagai_edge.edge.client import PlatformClient
     agent = state.agent()
     if agent is None:
         return None
-    return PlatformClient(
-        agent["platform_url"], agent["token"], candidate_wake=candidate_wake,
-    )
+    return PlatformClient(agent["platform_url"], agent["token"])
 
 
 def _sync_step(state) -> int:
@@ -476,7 +474,7 @@ def _cmd_listen(args) -> int:
     wake_command = (parsed_wake_command
                     if parsed_wake_command and parsed_wake_command[0].strip()
                     else [])
-    client = _edge_client(state, candidate_wake=bool(wake_command))
+    client = _edge_client(state)
     if client is None:
         print(_json.dumps({"ok": False, "error": "edge is not paired: run "
                                                  "`nakagai-edge setup <code> "
@@ -490,7 +488,7 @@ def _cmd_listen(args) -> int:
             return 1
         wake = None
         try:
-            wake = (WakeRunner(wake_command, state, note=_stderr_note)
+            wake = (WakeRunner(wake_command, note=_stderr_note)
                     if wake_command else None)
 
             def emit(msg):
@@ -517,8 +515,6 @@ def _cmd_brake(args) -> int:
     from nakagai_edge.edge.brake import (
         armed, clear_local_disarm, disarmed_positions, set_local_disarm,
     )
-    from nakagai_edge.edge.candidate import (
-        candidate_entries_armed, rearm_candidate_entries)
     from nakagai_edge.edge.supervision import ledger_fault, open_risk
 
     state = EdgeState(default_root())
@@ -527,7 +523,6 @@ def _cmd_brake(args) -> int:
                          position_id=args.position or "")
     elif args.action == "on":
         clear_local_disarm(state)
-        rearm_candidate_entries(state)
     is_armed, off = armed(state), disarmed_positions(state)
     # Read the ledger BEFORE asking for the fault: reading it is what detects a
     # corrupt one and sets it aside. The field earns its place because an empty
@@ -535,7 +530,6 @@ def _cmd_brake(args) -> int:
     # has lost track of everything.
     rows = open_risk(state, {}, brake_armed=is_armed, disarmed=off)
     print(json.dumps({"armed": is_armed,
-                      "candidate_entries_armed": candidate_entries_armed(state),
                       "disarmed_positions": sorted(off),
                       "ledger_fault": ledger_fault(state),
                       "positions": rows}, indent=2, default=str))

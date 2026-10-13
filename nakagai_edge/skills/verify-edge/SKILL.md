@@ -99,17 +99,20 @@ Only with the owner's explicit go-ahead, because it creates a real approval
 record and, on a real broker, a real order. Prefer the demo broker where
 available.
 
-1. Stage one platform execution candidate and wake the paired agent for it.
-   Accept that exact candidate; expect `mechanical_status: prepared` and an
+1. Propose one order on the platform with `propose_order` (protocol 1: a
+   good-till-cancelled buy limit with a protective stop below the limit);
+   expect `ok: true` and a pending proposal.
+2. Human approves it on the platform's Approvals page. Within a few seconds
+   the edge adopts the grant; its audit journal records `adopted` with the
    `approval_id`.
-2. Human approves on the platform's Approvals page.
-3. Poll `get_approval(approval_id)` until status leaves `pending`; expect
+3. Poll `get_approval(approval_id)` until status leaves `granted`; expect
    `executed` with a result, or a broker-side `error` message (which still
    proves the relay: the signed grant reached the edge and the edge dialed
    the broker).
-4. If the record instead sits `pending` forever, the platform never issued
-   a decision the edge could see: check the executor loop is running (it
-   polls every ~5s) and the approver setup on the platform side.
+4. If the record instead sits `granted` with no `adopted` journal entry, the
+   edge never picked the grant up: check the executor loop is running (it
+   polls every ~5s), that policy is fresh, and that exactly one
+   order-capable broker has exactly one full-access account.
 
 Never resubmit an approval that returned `error` with
 `outcome_unknown: true`; the broker may already hold the order.

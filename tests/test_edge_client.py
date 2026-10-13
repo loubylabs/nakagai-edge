@@ -51,12 +51,11 @@ def test_approval_round_trip_paths():
         return httpx.Response(200, json={"ok": True, "approval_id": "a1",
                                          "status": "pending", "expires_at": 0})
     c = PlatformClient("https://api.test", "nk_agent_t", transport=_transport(handler))
-    c.enqueue_approval("rh", "place_order", {"qty": 1})
     c.get_approval("a1")
     c.report_execution("a1", ok=True, result={"id": "42"})
     c.ship_audit([{"kind": "call"}])
-    assert seen == [("POST", "/api/agent/approvals"),
-                    ("GET", "/api/agent/approvals/a1"),
+    assert not hasattr(c, "enqueue_approval")
+    assert seen == [("GET", "/api/agent/approvals/a1"),
                     ("POST", "/api/agent/approvals/a1/execution"),
                     ("POST", "/api/agent/audit")]
 
@@ -115,175 +114,19 @@ def test_chat_protocol_header_only_covers_chat_routes():
     client.await_events(timeout_s=0)
 
 
-def test_candidate_protocol_header_only_covers_authenticated_event_polls():
+def test_event_polls_carry_only_the_chat_protocol_and_version_headers():
     seen = []
 
     def handler(request):
-        seen.append((request.url.path,
-                     request.headers.get("x-nakagai-candidate-protocol")))
-        if request.url.path == "/api/agent/events":
-            return httpx.Response(200, json={"ok": True, "events": []})
-        if request.url.path == "/api/agent/bundle":
-            return httpx.Response(200, json={"bundle_version": "v1"})
-        return httpx.Response(200, json={"ok": True})
-
-    client = PlatformClient("https://api.test", "nk_agent_t",
-                            transport=_transport(handler))
-    client.await_events(timeout_s=0)
-    client.agent_checkin("idle")
-    client.get_bundle()
-
-    assert seen == [
-        ("/api/agent/events", "1"),
-        ("/api/agent/checkin", None),
-        ("/api/agent/bundle", None),
-    ]
-
-
-def test_configured_candidate_wake_is_attested_only_on_event_polls():
-    seen = []
-
-    def handler(request):
-        seen.append((request.url.path,
-                     request.headers.get("x-nakagai-candidate-wake")))
-        if request.url.path == "/api/agent/events":
-            return httpx.Response(200, json={"ok": True, "events": []})
-        if request.url.path == "/api/agent/bundle":
-            return httpx.Response(200, json={"bundle_version": "v1"})
-        return httpx.Response(200, json={"ok": True})
-
-    client = PlatformClient(
-        "https://api.test", "nk_agent_t", candidate_wake=True,
-        transport=_transport(handler),
-    )
-    client.await_events(timeout_s=0)
-    client.list_peers()
-    client.get_bundle()
-    client.accept_candidate("candidate-1", "evidence is current")
-    client.report_candidate_outcome(
-        "candidate-1", mechanical_status="blocked",
-        mechanical_reason="approval is pending",
-    )
-    client.report_connectors([])
-
-    assert seen == [
-        ("/api/agent/events", "1"),
-        ("/api/agent/peers", None),
-        ("/api/agent/bundle", None),
-        ("/api/agent/candidates/candidate-1/accept", None),
-        ("/api/agent/candidates/candidate-1/outcome", None),
-        ("/api/agent/connectors", None),
-    ]
-
-
-def test_unconfigured_event_poll_omits_candidate_wake_attestation():
-    def handler(request):
-        assert request.url.path == "/api/agent/events"
-        assert request.headers["x-nakagai-candidate-protocol"] == "1"
-        assert request.headers.get("x-nakagai-candidate-wake") is None
+        seen.append({name for name in request.headers
+                     if name.startswith("x-nakagai-")})
         return httpx.Response(200, json={"ok": True, "events": []})
 
-    client = PlatformClient(
-        "https://api.test", "nk_agent_t", transport=_transport(handler),
-    )
+    client = PlatformClient("https://api.test", "nk_agent_t",
+                            transport=_transport(handler))
     client.await_events(timeout_s=0)
 
-
-def test_candidate_decision_routes_put_only_rationale_in_the_body():
-    """No memory_ids argument at all: the body an edge sent before the field
-    existed, unchanged."""
-    seen = []
-
-    def handler(request):
-        seen.append((request.url.path, json.loads(request.content)))
-        return httpx.Response(200, json={"candidate_id": "candidate-1",
-                                         "decision": "accepted"})
-
-    client = PlatformClient("https://api.test", "nk_agent_t",
-                            transport=_transport(handler))
-    client.accept_candidate("candidate-1", "fresh broker evidence")
-    client.abstain_candidate("candidate-1", "setup expired")
-
-    assert seen == [
-        ("/api/agent/candidates/candidate-1/accept",
-         {"rationale": "fresh broker evidence"}),
-        ("/api/agent/candidates/candidate-1/abstain",
-         {"rationale": "setup expired"}),
-    ]
-
-
-def test_candidate_decision_omits_memory_ids_from_the_body_when_empty():
-    """An empty list must produce the exact same wire body as no list at
-    all, so a platform that predates the field sees nothing different."""
-    seen = []
-
-    def handler(request):
-        seen.append((request.url.path, json.loads(request.content)))
-        return httpx.Response(200, json={"candidate_id": "candidate-1",
-                                         "decision": "accepted"})
-
-    client = PlatformClient("https://api.test", "nk_agent_t",
-                            transport=_transport(handler))
-    client.accept_candidate("candidate-1", "fresh broker evidence", [])
-    client.abstain_candidate("candidate-1", "setup expired", memory_ids=[])
-
-    assert seen == [
-        ("/api/agent/candidates/candidate-1/accept",
-         {"rationale": "fresh broker evidence"}),
-        ("/api/agent/candidates/candidate-1/abstain",
-         {"rationale": "setup expired"}),
-    ]
-
-
-def test_candidate_decision_sends_a_populated_memory_ids_list():
-    seen = []
-
-    def handler(request):
-        seen.append((request.url.path, json.loads(request.content)))
-        return httpx.Response(200, json={"candidate_id": "candidate-1",
-                                         "decision": "accepted"})
-
-    client = PlatformClient("https://api.test", "nk_agent_t",
-                            transport=_transport(handler))
-    client.accept_candidate("candidate-1", "matches a stated fact", ["mem-1", "mem-2"])
-    client.abstain_candidate("candidate-1", "conflicts with a guess", ["mem-3"])
-
-    assert seen == [
-        ("/api/agent/candidates/candidate-1/accept",
-         {"rationale": "matches a stated fact", "memory_ids": ["mem-1", "mem-2"]}),
-        ("/api/agent/candidates/candidate-1/abstain",
-         {"rationale": "conflicts with a guess", "memory_ids": ["mem-3"]}),
-    ]
-
-
-def test_candidate_mechanical_outcome_uses_the_internal_outcome_route():
-    seen = []
-
-    def handler(request):
-        seen.append((request.url.path, json.loads(request.content)))
-        return httpx.Response(200, json={
-            "candidate_id": "candidate-1", "decision": "accepted",
-            "mechanical_status": "blocked",
-            "mechanical_reason": "local policy is stale",
-            "approval_id": "approval-1",
-        })
-
-    client = PlatformClient("https://api.test", "nk_agent_t",
-                            transport=_transport(handler))
-    out = client.report_candidate_outcome(
-        "candidate-1", mechanical_status="blocked",
-        mechanical_reason="local policy is stale", approval_id="approval-1",
-        urgent=False, outcome_unknown=False,
-    )
-
-    assert out["mechanical_status"] == "blocked"
-    assert seen == [("/api/agent/candidates/candidate-1/outcome", {
-        "mechanical_status": "blocked",
-        "mechanical_reason": "local policy is stale",
-        "approval_id": "approval-1",
-        "urgent": False,
-        "outcome_unknown": False,
-    })]
+    assert seen == [{"x-nakagai-chat-protocol", "x-nakagai-edge-version"}]
 
 
 def test_chat_conflict_body_is_returned_intact():

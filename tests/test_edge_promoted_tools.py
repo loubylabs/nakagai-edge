@@ -40,8 +40,7 @@ PLATFORM = "nakagai-mcp"
 # prefixed, never both. Verified against nakagai_platform/mcp_server.py.
 COLLIDE = {"agent_checkin", "call_connector", "get_approval",
            "get_connector_status", "list_connector_tools", "list_peers",
-           "claim_message", "send_message", "request_peer",
-           "accept_candidate", "abstain_candidate"}
+           "claim_message", "send_message", "request_peer"}
 
 # The shipped registry entry, guardrails included: this is what
 # config/connectors.yaml in the platform repo actually sends down the bundle,
@@ -213,10 +212,10 @@ async def test_platform_tools_are_promoted(edge):
     names = set(await edge.names())
     assert {"get_signals", "get_runs", "run_backtest"} <= names
     assert "await_events" not in names
-    # Sixteen: the platform's twenty-eight minus the eleven local collisions and
+    # Fifteen: the platform's twenty-five minus the nine local collisions and
     # the event reader. A number, so that a promotion that quietly dropped
     # half of them is a failure rather than a smaller success.
-    assert len(names) == 20 + 16, sorted(names)
+    assert len(names) == 18 + 15, sorted(names)
 
 
 async def test_a_promoted_tool_publishes_the_platforms_own_argument_schema(edge):
@@ -233,7 +232,7 @@ async def test_a_promoted_tool_publishes_the_platforms_own_argument_schema(edge)
     assert not spec.input_schema.get("required")
     # A required argument stays required, so the agent is told before the call.
     write = next(t for t in await edge.mcp.list_tools()
-                 if t.name == "set_autoexecute_allowlist")
+                 if t.name == "edit_account_watchlist")
     assert write.input_schema["required"] == ["reason"]
 
 
@@ -486,7 +485,7 @@ async def test_platform_down_keeps_the_tool_listed(edge):
 # Asserted on a WRITE, because a read passing through both doors proves much
 # less: reads are what the shipped guardrails allow, so they would agree even
 # if promotion had skipped classification entirely. Both regimes are run: the
-# shipped one, where `set_autoexecute_allowlist` is refused because the
+# shipped one, where `edit_account_watchlist` is refused because the
 # platform connector is read-only, and one with allow_writes on, where the call
 # actually lands. A promotion that widened authority passes neither.
 
@@ -501,14 +500,14 @@ async def test_a_write_earns_the_same_verdict_through_both_doors(
 
     async with _promoted_edge(tmp_path, guardrails=guardrails) as edge:
         before = len(edge.audit.pending())
-        promoted = await edge.call("set_autoexecute_allowlist", **args)
+        promoted = await edge.call("edit_account_watchlist", **args)
         promoted_arrived = list(platform_mcp.calls)
         promoted_events = edge.audit.pending()[before:]
 
         platform_mcp.calls.clear()
         before = len(edge.audit.pending())
         raw = await edge.call("call_connector", connector_id=PLATFORM,
-                              tool="set_autoexecute_allowlist",
+                              tool="edit_account_watchlist",
                               args_json=json.dumps(args))
         raw_arrived = list(platform_mcp.calls)
         raw_events = edge.audit.pending()[before:]
@@ -522,8 +521,9 @@ async def test_a_write_earns_the_same_verdict_through_both_doors(
     # half above can agree by both being wrong.
     if lands:
         assert promoted["is_write"] is True
-        assert promoted_arrived == [("set_autoexecute_allowlist", {
-            "reason": "the owner asked", "add": ["AAPL"], "drop": None})]
+        assert promoted_arrived == [("edit_account_watchlist", {
+            "reason": "the owner asked", "add": ["AAPL"], "drop": None,
+            "notes": None})]
         assert [e["kind"] for e in promoted_events] == ["call"]
     else:
         assert promoted["is_error"] is True

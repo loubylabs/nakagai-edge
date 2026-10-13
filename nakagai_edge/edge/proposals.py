@@ -23,6 +23,7 @@ import math
 import time
 
 from nakagai_edge.capability import OUTBOUND_ORDER_FIELDS, CapabilityError, resolve
+from nakagai_edge.edge.portfolio import broker_specs
 from nakagai_edge.edge.remote import _write_intents, intents
 from nakagai_edge.edge.state import EdgeState
 from nakagai_edge.edge.sync import policy_fresh, public_key
@@ -82,6 +83,22 @@ def _expiry(art: dict) -> float | None:
     return value if math.isfinite(value) else None
 
 
+def _sole_broker_account(state: EdgeState):
+    """The sole locally write-tiered order-capable connector and its account."""
+    sole = []
+    for spec in broker_specs(state.root):
+        if "place_order" not in spec.capabilities:
+            continue
+        allowed = list(spec.guardrails.accounts.allow)
+        if len(allowed) == 1:
+            sole.append((spec, allowed[0]))
+    if len(sole) != 1:
+        raise ValueError(
+            "a proposal requires exactly one order-capable broker "
+            "with exactly one full-access account")
+    return sole[0]
+
+
 def _is_price(value) -> bool:
     return (not isinstance(value, bool) and isinstance(value, (int, float))
             and math.isfinite(value) and value > 0)
@@ -125,7 +142,6 @@ def _refusal(state: EdgeState, item: dict, sole) -> str:
         (item["args_hash"] == args_hash(args), "args_hash mismatch"),
         (art.get("approval_id") == item["approval_id"], "approval_id mismatch"),
         (art.get("proposal_id") == item["proposal_id"], "proposal_id mismatch"),
-        (art.get("candidate_id", "") == "", "a proposal grant cannot name a candidate"),
         (art.get("agent_id") == agent.get("agent_id"), "agent_id mismatch"),
         (art.get("connector_id") == item["connector_id"], "connector_id mismatch"),
         (art.get("tool") == item["tool"], "tool mismatch"),
@@ -139,7 +155,6 @@ def _refusal(state: EdgeState, item: dict, sole) -> str:
 def adopt_granted_proposals(state: EdgeState, client, audit) -> int:
     """Turn new owner-granted proposals into local intents. Returns how many."""
     from nakagai_edge.edge.brake import armed
-    from nakagai_edge.edge.runtime import _candidate_broker_account
 
     if not policy_fresh(state):
         return 0                       # retry next pass, report nothing
@@ -151,7 +166,7 @@ def adopt_granted_proposals(state: EdgeState, client, audit) -> int:
     items = client.granted_proposals()
     held = intents(state)
     try:
-        sole = _candidate_broker_account(state)
+        sole = _sole_broker_account(state)
     except ValueError:
         sole = None
     now = time.time()
@@ -188,8 +203,7 @@ def adopt_granted_proposals(state: EdgeState, client, audit) -> int:
         held[approval_id] = {
             "connector_id": item["connector_id"], "tool": item["tool"],
             "args": item["args"], "args_hash": item["args_hash"],
-            "signal_id": "", "candidate_id": "",
-            "proposal_id": item["proposal_id"],
+            "signal_id": "", "proposal_id": item["proposal_id"],
             "account": item["account"], "created_at": now}
         _write_intents(state, held)
         try:

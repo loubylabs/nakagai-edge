@@ -27,31 +27,20 @@ nested object arguments as self-contained schemas. It expands bounded local sche
 references before building the forwarded signature, while an unsupported schema
 leaves only that tool unpromoted and available through `call_connector`.
 
-An agent woken for one execution
-candidate can inspect that candidate, accept or abstain with a rationale, then
-stop. A listener-owned local scope enforces that boundary for the wake. The
-same candidate decision tools and read-only inspection remain available, while
-every other write is refused until the wake ends or expires. The agent cannot
-alter a prepared order field. The platform compiles the order, and local policy
-or the brake can still refuse execution. Frozen orders are the only order
-entry: a candidate the platform compiled, or a proposal the owner approved. A raw `call_connector` request whose tool exactly matches the
-selected connector's declared `capabilities.place_order.tool` is refused before
-dispatch with `canonical_order_required`. Other raw connector operations remain
-available.
+An order proposal the owner approved is the only order entry. Local policy or
+the brake can still refuse its execution. A raw `call_connector` request whose
+tool exactly matches the selected connector's declared
+`capabilities.place_order.tool` is refused before dispatch with
+`canonical_order_required`. A write the local guardrails send for approval is
+refused too, pointing at `propose_order`: the platform holds no queue for a
+local write to wait in. Other raw connector operations remain available.
 
 After broker acceptance, the edge durably stores the exact platform execution
 report beside the submitted intent. It retries that report until the platform
 acknowledges it and never repeats the broker order. Fill supervision starts only
 after that acknowledgement. An accepted result without a declared broker order
-id stays submitted, disarms further candidate entries, and alerts the owner that
-the outcome cannot be attributed safely.
-
-A listener started with a parsed, nonempty `--wake-command` adds
-`X-Nakagai-Candidate-Wake: 1` only to its authenticated event polls. This
-attests that the current listener is configured to wake an agent. It remains a
-self-reported readiness fact and grants no execution authority. The separate
-`X-Nakagai-Candidate-Protocol: 1` header continues to mean only that the poll
-understands execution candidate events.
+id stays submitted and alerts the owner that the outcome cannot be attributed
+safely.
 
 Every local approval queue operation still requires an explicit `account_key`.
 A paired edge uses its stable `agent_id` for that key. The key stays local; the
@@ -138,7 +127,7 @@ uvx nakagai-edge connect
 The one client recognized today is Claude Code, detected by `claude` being on
 your PATH. It gets an MCP entry added with
 `claude mcp add --scope user nakagai --transport http <url>`, at user scope
-because a project-scoped entry needs a per-project approval, and the nine skills
+because a project-scoped entry needs a per-project approval, and the eight skills
 below are copied into `~/.claude/skills/`. A client that is not detected is not
 an obstacle: the snippet below is the whole contract.
 
@@ -192,7 +181,7 @@ because a name that fails legibly beats a set of tools that silently vanish.
 
 ## Skills
 
-Nine skills ship inside the wheel:
+Eight skills ship inside the wheel:
 
 - **`connect-edge`**: connect a local edge to a hosted platform, and diagnose
   the known failure modes.
@@ -210,9 +199,6 @@ Nine skills ship inside the wheel:
   messages as they arrive.
 - **`verify`**: launch an isolated local platform and verify web, API, and MCP
   changes end to end.
-- **`candidate-trader`**: inspect one execution candidate, choose accept or
-  abstain with a rationale, then stop. Accepting cannot change a prepared
-  field, and local policy or the brake can still refuse execution.
 
 A client that reads skills as files gets them installed by `connect` (Claude
 Code: `~/.claude/skills/`). Any MCP client can read exactly the same text off
@@ -287,11 +273,6 @@ Notes that matter:
   This starts bounded non-interactive Codex turns. It cannot inject a message
   into an already-open Codex app conversation, and non-actionable context does
   not start a turn.
-* **Candidate wakes are one decision.** An `execution_candidate` is an
-  addressed, response-required event. Use `candidate-trader`: inspect one
-  candidate, choose accept or abstain, provide a concise rationale, and stop.
-  An acceptance leaves every prepared field under platform control. Local
-  policy and the brake retain their authority to refuse execution.
 * **Claim first when required.** If `claim_required` is true, call
   `claim_message(seq)` before reasoning or using another tool. A `409` is an
   ordinary coordination outcome. `already_claimed`, `claim_lost`, and
@@ -307,18 +288,18 @@ Notes that matter:
 
 ## The write path
 
-1. **Intent.** The agent calls a write tool through the edge's MCP surface.
-   The edge's guardrails classify it first, fail-closed, so an intent that
-   would already be denied never leaves the edge.
-2. **Pending approval.** A write matching the approval policy is enqueued to
-   the platform.
-3. **A human approves in the web app, or the mandate does.**
-4. **Signed grant.** On approve, the platform signs an Ed25519 artifact:
-   `{approval_id, agent_id, connector_id, tool, args_hash, account, expires_at}`.
-5. **Edge verifies and executes.** The edge checks the signature, recomputes
+1. **Proposal.** An agent proposes one order on the platform with
+   `propose_order`. A write the edge's own guardrails send for approval is
+   refused locally and points there instead.
+2. **The owner approves it by hand in the web app.** Nothing else approves.
+3. **Signed grant.** On approve, the platform signs an Ed25519 artifact:
+   `{approval_id, agent_id, connector_id, tool, args_hash, account,
+   proposal_id, expires_at}`.
+4. **Edge adopts, verifies and executes.** The edge re-derives the order
+   through its own `place_order` map, checks the signature, recomputes
    `args_hash` from its own copy of the arguments, checks expiry, and re-runs
    guardrails against its own synced policy before the broker is ever dialed.
-6. **Execution report.** The edge ships the outcome back and the approval
+5. **Execution report.** The edge ships the outcome back and the approval
    record closes.
 
 The platform never holds a broker credential at any point in this chain. It
@@ -407,7 +388,7 @@ the Portfolio page still lists them. A connector declaring an incomplete
 are missing, rather than found later by a position that had no stop watching
 it. A connector that places no orders at all simply declares no `place_order`.
 
-The frozen candidate executor creates limit entries only. Quantity must be a
+The executor creates limit entries only. Quantity must be a
 positive whole-share count, and both the limit and protective stop must be
 positive. Market orders carrying either priced field are refused. The only
 market orders the edge constructs are reduce-only warrant exits, and those
@@ -424,15 +405,10 @@ the one meant to cover a short.
 The model-facing broker surface exposes six named tools that work against any
 broker: `list_accounts`, `get_balance`, `list_positions`, `get_quote`,
 `list_orders`, and `cancel_order`. The internal `place_order` capability map
-serves frozen candidate execution and supervision only. The shared MCP surface
-remains present during an execution-candidate
-wake. Read-only inspection remains allowed. The edge enforces
-`accept_candidate` and `abstain_candidate` as the only write actions for the
-same candidate during that wake. Connector writes and order construction are
-refused in code until the wake ends or expires.
+serves owner-approved proposal execution and supervision only.
 `connector_id` is optional only while exactly one enabled broker declares the
 capability. Enable a second and the edge stops filling it in: the call comes
-back naming both candidates and the agent has to say which brokerage it meant.
+back naming both brokers and the agent has to say which brokerage it meant.
 Letting registry order decide which broker received an order is not something
 an agent can review or an owner can predict, so this is the one place the layer
 gets louder rather than quieter as brokers are added.
@@ -440,8 +416,9 @@ gets louder rather than quieter as brokers are added.
 `call_connector` remains the raw escape hatch for a broker tool outside the
 vocabulary. A connector's declared `place_order` tool is the exact exception:
 calling that raw name returns `canonical_order_required`, so every order starts
-from a frozen execution candidate. Other raw operations still use the same
-guardrails, approval queue, and audit record.
+from an order proposal the owner approved. Other raw operations still use the
+same guardrails and audit record, and one the guardrails send for approval is
+refused.
 
 **Three read-only classifications, each of which fails silently.** An
 unclassified tool counts as a write (`unknown_is_write`, fail closed), and
@@ -453,8 +430,8 @@ either by the downstream server's own `readOnlyHint` or by the owner's
 
 - **A connector's `get_quote` tool.** Otherwise the brake goes blind: no price,
   no breach, no fire, and every display still saying guarded.
-- **A connector's `list_accounts` tool.** Otherwise account inference enqueues
-  an approval instead of answering the question it was asked.
+- **A connector's `list_accounts` tool.** Otherwise account inference is sent
+  for approval and refused instead of answering the question it was asked.
 - **Anything else the edge dials on its own behalf**, for the same reason. The
   map moved the tool names out of the edge; it did not move this requirement,
   which now has to hold once per connector rather than once in total.
@@ -514,13 +491,8 @@ knowing:
 nakagai-edge brake status              # what is watched, and its risk in R
 nakagai-edge brake off                 # disarm, locally, with no network
 nakagai-edge brake off --position <id> # release one position
-nakagai-edge brake on                  # re-arm stops and candidate entries
+nakagai-edge brake on                  # re-arm stops
 ```
-
-An urgent candidate supervision failure leaves `candidate_entries_armed`
-false in `brake status` while existing warrant exits remain armed. Inspect the
-reported position and broker outcome first. `brake on` clears that local entry
-lockout when the owner is ready to permit another candidate.
 
 The brake does not promise the level. A gap opens a position under its stop and
 the exit goes off at the market, below it. That is what a stop is.
@@ -578,9 +550,9 @@ a record.
 - **Platform unreachable.** The edge caches the bootstrap bundle with a policy
   TTL (default 15 minutes). Reads may continue on the cached policy while the
   TTL holds; once it expires, everything is refused. Writes are impossible by
-  construction the whole time: a write needs a live round trip to the
-  platform's approval queue. An edge that started while the platform was down
-  serves its own 16 tools and none of the promoted ones, since the tool list is
+  construction the whole time: an order needs a live owner-signed grant from
+  the platform. An edge that started while the platform was down
+  serves its own 18 tools and none of the promoted ones, since the tool list is
   built once at startup; run `nakagai-edge restart` once the platform answers.
 - **Revocation.** Revoking an agent takes effect on the agent's next platform
   call: the bearer token 401s. Writes were already gated on a live platform

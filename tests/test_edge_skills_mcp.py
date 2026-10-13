@@ -54,9 +54,8 @@ def edge_mcp(tmp_path):
                            Brake(state, hub, client, audit))
 
 
-def test_list_skills_returns_the_canonical_nine():
+def test_list_skills_returns_the_canonical_eight():
     assert skills.list_skills() == [
-        "candidate-trader",
         "check-the-evidence",
         "connect-edge",
         "daily-brief",
