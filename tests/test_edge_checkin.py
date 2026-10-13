@@ -10,7 +10,6 @@ equity through their edge agent, exactly like a direct MCP agent can.
 
 import json
 import uuid
-from datetime import datetime, timezone
 
 import httpx
 import pytest
@@ -119,12 +118,9 @@ def _enroll(app, *, name="edge-shim", user=APPROVER["X-User"]) -> str:
 
 async def test_edge_checkin_lands_where_the_platform_can_read_it(
         tmp_path, platform_root, platform_app):
-    """The whole point of this branch: an equity report relayed by an EDGE
-    agent, through its shim's own agent_checkin tool, must be readable by
-    risk_inputs.read_equity_inputs() on the platform, exactly like a direct
-    MCP agent's report."""
-    from nakagai_platform.risk_inputs import read_equity_inputs
-
+    """An equity report relayed by an EDGE agent, through its shim's own
+    agent_checkin tool, lands in the owner's activity history as the same
+    check-in event a direct MCP agent's report produces."""
     owner = f"equity-owner-{uuid.uuid4().hex}@nakag.ai"
     token = _enroll(platform_app, user=owner)
     platform_client = _bridged_platform_client(platform_app, token)
@@ -137,24 +133,21 @@ async def test_edge_checkin_lands_where_the_platform_can_read_it(
     out = json.loads(text)
     assert out["ok"] is True
 
-    history = _history(owner)
-    report = read_equity_inputs(
-        history=history, now=datetime.now(timezone.utc), max_age_s=1e308)
-    assert report.equity == 100_000.0
-    assert report.day_pnl == -1_500.0
-
-    # And it landed under the edge agent's own name/id, not a synthetic one.
-    event = history.read(limit=1, category="agents")[0]
+    # It landed under the edge agent's own name/id, not a synthetic one,
+    # carrying the equity pair.
+    event = _history(owner).read(limit=1, category="agents")[0]
     assert event.actor_label == "edge-shim"
     assert event.kind == "checkin"
+    assert event.summary == "watching NVDA"
+    assert event.details["status"] == "scanning"
+    assert event.details["account_equity"] == 100_000.0
+    assert event.details["day_pnl"] == -1_500.0
 
 
 async def test_edge_checkin_discards_half_an_equity_report(
         tmp_path, platform_root, platform_app):
     """Both fields or nothing, over the edge path too: equity alone has no
-    baseline and would read as a flat day."""
-    from nakagai_platform.risk_inputs import read_equity_inputs
-
+    baseline and would read as a flat day. The beat itself is still recorded."""
     owner = f"half-report-owner-{uuid.uuid4().hex}@nakag.ai"
     token = _enroll(platform_app, user=owner)
     platform_client = _bridged_platform_client(platform_app, token)
@@ -163,7 +156,8 @@ async def test_edge_checkin_discards_half_an_equity_report(
     await mcp.call_tool("agent_checkin", {
         "status": "scanning", "account_equity": 100_000.0})   # no day_pnl
 
-    report = read_equity_inputs(
-        history=_history(owner), now=datetime.now(timezone.utc), max_age_s=1e308)
-    assert report.equity is None
-    assert report.day_pnl is None
+    event = _history(owner).read(limit=1, category="agents")[0]
+    assert event.kind == "checkin"
+    assert event.details["status"] == "scanning"
+    assert "account_equity" not in event.details
+    assert "day_pnl" not in event.details
