@@ -418,14 +418,6 @@ class ConnectorHub:
         """
         return None, 0.0
 
-    async def _maybe_auto_approve(self, record) -> tuple[Any | None, bool]:
-        """The mandate's verdict on this record, before a human is asked.
-
-        The base hub has no mandate, no equity report and no signing key, so it never
-        auto-approves. PlatformHub overrides this.
-        """
-        return None, False
-
     async def call(self, connector_id: str, tool: str, args: dict, *,
                    account_key: str, requested_by: str = "",
                    approved: bool = False, signal_id: str = "",
@@ -440,8 +432,7 @@ class ConnectorHub:
 
         `signal_id` is the id of a signal Nakagai emitted that this order claims to
         execute. It is resolved and frozen onto the approval record for the audit
-        trail at every rung. Under autopilot it is also what the envelope checks: an
-        order citing nothing never auto-executes.
+        trail.
         """
         spec = self.spec(connector_id)
         spec.check_connectable()
@@ -495,28 +486,9 @@ class ConnectorHub:
                                    signal_id=signal_id, signal=signal,
                                    notional=notional, candidate_id=candidate_id,
                                    intent_account=found_account)
-
-            # The mandate gets to decide before a human is asked. Inline, not a
-            # background sweeper: a sweeper would put a polling interval between
-            # "the agent saw the setup" and "the order reached the broker", which is
-            # the latency the autopilot rung exists to remove. It decides through
-            # self.decide(), the same door the owner's tap goes through, so a
-            # decline is never a denial: the record simply stays pending.
-            decided, declined = await self._maybe_auto_approve(record)
-            if decided is not None:
-                return {"connector": connector_id, "tool": tool,
-                        "is_write": verdict.is_write, "auto_approved": True,
-                        "approval_id": decided.id, "status": decided.status,
-                        "signal_id": decided.signal_id,
-                        "decided_by": decided.decided_by,
-                        "result": decided.result, "error": decided.error,
-                        "message": "the mandate approved this order inside your "
-                                   "autopilot envelope; nothing to poll"}
-
             return {"connector": connector_id, "tool": tool, "is_write": verdict.is_write,
                     "approval_required": True, "approval_id": record.id,
                     "status": record.status, "expires_at": record.expires_at,
-                    "auto_declined": declined,
                     "message": f"{verdict.reason}. Poll get_approval({record.id!r}) "
                                f"for the outcome."}
 

@@ -18,9 +18,8 @@ grant. The edge's pickup is what tells the platform it can carry a proposal
 out, so an older edge never receives one.
 
 Its platform-integration tests follow
-account-owned broker rulebooks and the retired platform login, and open the
-platform's withheld autopilot rung to prove an edge check-in clears the arm
-precheck. Account refusals name only the refused
+account-owned broker rulebooks and the retired platform login. Every order
+waits for the owner's tap on the platform. Account refusals name only the refused
 account, and a broker whose account list is empty takes no write until its owner
 confirms one. Platform tool promotion preserves declared
 string arguments byte-for-byte, including JSON-looking strings, and publishes
@@ -74,8 +73,7 @@ call, the platform placed the trade. The fix is a custody split:
 
 - **Control plane: the platform (`api.nakag.ai`).** Source of truth for
   everything that is not a broker secret: settings, the mandate, the monitor
-  watchlist (what an account watches) and the auto-execute allowlist (the
-  separate, smaller list autopilot may trade unattended), strategy configs, the
+  watchlist (what an account watches), strategy configs, the
   connector registry, guardrail policy, the approval queue and its signing key,
   and audit ingest. It issues *signed decisions*.
   It never dials a broker and never executes an edge-origin trade.

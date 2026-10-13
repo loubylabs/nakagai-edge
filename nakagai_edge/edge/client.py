@@ -143,9 +143,7 @@ class PlatformClient:
     def enqueue_approval(self, connector_id: str, tool: str, args: dict,
                          signal_id: str = "", candidate_id: str = "") -> dict:
         # signal_id is what the platform resolves to a frozen signal + notional
-        # and checks against the autopilot envelope: an order citing a signal
-        # Nakagai emitted, inside the owner's caps, comes back `granted` (signed)
-        # for the edge to execute. The platform decides; the edge never does.
+        # for the owner to read. The platform decides; the edge never does.
         return self._check(self._client.post("/api/agent/approvals", json={
             "connector_id": connector_id, "tool": tool, "args": args,
             "signal_id": signal_id, "candidate_id": candidate_id}))
@@ -187,8 +185,8 @@ class PlatformClient:
         # POST /api/agent/checkin (see nakagai/api/agent_routes.py), which
         # runs the exact same body a direct MCP agent's agent_checkin tool
         # does (nakagai.mandate.record_checkin). This is the edge's only
-        # route to the autopilot daily-loss breaker's equity figure - the
-        # platform holds no broker credentials to read it itself.
+        # route to report account equity - the platform holds no broker
+        # credentials to read it itself.
         return self._chat_result(self._client.post(
             "/api/agent/checkin", headers=self._chat_headers(), json={
                 "status": status, "note": note, "account_equity": account_equity,

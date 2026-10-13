@@ -30,7 +30,6 @@ Safety properties this file is responsible for:
 
 from __future__ import annotations
 
-import contextlib
 import copy
 import json
 import logging
@@ -56,22 +55,9 @@ APPROVAL_STATUSES = frozenset(
 # pending approvals. Enqueue past this and that account's request is refused.
 APPROVAL_MAX_PENDING_PER_ACCOUNT = 100
 
-# The budget a worker gives the autopilot decision lock: how long it will wait for a
-# pooled connection, and how long a statement inside the lock transaction may run.
-# NOT a wait for the lock itself: that is a `try` (see PgApprovalQueue.
-# decision_lock), so a contended lock declines at once rather than blocking. A
-# database that has gone slow or away must make autopilot decline, never hang.
-LOCK_TIMEOUT_S = 10.0
-
 
 class ApprovalError(Exception):
     """The approval could not be recorded or acted on."""
-
-
-class DecisionLockError(ApprovalError):
-    """The autopilot decision lock could not be taken: a sibling worker is
-    mid-decision, or the database is unreachable. The caller must DECLINE (leave
-    the record pending for a human); it must never auto-execute without it."""
 
 
 def _require_account_key(account_key: str) -> str:
@@ -178,21 +164,20 @@ class Approval:
     # What this order CLAIMS to be. `signal_id` is the id of a signal Nakagai
     # itself emitted; `signal` is the frozen record as it stood at request time,
     # so the approvals screen and the journal show the evidence a human is
-    # actually deciding on. `notional` is the extracted order size, stored so the
-    # day's autopilot budget is computable from this queue alone, with no second
-    # ledger to drift out of sync. All empty for an order that cited nothing.
+    # actually deciding on. `notional` is the extracted order size. All empty for
+    # an order that cited nothing.
     signal_id: str = ""
     signal: dict | None = None
     notional: float = 0.0
     # Copilot read: an advisory LLM-generated second opinion, written AFTER
     # enqueue by nakagai/api/rationale.py. Success: {summary, concerns, lean,
     # model, generated_at}. Failure: {error, generated_at}. None: not generated
-    # (still running, key unset, or lost to a restart). Display-only; nothing
-    # in the mandate or autopilot path reads it.
+    # (still running, key unset, or lost to a restart). Display-only; no
+    # decision path reads it.
     rationale: dict | None = None
     # Set when the owner cleared this decided record from the History view.
     # A hide, never a delete: the record stays in the journal and in list(),
-    # which autoapprove.py and mandate.py read for budgets and reconciliation.
+    # which reconciliation reads.
     cleared_at: float = 0.0
     # Present only for the bounded execution-candidate path. This is the
     # queue-level idempotency and grant-binding key. Ordinary approvals keep
@@ -227,30 +212,6 @@ class Approval:
 class BaseApprovalQueue:
     """The orchestration every backend shares. Subclasses supply the atomic bits:
     `enqueue`, `get`, `list`, `deny`, `_claim` (the CAS), `_finish`, `_resolve`."""
-
-    @contextlib.contextmanager
-    def decision_lock(self, account_key: str, timeout_s: float = LOCK_TIMEOUT_S):
-        """Serialize autopilot's read → check → claim for one account.
-
-        The CAS below makes sure an approval is decided at most ONCE. It does not
-        make the mandate's *budget* safe: `autoapprove.py` reads the day's usage
-        (and the once-per-signal fence) from this queue and only then claims. Two
-        workers can both read `orders == 4`, both pass `daily_order_max`, and both
-        claim two different records, overshooting the day's cap by (workers - 1).
-        The cap is the primary containment for a runaway loop, so it has to be
-        atomic, not advisory. Hence: hold this across the whole sequence.
-
-        The default is a NO-OP, which is correct for `ApprovalQueue`: it is
-        file-backed and single-process by construction (its CAS is a
-        `threading.Lock`), so there is no second reader to serialize against, and
-        the auto-approver's read→claim contains no `await`. `PgApprovalQueue`, the
-        backend that exists precisely so several API workers can run, overrides it
-        with a Postgres advisory lock.
-
-        Raises `DecisionLockError` if the lock cannot be taken. The caller declines.
-        """
-        _require_account_key(account_key)
-        yield
 
     def _claim(self, account_key: str, approval_id: str, decided_by: str,
                reason: str) -> Approval:
@@ -829,33 +790,6 @@ class PgApprovalQueue(BaseApprovalQueue):
         for key in ("created_at", "expires_at", "decided_at", "cleared_at"):
             values[key] = values[key].timestamp() if values[key] is not None else 0.0
         return Approval(**values)
-
-    @contextlib.contextmanager
-    def decision_lock(self, account_key: str, timeout_s: float = LOCK_TIMEOUT_S):
-        """Serialize one account's autopilot decision across API workers."""
-        _require_account_key(account_key)
-        with contextlib.ExitStack() as stack:
-            try:
-                connection = stack.enter_context(
-                    self.db.pool.connection(timeout=timeout_s)
-                )
-                stack.enter_context(connection.transaction())
-                connection.execute(
-                    "select set_config('statement_timeout', %s, true)",
-                    (f"{max(int(timeout_s * 1000), 1)}ms",),
-                )
-                locked = connection.execute(
-                    "select pg_try_advisory_xact_lock("
-                    "hashtext('nakagai:autopilot'), hashtext(%s::text))",
-                    (account_key,),
-                ).fetchone()[0]
-            except Exception as error:  # noqa: BLE001
-                raise DecisionLockError(f"{type(error).__name__}: {error}") from error
-            if not locked:
-                raise DecisionLockError(
-                    "another worker is deciding an autopilot order for this account"
-                )
-            yield
 
     @classmethod
     def _expire_with(cls, connection, account_key: str) -> list[Approval]:

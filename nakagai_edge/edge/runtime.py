@@ -728,10 +728,8 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         measured against the prior session's close). Report BOTH or neither;
         one without the other is discarded.
 
-        autopilot's daily-loss circuit breaker runs on these and nothing else.
-        Nakagai never pulls them from your broker. While the dial is on and no
-        recent report exists, autopilot will not auto-execute: it declines to a
-        human tap rather than trade blind to the account's drawdown.
+        Nakagai never pulls them from your broker; this report is the only way
+        the platform learns them.
 
         Not gated on local policy freshness: this call goes straight to the
         platform rather than reading anything cached, so a stale local policy

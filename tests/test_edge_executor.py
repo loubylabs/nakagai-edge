@@ -1105,6 +1105,10 @@ async def test_edge_enqueue_still_works_with_a_cited_signal_id(tmp_path):
                          account_key="ag1",
                          signal_id="abc123")
     assert out["approval_required"] is True and out["approval_id"] == "a1"
+    # Only the owner's tap decides: the hub never answers for them, so a
+    # guarded write returns exactly the pending record and nothing else.
+    assert set(out) == {"connector", "tool", "is_write", "approval_required",
+                        "approval_id", "status", "expires_at", "message"}
     await hub.aclose()
 
 
@@ -1121,8 +1125,7 @@ def test_remote_enqueue_carries_signal_id_onto_the_returned_record(tmp_path):
 
 def test_signal_id_travels_from_edge_to_platform(tmp_path):
     """RemoteApprovalQueue.enqueue(signal_id=...) makes the client POST a body
-    carrying that id; it is what the platform checks against the autopilot
-    envelope. signal/notional are NOT sent: the edge holds no authority to vouch
+    carrying that id. signal/notional are NOT sent: the edge holds no authority to vouch
     for a signal, so the platform recomputes both from the id against its own
     store."""
     posted = {}

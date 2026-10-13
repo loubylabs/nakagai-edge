@@ -17,7 +17,6 @@ from nakagai_edge.approvals import (
 
 
 PG_RECORD_METHODS = (
-    "decision_lock",
     "enqueue",
     "get",
     "list",
@@ -95,8 +94,6 @@ class RecordingConnection:
         normalized = " ".join(sql.split()).lower()
         params = tuple(params)
         self.statements.append((normalized, params))
-        if "pg_try_advisory_xact_lock" in normalized:
-            return Result((True,))
         if "select count(*)" in normalized:
             return Result((0,))
         if "select status, decided_by" in normalized:
@@ -196,19 +193,6 @@ def test_pg_every_record_query_carries_account_predicate(operation) -> None:
     database = RecordingDatabase()
     operation(PgApprovalQueue(database))
     assert_account_scoped(database)
-
-
-def test_pg_decision_locks_are_distinct_per_account() -> None:
-    database = RecordingDatabase()
-    queue = PgApprovalQueue(database)
-
-    with queue.decision_lock("account-a"):
-        pass
-    with queue.decision_lock("account-b"):
-        pass
-
-    locks = [entry for entry in database.statements if "pg_try_advisory_xact_lock" in entry[0]]
-    assert [params[-1] for _, params in locks] == ["account-a", "account-b"]
 
 
 def test_pg_admission_counts_inside_the_account_transaction() -> None:

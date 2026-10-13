@@ -8,7 +8,6 @@ from nakagai_edge.approvals import ApprovalQueue, BaseApprovalQueue
 
 
 RECORD_METHODS = (
-    "decision_lock",
     "enqueue",
     "get",
     "list",
@@ -43,6 +42,16 @@ def test_every_record_method_requires_leading_account_key() -> None:
         )
         assert parameters[1].default is inspect.Parameter.empty, method_name
         assert "workspace" not in inspect.signature(method).parameters, method_name
+
+
+def test_no_queue_offers_an_unattended_lock() -> None:
+    """Only the owner decides, one record at a time through the claim CAS;
+    no queue offers a lock for deciding on the owner's behalf."""
+    from nakagai_edge.approvals import PgApprovalQueue
+
+    for queue in (BaseApprovalQueue, ApprovalQueue, PgApprovalQueue):
+        assert not [name for name in dir(queue) if "lock" in name.lower()
+                    and not name.startswith("_")], queue.__name__
 
 
 @pytest.mark.parametrize(
