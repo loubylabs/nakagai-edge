@@ -188,14 +188,41 @@ def test_remote_enqueue_points_at_order_proposals(tmp_path):
 
 
 async def test_granted_artifact_executes_and_reports(tmp_path):
-    state, client, queue, reports = _setup(tmp_path, artifact=_artifact("a1"))
-    _seed(state)
-    hub = FakeHub()
+    state, client, queue, reports = _setup(
+        tmp_path, artifact=_proposal_artifact(),
+        record_overrides={"args": ENTRY_ARGS})
+    _seed_proposal(state)
+    hub = EntryHub()
     n = await poll_once(hub, state, client, EdgeAudit(state))
     assert n == 1
     assert hub.calls and hub.calls[0][3].get("approved") is True
     assert reports and reports[0]["ok"] is True
-    assert intents(state) == {}
+    assert reports[0]["outcome_unknown"] is False
+    # Acknowledged, and held under its broker id until the fill journal
+    # matches it; a later pass never submits it again.
+    assert "pending_execution_report" not in intents(state)["a1"]
+    assert intents(state)["a1"]["broker_order_id"] == "42"
+    assert await poll_once(hub, state, client, EdgeAudit(state)) == 0
+    assert len(hub.calls) == 1
+
+
+async def test_an_unknown_order_id_is_held_and_alerted_never_dropped(tmp_path):
+    """An executed order the broker gave no id for cannot be matched to a
+    fill, so it stays submitted and the owner is told, rather than vanishing."""
+    state, client, queue, reports = _setup(tmp_path, artifact=_artifact("a1"))
+    _seed(state)
+
+    class NoIdHub(FakeHub):
+        async def call(self, connector_id, tool, args, **kw):
+            self.calls.append((connector_id, tool, args, kw))
+            return {"is_error": False, "data": {}}
+
+    hub = NoIdHub()
+    await poll_once(hub, state, client, EdgeAudit(state))
+
+    assert reports[0]["outcome_unknown"] is True
+    assert intents(state)["a1"]["phase"] == "submitted"
+    assert len(client.alerts) == 1
 
 
 async def test_tampered_args_hash_never_executes(tmp_path):
@@ -715,7 +742,7 @@ async def test_success_report_survives_audit_failure(tmp_path):
     assert reports and reports[0]["ok"] is True
 
 
-async def test_intent_dropped_when_bookkeeping_raises(tmp_path):
+async def test_submitted_intent_survives_when_bookkeeping_raises(tmp_path):
     state, client, queue, reports = _setup(tmp_path, artifact=_artifact("a1"))
     _seed(state)
     hub = FakeHub()
@@ -726,8 +753,10 @@ async def test_intent_dropped_when_bookkeeping_raises(tmp_path):
 
     audit.record = _boom
     await poll_once(hub, state, client, audit)     # must not raise
-    assert intents(state) == {}                     # no second execution possible
     assert reports and reports[0]["ok"] is True
+    assert intents(state)["a1"]["phase"] == "submitted"
+    await poll_once(hub, state, client, audit)
+    assert len(hub.calls) == 1                      # no second execution possible
 
 
 async def test_nonjson_execution_response_cannot_rearm_intent(tmp_path):

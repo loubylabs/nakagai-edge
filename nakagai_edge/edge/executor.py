@@ -388,12 +388,6 @@ async def reconcile_submitted_fills(
     return matched
 
 
-def _frozen(intent: dict) -> bool:
-    """A proposal intent: an order frozen before the owner's grant, which
-    stays durable under its exact broker id until a fill."""
-    return bool(intent.get("proposal_id"))
-
-
 def _alert_owner(client: PlatformClient, reason: str) -> None:
     try:
         client.agent_checkin("alert", reason)
@@ -458,9 +452,6 @@ async def poll_once(hub, state: EdgeState, client: PlatformClient,
         if _deliver_pending_execution_report(
                 state, client, audit, approval_id, intent):
             resolved += 1
-            if (not _frozen(intent)
-                    and not str(intent.get("broker_order_id") or "")):
-                drop_intent(state, approval_id)
     try:
         adopt_granted_proposals(state, client, audit)
     except Exception:  # noqa: BLE001 (nothing adopted; the next pass retries)
@@ -512,25 +503,24 @@ async def poll_once(hub, state: EdgeState, client: PlatformClient,
                 pass
             continue
 
-        if intent.get("proposal_id"):
-            # Adoption checked the brake, but a pass that could not read the
-            # approval leaves the intent for a later one; check it again here.
-            from nakagai_edge.edge.brake import armed
-            if not armed(state):
-                error = "local brake is disarmed; proposal grant refused"
-                try:
-                    audit.record("denial", intent["connector_id"], intent["tool"],
-                                 {"approval_id": approval_id, "error": error,
-                                  "proposal_id": intent["proposal_id"]})
-                except Exception:  # noqa: BLE001 (journal is best-effort here)
-                    pass
-                try:
-                    client.report_execution(approval_id, ok=False, error=error)
-                except Exception:  # noqa: BLE001 (the broker was never contacted)
-                    pass
-                drop_intent(state, approval_id)
-                resolved += 1
-                continue
+        # Adoption checked the brake, but a pass that could not read the
+        # approval leaves the intent for a later one; check it again here.
+        from nakagai_edge.edge.brake import armed
+        if not armed(state):
+            error = "local brake is disarmed; proposal grant refused"
+            try:
+                audit.record("denial", intent["connector_id"], intent["tool"],
+                             {"approval_id": approval_id, "error": error,
+                              "proposal_id": intent.get("proposal_id", "")})
+            except Exception:  # noqa: BLE001 (journal is best-effort here)
+                pass
+            try:
+                client.report_execution(approval_id, ok=False, error=error)
+            except Exception:  # noqa: BLE001 (the broker was never contacted)
+                pass
+            drop_intent(state, approval_id)
+            resolved += 1
+            continue
 
         try:
             result = await hub.call(intent["connector_id"], intent["tool"],
@@ -551,12 +541,12 @@ async def poll_once(hub, state: EdgeState, client: PlatformClient,
             except Exception:  # noqa: BLE001 (never re-arm an attempted intent)
                 pass
         else:
-            # Broker acceptance is a submitted order, not a fill. Proposal
-            # entries stay durable under their exact broker id until the fill
-            # journal sees that same order in a declared filled state.
-            frozen = _frozen(intent)
+            # Broker acceptance is a submitted order, not a fill. Every intent
+            # is an adopted proposal and stays durable under its exact broker
+            # id until the fill journal sees that same order in a declared
+            # filled state.
             order_id = placed_order_id(hub, intent, result)
-            missing_order_id = bool(frozen and not order_id)
+            missing_order_id = not order_id
             execution_report = _execution_report(
                 result, order_id, missing_order_id=missing_order_id)
             try:
@@ -568,8 +558,7 @@ async def poll_once(hub, state: EdgeState, client: PlatformClient,
                 reason = (
                     "submission could not be persisted after broker result: "
                     f"{type(error).__name__}: {error}")
-                if frozen:
-                    _alert_owner(client, reason)
+                _alert_owner(client, reason)
                 try:
                     audit.record(
                         "error", intent["connector_id"], intent["tool"],
@@ -581,10 +570,8 @@ async def poll_once(hub, state: EdgeState, client: PlatformClient,
                 submitted = intents(state).get(approval_id) or {}
                 if missing_order_id:
                     _alert_owner(client, execution_report["error"])
-                acknowledged = _deliver_pending_execution_report(
+                _deliver_pending_execution_report(
                     state, client, audit, approval_id, submitted)
-                if acknowledged and not frozen and not order_id:
-                    drop_intent(state, approval_id)
         current = intents(state).get(approval_id)
         if not isinstance(current, dict) or current.get("phase") != "submitted":
             drop_intent(state, approval_id)

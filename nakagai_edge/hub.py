@@ -405,19 +405,6 @@ class ConnectorHub:
         conn.last_used = time.monotonic()
         return {"connector": connector_id, "tools": annotate_tools(spec, conn.tools)}
 
-    def provenance(self, spec: ConnectorSpec, args: dict,
-                   signal_id: str) -> tuple[dict | None, float]:
-        """What this order claims to be: the signal Nakagai emitted under the cited
-        id, and the order's notional.
-
-        The base hub is what the edge runs, and the edge cannot answer this: it has
-        no signals/ directory, because signals are the platform's. (None, 0.0) is the
-        honest answer, not a stub. The platform re-derives provenance when the edge's
-        record reaches it (api/agent_routes.py:436), so nothing is lost. PlatformHub
-        overrides this for the platform's own enqueue path.
-        """
-        return None, 0.0
-
     async def call(self, connector_id: str, tool: str, args: dict, *,
                    account_key: str, requested_by: str = "",
                    approved: bool = False, signal_id: str = "") -> dict:
@@ -454,12 +441,10 @@ class ConnectorHub:
                 raise GuardrailDenied(
                     f"{verdict.reason}; no approval queue is configured. "
                     f"Remove this tool from approvals.require_for to allow it")
-            signal, notional = self.provenance(spec, args, signal_id)
             record = queue.enqueue(account_key, connector_id, tool, args,
                                    ttl_s=spec.guardrails.approvals.ttl_s,
                                    requested_by=requested_by,
-                                   signal_id=signal_id, signal=signal,
-                                   notional=notional)
+                                   signal_id=signal_id)
             return {"connector": connector_id, "tool": tool, "is_write": verdict.is_write,
                     "approval_required": True, "approval_id": record.id,
                     "status": record.status, "expires_at": record.expires_at,
