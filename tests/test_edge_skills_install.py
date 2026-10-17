@@ -1,7 +1,9 @@
 """Installing the packaged skills onto disk, without eating an owner's edit."""
 
+import json
+
 from nakagai_edge.edge import skills
-from nakagai_edge.edge.install import install_skills
+from nakagai_edge.edge.install import _digest, install_skills
 
 
 def test_install_writes_every_skill(tmp_path):
@@ -17,7 +19,7 @@ def test_reinstall_is_idempotent(tmp_path):
     install_skills(dest, manifest=manifest)
     report = install_skills(dest, manifest=manifest)
     assert report.written == []
-    assert "halt" in report.unchanged
+    assert "daily-brief" in report.unchanged
 
 
 def test_a_users_edit_is_never_overwritten(tmp_path):
@@ -25,14 +27,14 @@ def test_a_users_edit_is_never_overwritten(tmp_path):
     loses the edit. They do not trust the tool again after that."""
     dest, manifest = tmp_path / "skills", tmp_path / "manifest.json"
     install_skills(dest, manifest=manifest)
-    edited = dest / "halt" / "SKILL.md"
+    edited = dest / "daily-brief" / "SKILL.md"
     edited.write_text("MY OWN VERSION")
 
     report = install_skills(dest, manifest=manifest)
 
     assert edited.read_text() == "MY OWN VERSION"
-    assert "halt" in report.skipped_modified
-    assert "halt" not in report.written
+    assert "daily-brief" in report.skipped_modified
+    assert "daily-brief" not in report.written
 
 
 def test_an_unreadable_target_does_not_abort_the_install(tmp_path):
@@ -41,13 +43,38 @@ def test_an_unreadable_target_does_not_abort_the_install(tmp_path):
     edit: we cannot prove we wrote it, so we do not touch it."""
     dest, manifest = tmp_path / "skills", tmp_path / "manifest.json"
     install_skills(dest, manifest=manifest)
-    (dest / "halt" / "SKILL.md").write_bytes(b"\xff\xfe not utf-8 \x00")
+    (dest / "daily-brief" / "SKILL.md").write_bytes(b"\xff\xfe not utf-8 \x00")
 
     report = install_skills(dest, manifest=manifest)
 
-    assert "halt" in report.skipped_modified
+    assert "daily-brief" in report.skipped_modified
     assert "check-the-evidence" in report.unchanged, "the install stopped early"
-    assert (dest / "halt" / "SKILL.md").read_bytes().startswith(b"\xff\xfe")
+    assert (dest / "daily-brief" / "SKILL.md").read_bytes().startswith(b"\xff\xfe")
+
+
+def test_a_skill_no_longer_shipped_is_retired_unless_edited(tmp_path):
+    """0.7.1 dropped `halt`, whose copy told agents to engage a kill switch
+    the platform no longer has. An upgrade removes our untouched copy and
+    leaves an edited one alone."""
+    dest, manifest = tmp_path / "skills", tmp_path / "manifest.json"
+    install_skills(dest, manifest=manifest)
+    for name, text in (("halt", "old halt skill"), ("mine", "old mine skill")):
+        (dest / name).mkdir()
+        (dest / name / "SKILL.md").write_text(text)
+    recorded = json.loads(manifest.read_text())
+    recorded["halt"] = _digest("old halt skill")
+    recorded["mine"] = _digest("old mine skill")
+    manifest.write_text(json.dumps(recorded))
+    (dest / "mine" / "SKILL.md").write_text("MY OWN VERSION")
+
+    report = install_skills(dest, manifest=manifest)
+
+    assert report.removed == ["halt"]
+    assert not (dest / "halt").exists()
+    assert "mine" in report.skipped_modified
+    assert (dest / "mine" / "SKILL.md").read_text() == "MY OWN VERSION"
+    assert "halt" not in json.loads(manifest.read_text())
+    assert "1 retired" in report.summary()
 
 
 def test_install_is_a_copy_not_a_reference(tmp_path):
@@ -55,6 +82,6 @@ def test_install_is_a_copy_not_a_reference(tmp_path):
     the package still being importable from the same place."""
     dest, manifest = tmp_path / "skills", tmp_path / "manifest.json"
     install_skills(dest, manifest=manifest)
-    body = (dest / "halt" / "SKILL.md")
+    body = (dest / "daily-brief" / "SKILL.md")
     assert not body.is_symlink()
     assert body.stat().st_size > 200

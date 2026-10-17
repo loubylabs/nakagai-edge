@@ -588,7 +588,7 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
                            reply_to_seq: int = 0) -> str:
         """Send a linked message to one room. Use the source message sequence
         in `reply_to_seq` and a stable `idempotency_key` when retrying. Never
-        gated: even halted, you may say you are halted."""
+        mandate-gated."""
         try:
             out = client.send_message(text, room_id, idempotency_key, reply_to_seq)
             return json.dumps(out, default=str)

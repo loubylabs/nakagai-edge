@@ -222,7 +222,7 @@ def _notification_key(*parts: object) -> str:
 class Brake:
     """Places the exit a supervised position's warrant authorizes.
 
-    Deliberately NOT gated on policy freshness or on the kill switch. Its
+    Deliberately NOT gated on policy freshness. Its
     authority came from a signed artifact that was fresh when issued, and
     firing can only reduce exposure. The guardrails still re-run inside
     hub.call, which is a second, independent check.

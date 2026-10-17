@@ -1,10 +1,9 @@
 """Firing: the one path where the brake touches the broker.
 
 The bounds pinned here are the whole reason a standing warrant is safe. Note
-two inversions of the edge's usual posture, both deliberate: the brake fires on
-STALE POLICY and with the KILL SWITCH engaged, because its authority came from
-a signed artifact rather than from cached policy, and because reducing exposure
-is the safe direction.
+the inversion of the edge's usual posture, which is deliberate: the brake fires
+on STALE POLICY, because its authority came from a signed artifact rather than
+from cached policy, and because reducing exposure is the safe direction.
 """
 
 import asyncio
@@ -833,9 +832,9 @@ async def test_the_brake_fires_while_the_gated_tool_surface_refuses(tmp_path):
 
     Every promoted eligible platform tool is behind `_gate()`, so policy
     staleness now refuses nearly everything an agent can reach. brake.py
-    documents its own exit path as "Deliberately NOT gated on policy freshness
-    or on the kill switch", because a stop supervisor that switches off with
-    everything else is not a safety device, and nothing pinned the two facts
+    documents its own exit path as "Deliberately NOT gated on policy freshness",
+    because a stop supervisor that switches off with everything
+    else is not a safety device, and nothing pinned the two facts
     together: a later refactor could route the brake through the same door and
     no test would notice.
 

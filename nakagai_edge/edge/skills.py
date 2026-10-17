@@ -18,7 +18,6 @@ SKILL_NAMES = (
     "check-the-evidence",
     "connect-edge",
     "daily-brief",
-    "halt",
     "nakagai-chat",
     "pair-agent",
     "verify",

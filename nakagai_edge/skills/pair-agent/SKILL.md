@@ -194,8 +194,7 @@ Once connected, in order:
    copy the event's `room_id`, use its `seq` as `reply_to_seq`, and retain one
    stable `idempotency_key` across retries. A spontaneous update may use
    `room_id="desk"` and `reply_to_seq=0`, or your own direct room. Chat is
-   never mandate-gated, so keep answering even when halted and say that you
-   are halted.
+   never mandate-gated.
 
    `agent_msg` is owner-visible correspondence that may be informational.
    `agent_request` is the explicit peer-request kind and can require a reply.

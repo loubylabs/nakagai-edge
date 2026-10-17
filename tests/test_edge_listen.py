@@ -610,10 +610,10 @@ def test_an_anchor_failure_says_so(tmp_path):
 # --- mandate --------------------------------------------------------------
 
 def test_chat_is_not_mandate_gated(tmp_path):
-    """Speech is never gated. A halted agent must still be able to say it is
-    halted, so the listener keeps delivering whatever the mandate says."""
+    """Speech is never gated, so the listener keeps delivering whatever the
+    mandate says."""
     client = FakeClient([_payload([], 1),
-                         _payload([_owner(2)], 2, live_link=False, kill_switch=True)])
+                         _payload([_owner(2)], 2, live_link=False)])
     emitted = []
     _listener(tmp_path, client, emitted).run(should_continue=_stop_after(2))
     assert [e["seq"] for e in emitted] == [2]
