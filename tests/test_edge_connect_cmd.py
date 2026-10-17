@@ -82,7 +82,7 @@ def test_a_detected_client_gets_registered_and_the_skills_installed(
     assert rc == 0
     assert fake.registered == ["http://127.0.0.1:8330/mcp/"]
     assert "registered" in out
-    assert (tmp_path / "fake-skills" / "halt" / "SKILL.md").is_file()
+    assert (tmp_path / "fake-skills" / "daily-brief" / "SKILL.md").is_file()
     assert json.loads((tmp_path / "skills-manifest.json").read_text())
 
 
@@ -99,7 +99,7 @@ def test_a_failed_registration_says_so_and_still_installs(capsys, monkeypatch,
 
     assert rc == 0
     assert "NOT registered" in out
-    assert (tmp_path / "fake-skills" / "halt" / "SKILL.md").is_file()
+    assert (tmp_path / "fake-skills" / "daily-brief" / "SKILL.md").is_file()
 
 
 # --- setup connects too, and does it on the near side of the blocking serve ---

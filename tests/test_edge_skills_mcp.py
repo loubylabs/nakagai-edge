@@ -54,12 +54,11 @@ def edge_mcp(tmp_path):
                            Brake(state, hub, client, audit))
 
 
-def test_list_skills_returns_the_canonical_eight():
+def test_list_skills_returns_the_canonical_seven():
     assert skills.list_skills() == [
         "check-the-evidence",
         "connect-edge",
         "daily-brief",
-        "halt",
         "nakagai-chat",
         "pair-agent",
         "verify",
@@ -68,9 +67,9 @@ def test_list_skills_returns_the_canonical_eight():
 
 
 def test_read_skill_returns_the_body():
-    body = skills.read_skill("halt")
+    body = skills.read_skill("daily-brief")
     assert body.startswith("---")
-    assert "kill switch" in body.lower()
+    assert "pending approvals" in body.lower()
 
 
 def test_read_skill_raises_for_unknown():
@@ -79,7 +78,7 @@ def test_read_skill_raises_for_unknown():
 
 
 def test_description_comes_from_frontmatter():
-    assert "stop" in skills.skill_description("halt").lower()
+    assert "morning brief" in skills.skill_description("daily-brief").lower()
 
 
 def test_pair_agent_covers_direct_and_edge_onboarding():
@@ -113,10 +112,10 @@ async def test_the_index_resource_names_every_skill(edge_mcp):
     body = next(iter(await edge_mcp.read_resource("nakagai://skills"))).content
     index = json.loads(body)
     assert set(index) == set(skills.list_skills())
-    assert index["halt"] == skills.skill_description("halt")
+    assert index["daily-brief"] == skills.skill_description("daily-brief")
 
 
 @pytest.mark.anyio
 async def test_a_skill_resource_serves_its_full_text(edge_mcp):
-    body = next(iter(await edge_mcp.read_resource("nakagai://skills/halt"))).content
-    assert body == skills.read_skill("halt")
+    body = next(iter(await edge_mcp.read_resource("nakagai://skills/daily-brief"))).content
+    assert body == skills.read_skill("daily-brief")

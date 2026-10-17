@@ -5,7 +5,7 @@ the only place a broker credential is ever written to disk. Your agent talks to
 exactly one MCP endpoint, the edge, and never sees a token. The platform never
 sees one either.
 
-Version 0.7.0 is the current release. Autopilot and execution candidates are
+Version 0.7.1 is the current release. Autopilot and execution candidates are
 removed: orders reach a broker only as owner-approved order proposals. It
 speaks proposal protocol 1: when an
 outside agent proposes an order on the platform and the owner approves it, the
@@ -129,7 +129,7 @@ uvx nakagai-edge connect
 The one client recognized today is Claude Code, detected by `claude` being on
 your PATH. It gets an MCP entry added with
 `claude mcp add --scope user nakagai --transport http <url>`, at user scope
-because a project-scoped entry needs a per-project approval, and the eight skills
+because a project-scoped entry needs a per-project approval, and the seven skills
 below are copied into `~/.claude/skills/`. A client that is not detected is not
 an obstacle: the snippet below is the whole contract.
 
@@ -183,7 +183,7 @@ because a name that fails legibly beats a set of tools that silently vanish.
 
 ## Skills
 
-Eight skills ship inside the wheel:
+Seven skills ship inside the wheel:
 
 - **`connect-edge`**: connect a local edge to a hosted platform, and diagnose
   the known failure modes.
@@ -193,8 +193,6 @@ Eight skills ship inside the wheel:
   relay, with an opt-in write-path drill through approvals.
 - **`daily-brief`**: signals, open risk, portfolio and pending approvals in one
   pass.
-- **`halt`**: stop trading authority now, and say precisely what is and is not
-  stopped.
 - **`check-the-evidence`**: pull a play's proving record before endorsing it,
   and say so plainly when there is none.
 - **`nakagai-chat`**: hold the owner's live chat channel open and answer
@@ -285,8 +283,7 @@ Notes that matter:
   as `reply_to_seq`, and a stable `idempotency_key` with `send_message`. Use
   `list_peers` before `request_peer`; peer requests are visible to the owner in
   Desk and are never a private agent channel.
-* **Chat is never mandate-gated.** The kill switch halts trading authority, not
-  speech: a halted agent must still be able to tell you that it is halted.
+* **Chat is never mandate-gated.**
 
 ## The write path
 
@@ -486,8 +483,6 @@ knowing:
   in the edge refuses when policy goes stale, because every other path exists
   to restrain the agent. The brake's authority is in the signed warrant, and
   firing only reduces exposure.
-- **The kill switch does not stop it.** The kill switch halts the agent.
-  Killing the agent must not strip the stops off your open positions.
 
 ```bash
 nakagai-edge brake status              # what is watched, and its risk in R

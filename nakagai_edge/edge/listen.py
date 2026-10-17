@@ -112,7 +112,7 @@ RENDERERS = {
                      "bar_ts", "entry", "stop", "target", "rr"),
     "approval_decided": _named("approval_id", "status", "decided_by",
                                "connector_id", "tool", "signal_id"),
-    "mandate_changed": _named("preset", "kill_switch"),
+    "mandate_changed": _named("preset"),
     # A signal someone put a question mark against: the owner pressing "Ask
     # the agent", or their own confluence dial clearing on its own.
     # `referred_by` says which, an email or the literal "confluence".
