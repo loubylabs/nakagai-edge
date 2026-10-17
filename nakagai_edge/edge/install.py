@@ -20,11 +20,14 @@ class InstallReport:
     written: list[str] = field(default_factory=list)
     skipped_modified: list[str] = field(default_factory=list)
     unchanged: list[str] = field(default_factory=list)
+    removed: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
         bits = []
         if self.written:
             bits.append(f"{len(self.written)} installed")
+        if self.removed:
+            bits.append(f"{len(self.removed)} retired")
         if self.unchanged:
             bits.append(f"{len(self.unchanged)} already current")
         if self.skipped_modified:
@@ -93,6 +96,26 @@ def install_skills(dest: Path, *, manifest: Path) -> InstallReport:
         target.write_text(body, encoding="utf-8")
         recorded[name] = _digest(body)
         report.written.append(name)
+
+    # A skill a release stopped shipping is retired from disk on the same rule:
+    # removed only while it still matches what we wrote, so a stale copy cannot
+    # keep telling an agent to use a tool that is gone. An edited copy is theirs.
+    for name in sorted(set(recorded) - set(packaged)):
+        target = dest / name / "SKILL.md"
+        if target.exists():
+            try:
+                current = target.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                report.skipped_modified.append(name)
+                continue
+            if _digest(current) != recorded[name]:
+                report.skipped_modified.append(name)
+                continue
+            target.unlink()
+            if not any(target.parent.iterdir()):
+                target.parent.rmdir()
+            report.removed.append(name)
+        del recorded[name]
 
     manifest.parent.mkdir(parents=True, exist_ok=True)
     manifest.write_text(json.dumps(recorded, indent=2), encoding="utf-8")
