@@ -518,7 +518,7 @@ async def test_a_connector_that_declares_no_list_positions_does_not_fire_blind(
     assert "not firing blind" in reason
     assert load(state)["ap_1"]["state"] == "armed"
     assert client.messages, "the owner must hear the position is unguarded"
-    assert "denial" in [e["kind"] for e in brake.audit.pending()]
+    assert "denial" in [e["kind"] for e in brake.audit.events()]
 
 
 # ---- fix round 1: one-shot under concurrency, and loud refusals ----------
@@ -552,7 +552,7 @@ async def test_the_owner_hears_when_the_broker_will_not_confirm_the_position(tmp
     record(state, _rec())
     await brake.fire(load(state)["ap_1"])
     assert client.messages, "the owner must hear the position is unguarded"
-    kinds = [e["kind"] for e in brake.audit.pending()]
+    kinds = [e["kind"] for e in brake.audit.events()]
     assert "denial" in kinds
 
 
@@ -599,7 +599,7 @@ async def test_a_connector_that_declares_no_place_order_refuses_by_name(tmp_path
     assert [c[0] for c in hub.calls] == ["get_equity_positions"]
     assert load(state)["ap_1"]["state"] == "armed"
     assert client.messages, "the owner must hear the position is unguarded"
-    assert "denial" in [e["kind"] for e in brake.audit.pending()]
+    assert "denial" in [e["kind"] for e in brake.audit.events()]
 
 
 async def test_the_owner_hears_when_the_connector_cannot_express_an_exit(tmp_path):
@@ -611,7 +611,7 @@ async def test_the_owner_hears_when_the_connector_cannot_express_an_exit(tmp_pat
     assert [c[0] for c in hub.calls] == ["get_equity_positions"]
     assert load(state)["ap_1"]["state"] == "armed"
     assert client.messages, "the owner must hear the position is unguarded"
-    kinds = [e["kind"] for e in brake.audit.pending()]
+    kinds = [e["kind"] for e in brake.audit.events()]
     assert "denial" in kinds
 
 
@@ -632,7 +632,7 @@ async def test_fire_refuses_an_account_less_record_without_asking_the_broker(tmp
     assert hub.calls == [], "the broker must never be asked about account ''"
     assert load(state)["ap_1"]["state"] == "armed"
     assert client.messages, "the owner must hear the position is unguarded"
-    assert "denial" in [e["kind"] for e in brake.audit.pending()]
+    assert "denial" in [e["kind"] for e in brake.audit.events()]
 
 
 # ---- final round: the owner is told, not buried ---------------------------
@@ -651,7 +651,7 @@ async def test_a_refusal_repeated_every_tick_is_told_once(tmp_path):
     for i in range(6):
         await brake.fire(load(state)["ap_1"], now=1000.0 + i * 15.0)
     assert len(client.messages) == 1
-    denials = [e for e in brake.audit.pending() if e["kind"] == "denial"]
+    denials = [e for e in brake.audit.events() if e["kind"] == "denial"]
     assert len(denials) == 6, "the journal keeps every refusal"
 
 
@@ -789,7 +789,7 @@ async def test_a_quote_famine_reaches_the_owner_once(tmp_path):
     assert await brake.tick({}, 1.0 + (ticks - 1) * 15.0) == []
     assert len(client.messages) == 1
     assert "AAPL" in client.messages[0]
-    assert "error" in [e["kind"] for e in brake.audit.pending()]
+    assert "error" in [e["kind"] for e in brake.audit.events()]
 
     for i in range(ticks, ticks + 6):
         await brake.tick({}, 1.0 + i * 15.0)

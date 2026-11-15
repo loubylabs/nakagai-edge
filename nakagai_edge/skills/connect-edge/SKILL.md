@@ -61,7 +61,7 @@ uvx nakagai-edge run          # long-running; background it
 ```
 
 `run` serves MCP on `http://127.0.0.1:8330/mcp/` and starts the sync,
-executor, audit-ship, and portfolio loops. Point the agent's MCP client at
+executor, portfolio, fills, and brake loops. Point the agent's MCP client at
 that one URL; it carries platform tools, broker tools, and approval polling.
 
 To bounce an edge that is already up, do not stop and `run` again by hand:

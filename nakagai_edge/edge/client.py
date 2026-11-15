@@ -266,16 +266,12 @@ class PlatformClient:
         return self._check(self._client.post("/api/agent/portfolio",
                                              json={"connectors": connectors}))
 
-    def ship_audit(self, events: list[dict]) -> dict:
-        return self._check(self._client.post("/api/agent/audit",
-                                             json={"events": events}))
-
     def report_fills(self, fills: list[dict]) -> dict:
-        # Deliberately NOT ship_audit. The audit trail is the record of what
-        # the edge did, and it is what answers for the agent's conduct; a trade
-        # the owner placed in the broker's own app is an observation about the
-        # broker, not an edge action. Sharing the pipe would stop the audit
-        # trail answering the one question it exists for.
+        # Fills are not audit events. The local audit journal is the record of
+        # what the edge did, and it is what answers for the agent's conduct; a
+        # trade the owner placed in the broker's own app is an observation
+        # about the broker, not an edge action, so it has its own journal and
+        # its own route.
         return self._check(self._client.post("/api/agent/fills",
                                              json={"fills": fills}))
 

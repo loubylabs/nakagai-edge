@@ -128,8 +128,6 @@ def _setup(tmp_path, grant_status="granted", artifact=None,
         if req.url.path == "/api/agent/checkin":
             alerts.append(json.loads(req.content))
             return httpx.Response(200, json={"ok": True})
-        if req.url.path == "/api/agent/audit":
-            return httpx.Response(200, json={"ok": True, "accepted": 1})
         return httpx.Response(404, json={"detail": "?"})
 
     client = PlatformClient("https://api.test", "nk_agent_t",

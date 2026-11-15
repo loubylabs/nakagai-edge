@@ -10,7 +10,7 @@
     cache/proposals-adopted.json    approval and proposal ids adopted from
                         granted proposals, so one proposal becomes at most one
                         local intent
-    results/audit.jsonl local audit journal, shipped in batches
+    results/audit.jsonl local audit journal; it never leaves this machine
     edge.pid            the serving daemon: pid, port, start, version.
                         pid 0 once it has stopped: the claim is released,
                         the port stays, so a restart comes back where it was

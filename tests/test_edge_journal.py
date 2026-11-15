@@ -21,8 +21,8 @@ def test_pending_returns_what_has_not_shipped_and_stops_there(tmp_path):
 
 def test_an_unreadable_line_is_none_rather_than_an_empty_record(tmp_path):
     # None, not {}: the caller has to decide what a lost line means, and an
-    # empty record would let it skip that decision without noticing. The audit
-    # trail ships a `corrupt` marker; the fill journal drops it.
+    # empty record would let it skip that decision without noticing. The fill
+    # journal drops it.
     path = tmp_path / "j.jsonl"
     j = Journal(path)
     j.append({"n": 0})

@@ -857,3 +857,46 @@ async def test_the_syncer_survives_a_report_that_raises(tmp_path, monkeypatch, c
     assert calls["bundle"] >= 2, "sync_once stopped running too, not just the report"
     assert any("connector" in r.message.lower() for r in caplog.records)
     await hub.aclose()
+
+
+async def test_the_audit_journal_never_leaves_the_machine(tmp_path, monkeypatch):
+    """The audit journal is local-only: with an event already recorded, the
+    running loops make no request to the retired audit ingest route, and the
+    event stays readable in the journal."""
+    import nakagai_edge.edge.runtime as runtime
+    monkeypatch.setattr(runtime, "SYNC_INTERVAL_S", 0.01)
+    state = _state(tmp_path)
+    paths = []
+
+    def handler(req):
+        paths.append(req.url.path)
+        if req.url.path == "/api/agent/bundle":
+            return httpx.Response(200, json={"bundle_version": "v1",
+                                             "schema_version": BUNDLE_SCHEMA,
+                                             "connectors": {"connectors": []},
+                                             "signing_public_key": "k"},
+                                  headers={"etag": "v1"})
+        return httpx.Response(404, json={"detail": "?"})
+
+    client = PlatformClient("https://api.test", "t",
+                            transport=httpx.MockTransport(handler))
+    hub = build_hub(state, client)
+    audit = EdgeAudit(state)
+    audit.record("call", "robinhood-trading", "get_account", {"ok": True})
+
+    tasks = await runtime._loops(state, hub, client, audit, _Reporter(),
+                                 Brake(state, hub, client, audit), _NoFills())
+    for _ in range(200):
+        if paths.count("/api/agent/bundle") >= 3:
+            break
+        await asyncio.sleep(0.01)
+    for t in tasks:
+        t.cancel()
+    for t in tasks:
+        with contextlib.suppress(asyncio.CancelledError):
+            await t
+
+    assert paths.count("/api/agent/bundle") >= 3, "the loops never ran"
+    assert "/api/agent/audit" not in paths
+    assert [e["kind"] for e in audit.events()] == ["call"]
+    await hub.aclose()

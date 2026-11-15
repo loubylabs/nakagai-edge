@@ -535,7 +535,7 @@ async def test_every_pre_guard_refusal_is_journalled(tmp_path, specs, tool,
     doc = await _call(_server(state, hub), tool, **args)
 
     assert doc["is_error"] is True
-    events = EdgeAudit(state).pending()
+    events = EdgeAudit(state).events()
     assert [e["kind"] for e in events] == ["denial"]
     assert events[0]["connector_id"] == connector
     assert events[0]["detail"]["capability"] == tool
@@ -568,7 +568,7 @@ async def test_a_failed_inference_probe_journals_no_denial(tmp_path):
     doc = await _call(_server(state, hub), "get_balance")
 
     assert not doc.get("is_error"), "the outer call is unaffected by the probe"
-    assert [e["kind"] for e in EdgeAudit(state).pending()] == ["call"]
+    assert [e["kind"] for e in EdgeAudit(state).events()] == ["call"]
 
 
 # ---- account inference ----------------------------------------------------
@@ -765,7 +765,7 @@ async def test_a_stale_write_attempt_is_still_journalled(tmp_path, monkeypatch):
 
     await _call(mcp, "cancel_order", order_id="AL-ORD-1")
 
-    events = EdgeAudit(state).pending()
+    events = EdgeAudit(state).events()
     assert len(events) == 1
     assert events[0]["kind"] == "denial"
     assert events[0]["detail"] == {"reason": "policy stale",

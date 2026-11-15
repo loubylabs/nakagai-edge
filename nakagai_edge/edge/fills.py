@@ -45,7 +45,7 @@ from nakagai_edge.edge.portfolio import (broker_specs, listed_accounts,
 from nakagai_edge.edge.remote import intents
 
 FILLS_INTERVAL_S = 300          # the timer loop's cadence
-SHIP_LIMIT = 200                # rows per POST, matching the audit shipper
+SHIP_LIMIT = 200                # rows per POST
 
 ANCHOR_RELPATH = Path("cache") / "fills-anchor.json"
 JOURNAL_RELPATH = Path("results") / "fills.jsonl"

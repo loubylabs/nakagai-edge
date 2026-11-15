@@ -1,7 +1,8 @@
 """The edge shim itself: an MCPServer on 127.0.0.1 that IS the agent's
 whole world. Brokers are dialed with locally-held credentials through the
 unmodified gateway runtime; the platform is reached as data (via a synced
-nakagai-mcp connector) and as authority (approvals, audit, bundle).
+nakagai-mcp connector) and as authority (approvals, bundle). The audit
+journal stays on this machine.
 
 Fail-closed: policy staler than sync.POLICY_TTL_S refuses every connector
 call. Writes additionally require a live platform grant, so they are doubly
@@ -36,7 +37,6 @@ from nakagai_edge.edge.sync import (POLICY_TTL_S, SYNC_INTERVAL_S, policy_fresh,
                                     schema_error, sync_once)
 
 EXECUTOR_INTERVAL_S = 5
-AUDIT_SHIP_INTERVAL_S = 30
 
 # The platform, as the edge dials it. sync.py rewrites this one registry entry
 # to point at the real platform with the agent's own bearer token.
@@ -901,8 +901,6 @@ async def _quotes(hub, state: EdgeState, symbols: list[str]) -> dict:
 
 async def _loops(state: EdgeState, hub, client: PlatformClient, audit: EdgeAudit,
                  reporter, brake: Brake, fills):
-    from nakagai_edge.edge.client import EdgeClientError
-
     async def syncer():
         while True:
             await asyncio.to_thread(sync_once, state, client)
@@ -960,17 +958,6 @@ async def _loops(state: EdgeState, hub, client: PlatformClient, audit: EdgeAudit
                 pass  # next pass retries; the journal has the details
             await asyncio.sleep(EXECUTOR_INTERVAL_S)
 
-    async def shipper():
-        while True:
-            batch = audit.pending()
-            if batch:
-                try:
-                    await asyncio.to_thread(client.ship_audit, batch)
-                    audit.mark_shipped(len(batch))
-                except EdgeClientError:
-                    pass  # ship on reconnect
-            await asyncio.sleep(AUDIT_SHIP_INTERVAL_S)
-
     async def portfolio_loop():
         while True:
             try:
@@ -1013,7 +1000,6 @@ async def _loops(state: EdgeState, hub, client: PlatformClient, audit: EdgeAudit
 
     return [asyncio.create_task(syncer(), name="syncer"),
             asyncio.create_task(executor(), name="executor"),
-            asyncio.create_task(shipper(), name="shipper"),
             asyncio.create_task(portfolio_loop(), name="portfolio_loop"),
             asyncio.create_task(fills_loop(), name="fills_loop"),
             asyncio.create_task(brake_loop(), name="brake_loop")]

@@ -1,17 +1,16 @@
 """An append-only JSONL with a watermark saying how much of it has shipped.
 
 Two journals share this: the audit trail (edge/audit.py) and the fill journal
-(edge/fills.py). Both are local-first for the same reason. What happened on
-this machine is written down before the platform is told, so a platform outage
-costs latency and never a record, and a reconnect ships the gap rather than
-skipping it.
+(edge/fills.py). Both are local-first: what happened on this machine is written
+down here first. The audit trail never leaves the machine and only appends and
+reads `records()`. The fill journal ships, and uses the watermark: a platform
+outage costs latency and never a record, and a reconnect ships the gap rather
+than skipping it.
 
-No policy lives here. What a record looks like, and whether an unreadable line
-is worth reporting upstream, are the callers' decisions: the audit trail ships
-a `corrupt` marker so the owner can see a line was lost, while the fill journal
-drops it, because a fill nobody can read cannot be joined to anything anyway.
-This module only offers the distinction, by handing back `None` for a line it
-could not parse.
+No policy lives here. What a record looks like, and what an unreadable line
+means, are the callers' decisions; the fill journal drops one, because a fill
+nobody can read cannot be joined to anything anyway. This module only offers
+the distinction, by handing back `None` for a line it could not parse.
 
 The watermark counts LINES, not records, and that is what makes the `None`
 above safe. A caller that drops unreadable lines must still mark them shipped,
