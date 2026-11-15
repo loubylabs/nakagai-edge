@@ -1,6 +1,6 @@
 ---
 name: verify-edge
-description: Run the edge health ladder: prove the local edge, its pairing, every connector, and the platform relay (check-in, portfolio, audit, events) are green, with an opt-in write-path drill through approvals. Use when asked whether the edge is healthy, connected, relaying, or "everything green", or after connect-edge / pair-agent to confirm the result.
+description: Run the edge health ladder: prove the local edge, its pairing, every connector, and the platform relay (check-in, portfolio, events) are green, with an opt-in write-path drill through approvals. Use when asked whether the edge is healthy, connected, relaying, or "everything green", or after connect-edge / pair-agent to confirm the result.
 ---
 
 # Verify the edge, end to end

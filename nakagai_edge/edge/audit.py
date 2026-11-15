@@ -1,12 +1,10 @@
 """Local-first audit: every call, denial, execution, and error is journaled on
-the edge before it ships. Offline decisions reach the platform on reconnect;
-secrets never do; scrub() runs on the way into the journal.
+this machine. The journal never leaves it; scrub() runs on the way in all the
+same, so a secret never lands in a file the owner may share.
 
-The append/watermark/ship mechanics live in edge/journal.py, shared with the
-fill journal. What stays here is what is genuinely audit's own: scrubbing, the
-event shape, and the decision that an unreadable line ships as a visible
-`corrupt` marker rather than vanishing. A line lost out of the record of what
-the agent did is exactly the thing an audit trail must not swallow.
+The append mechanics live in edge/journal.py, shared with the fill journal.
+What stays here is what is genuinely audit's own: scrubbing and the event
+shape. The audit journal keeps no watermark, because nothing ships it.
 """
 
 import time
@@ -43,17 +41,7 @@ class EdgeAudit:
                               "connector_id": connector_id, "tool": tool,
                               "detail": self.scrub(detail or {})})
 
-    def pending(self, limit: int = 200) -> list[dict]:
-        """The next unshipped events, an unreadable line standing in as a
-        `corrupt` marker rather than being dropped.
-
-        The returned count still matches the lines consumed, which is what lets
-        the caller `mark_shipped(len(batch))` without stranding the bad line and
-        re-reading it forever.
-        """
-        return [event if event is not None
-                else {"ts": time.time(), "kind": "corrupt", "detail": {}}
-                for event in self._journal.pending(limit)]
-
-    def mark_shipped(self, n: int) -> None:
-        self._journal.mark_shipped(n)
+    def events(self) -> list[dict]:
+        """Every readable event in the journal, oldest first. An unreadable
+        line is skipped here and stays in the file, where the owner can see it."""
+        return list(self._journal.records())

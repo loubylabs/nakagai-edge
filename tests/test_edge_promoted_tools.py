@@ -414,7 +414,7 @@ async def test_run_sweep_preserves_specs_json_with_typed_policies_and_defaults(
 
     async with _promoted_edge(
             tmp_path, upstream=_sweep_platform, guardrails=guardrails) as edge:
-        before = len(edge.audit.pending())
+        before = len(edge.audit.events())
         doc = await edge.call(
             "run_sweep",
             target_play="adx_pullback",
@@ -424,7 +424,7 @@ async def test_run_sweep_preserves_specs_json_with_typed_policies_and_defaults(
             benchmark=benchmark,
             idempotency_key="sweep-string-forwarding",
         )
-        events = edge.audit.pending()[before:]
+        events = edge.audit.events()[before:]
 
     expected = {
         "target_play": "adx_pullback",
@@ -448,9 +448,9 @@ async def test_a_promoted_call_goes_through_the_guardrail_door(edge):
     """`_guarded` is the only place a connector call is journalled. No audit
     record means the call reached `hub.call` some other way, which is the one
     thing this feature must never do."""
-    before = len(edge.audit.pending())
+    before = len(edge.audit.events())
     await edge.call("get_signals")
-    events = edge.audit.pending()[before:]
+    events = edge.audit.events()[before:]
     assert [e["kind"] for e in events] == ["call"]
     assert events[0]["connector_id"] == PLATFORM
     assert events[0]["tool"] == "get_signals"
@@ -499,18 +499,18 @@ async def test_a_write_earns_the_same_verdict_through_both_doors(
     args = {"reason": "the owner asked", "add": ["AAPL"]}
 
     async with _promoted_edge(tmp_path, guardrails=guardrails) as edge:
-        before = len(edge.audit.pending())
+        before = len(edge.audit.events())
         promoted = await edge.call("edit_account_watchlist", **args)
         promoted_arrived = list(platform_mcp.calls)
-        promoted_events = edge.audit.pending()[before:]
+        promoted_events = edge.audit.events()[before:]
 
         platform_mcp.calls.clear()
-        before = len(edge.audit.pending())
+        before = len(edge.audit.events())
         raw = await edge.call("call_connector", connector_id=PLATFORM,
                               tool="edit_account_watchlist",
                               args_json=json.dumps(args))
         raw_arrived = list(platform_mcp.calls)
-        raw_events = edge.audit.pending()[before:]
+        raw_events = edge.audit.events()[before:]
 
     assert promoted == raw, "the entry point moved the verdict"
     assert promoted_arrived == raw_arrived, "the two doors sent different bytes"

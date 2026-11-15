@@ -53,11 +53,10 @@ def test_approval_round_trip_paths():
     c = PlatformClient("https://api.test", "nk_agent_t", transport=_transport(handler))
     c.get_approval("a1")
     c.report_execution("a1", ok=True, result={"id": "42"})
-    c.ship_audit([{"kind": "call"}])
     assert not hasattr(c, "enqueue_approval")
+    assert not hasattr(c, "ship_audit")
     assert seen == [("GET", "/api/agent/approvals/a1"),
-                    ("POST", "/api/agent/approvals/a1/execution"),
-                    ("POST", "/api/agent/audit")]
+                    ("POST", "/api/agent/approvals/a1/execution")]
 
 
 def test_chat_protocol_request_shapes():
@@ -455,6 +454,6 @@ def test_every_request_carries_the_running_version():
     c = PlatformClient("https://p.example", "nk_agent_x",
                        transport=httpx.MockTransport(handler))
     c.agent_checkin("idle")
-    c.ship_audit([])
+    c.report_fills([])
     assert seen == [package_version(), package_version()]
     assert package_version() != ""

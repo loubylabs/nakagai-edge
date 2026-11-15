@@ -5,7 +5,7 @@ the only place a broker credential is ever written to disk. Your agent talks to
 exactly one MCP endpoint, the edge, and never sees a token. The platform never
 sees one either.
 
-Version 0.7.1 is the current release. Autopilot and execution candidates are
+Version 0.7.2 is the current release. Autopilot and execution candidates are
 removed: orders reach a broker only as owner-approved order proposals. It
 speaks proposal protocol 1: when an
 outside agent proposes an order on the platform and the owner approves it, the
@@ -65,8 +65,8 @@ call, the platform placed the trade. The fix is a custody split:
 - **Control plane: the platform (`api.nakag.ai`).** Source of truth for
   everything that is not a broker secret: settings, the mandate, the monitor
   watchlist (what an account watches), strategy configs, the
-  connector registry, guardrail policy, the approval queue and its signing key,
-  and audit ingest. It issues *signed decisions*.
+  connector registry, guardrail policy, and the approval queue and its signing
+  key. It issues *signed decisions*.
   It never dials a broker and never executes an edge-origin trade.
 - **Data plane: the edge (this package, user-run).** Sole holder of broker
   credentials, stored locally under mode-0600 token files. Serves MCP on
@@ -538,9 +538,9 @@ Three properties are deliberate:
   than splitting a row by arithmetic that drifts wrong after the first transfer
   or corporate action. The journal is the record.
 
-The journal is local-first, like the audit trail and for the same reason: it is
-written here before the platform is told, so an outage costs latency and never
-a record.
+The journal is local-first: it is written here before the platform is told, so
+an outage costs latency and never a record. The audit trail of what the agent
+did, `results/audit.jsonl`, is local too, and never leaves this machine.
 
 ## Failure modes
 

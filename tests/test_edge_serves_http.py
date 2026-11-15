@@ -137,7 +137,7 @@ def test_run_binds_the_loopback_address_and_the_port_it_was_handed(tmp_path,
     Nothing here is asserted about serving, which the test above owns. The
     serve coroutine is replaced on the instance `run()` built, so the whole of
     `run()` executes for real up to that one call and then unwinds: promotion,
-    the pidfile, the hub. `_loops` is stubbed because its six loops immediately
+    the pidfile, the hub. `_loops` is stubbed because its five loops immediately
     dial a platform this test has no business standing up, and each of them is
     covered by its own module.
     """
