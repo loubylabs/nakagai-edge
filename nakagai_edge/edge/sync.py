@@ -217,6 +217,25 @@ def server_edge_version(state: EdgeState) -> str:
     return version if isinstance(version, str) else ""
 
 
+def trade_history_days(state: EdgeState, connector_id: str) -> int:
+    """How many days of order history the owner chose to send for a connector.
+
+    Read off the cached bundle's top-level `trade_history` key, which lists
+    only connectors whose owner turned history on. Zero covers every other
+    case: no bundle yet, a platform that predates the key, a connector not
+    listed, or a value that is not a positive whole number. Zero means no
+    backfill, the journal's default.
+    """
+    try:
+        doc = json.loads(state.bundle_path.read_text())
+        days = ((doc.get("trade_history") or {}).get(connector_id) or {}).get("days")
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return 0
+    if isinstance(days, bool) or not isinstance(days, int) or days < 0:
+        return 0
+    return days
+
+
 def sync_once(state: EdgeState, client: PlatformClient) -> bool:
     """One conditional fetch. Returns True when the bundle changed. No
     exception ever escapes: network trouble, a non-JSON body, a bad 304

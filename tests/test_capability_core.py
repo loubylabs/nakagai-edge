@@ -152,3 +152,98 @@ def test_notional_is_numeric_not_a_relayed_display_string():
     assert coerce("notional", "250.00", cap) == 250.0
     assert coerce("notional", "not a number", cap) is None
     assert coerce("notional", True, cap) is None
+
+
+# ---- history: since, cursor, next, filled_quantity -------------------------
+
+def test_list_orders_takes_since_and_cursor():
+    assert CAPABILITIES["list_orders"].args == ("account", "status", "since",
+                                                "cursor")
+
+
+def test_filled_quantity_is_a_float_beside_quantity():
+    from nakagai_edge.capability import read_row
+    assert "filled_quantity" in CAPABILITIES["list_orders"].optional
+    cap = _orders_cap(quantity=["quantity"], filled_quantity=["done"])
+    row = read_row("list_orders", cap,
+                   {"id": "o", "symbol": "a", "quantity": "10", "done": "4"})
+    assert row["filled_quantity"] == 4.0
+    assert coerce("filled_quantity", "nan", cap) is None
+
+
+def test_since_and_cursor_travel_under_the_maps_keys():
+    from nakagai_edge.capability import resolve
+    cap = Capability(tool="orders", args={"account": "acct", "since": "from",
+                                          "cursor": "page"},
+                     fields={"order_id": ["id"], "symbol": ["s"]})
+    tool, args = resolve("list_orders", cap, {"account": "1",
+                                              "since": "2026-11-01T00:00:00Z",
+                                              "cursor": "abc"})
+    assert (tool, args) == ("orders", {"acct": "1",
+                                       "from": "2026-11-01T00:00:00Z",
+                                       "page": "abc"})
+
+
+def test_a_map_without_the_new_keys_still_parses_and_pages_once():
+    from nakagai_edge.config import ConnectorSpec
+    spec = ConnectorSpec(id="b", kind="mcp-http", role="broker", capabilities={
+        "list_orders": {"tool": "orders", "args": {"account": "acct"},
+                        "fields": {"order_id": ["id"], "symbol": ["s"]}}})
+    assert spec.capability("list_orders").next == []
+
+
+def _pager(pages_by_cursor):
+    calls = []
+
+    async def fetch(args):
+        calls.append(dict(args))
+        return pages_by_cursor[args.get("cursor")]
+    return fetch, calls
+
+
+def _paged(cap, payloads, limit):
+    import asyncio
+
+    from nakagai_edge.capability import pages
+    fetch, calls = _pager(payloads)
+    out = asyncio.run(pages(cap, fetch, {"account": "1"}, limit=limit))
+    return out, calls
+
+
+PAGED = Capability(tool="orders", next=["data.next"],
+                   fields={"order_id": ["id"], "symbol": ["s"]})
+
+
+def test_pages_follow_next_until_it_runs_out():
+    out, calls = _paged(PAGED, {None: {"data": {"next": "b"}},
+                                "b": {"data": {"next": "c"}},
+                                "c": {"data": {"next": None}}}, limit=25)
+    assert len(out) == 3
+    assert [c.get("cursor") for c in calls] == [None, "b", "c"]
+
+
+def test_pages_stop_on_an_empty_token():
+    out, _ = _paged(PAGED, {None: {"data": {"next": "b"}},
+                            "b": {"data": {"next": ""}}}, limit=25)
+    assert len(out) == 2
+
+
+def test_pages_stop_on_a_repeated_token():
+    out, calls = _paged(PAGED, {None: {"data": {"next": "b"}},
+                                "b": {"data": {"next": "b"}}}, limit=25)
+    assert len(out) == 2
+    assert [c.get("cursor") for c in calls] == [None, "b"]
+
+
+def test_pages_are_bounded():
+    endless = {None: {"data": {"next": 1}}}
+    endless.update({i: {"data": {"next": i + 1}} for i in range(1, 100)})
+    out, _ = _paged(PAGED, endless, limit=25)
+    assert len(out) == 25
+
+
+def test_a_map_with_no_next_reads_one_page():
+    cap = Capability(tool="orders", fields={"order_id": ["id"], "symbol": ["s"]})
+    out, calls = _paged(cap, {None: {"data": {"next": "b"}}}, limit=25)
+    assert len(out) == 1
+    assert "cursor" not in calls[0]

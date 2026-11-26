@@ -160,10 +160,14 @@ ROBINHOOD_CONNECTOR = {
         # now pins every name in its own map against a recorded one.
         "list_orders": {
             "tool": "get_equity_orders",
-            "args": {"account": "account_number", "status": "state"},
+            "args": {"account": "account_number", "status": "state",
+                     "since": "created_at_gte", "cursor": "cursor"},
             "items": ["data.orders"],
+            "next": ["data.next"],
             "fields": {"order_id": ["id"], "symbol": ["symbol"], "side": ["side"],
-                       "quantity": ["quantity"], "status": ["state"],
+                       "quantity": ["quantity"],
+                       "filled_quantity": ["cumulative_quantity"],
+                       "status": ["state"],
                        "fill_price": ["average_price"],
                        "filled_at": ["last_transaction_at"]},
             "values": {"side": {"buy": ["buy", "buy_to_open", "buy_to_cover"],

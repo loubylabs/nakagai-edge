@@ -157,6 +157,19 @@ def test_chat_protocol_upgrade_error_preserves_server_detail():
         client.list_peers()
 
 
+def test_report_fills_carries_filled_quantity_to_the_platform():
+    seen = {}
+
+    def handler(req):
+        assert req.url.path == "/api/agent/fills"
+        seen.update(json.loads(req.content))
+        return httpx.Response(200, json={"ok": True})
+    c = PlatformClient("https://api.test", "nk_agent_t", transport=_transport(handler))
+    c.report_fills([{"order_id": "o", "symbol": "NVDA", "quantity": 10.0,
+                     "filled_quantity": 4.0}])
+    assert seen["fills"][0]["filled_quantity"] == 4.0
+
+
 def test_state_agent_json_round_trip(tmp_path):
     s = EdgeState(tmp_path)
     assert s.agent() is None

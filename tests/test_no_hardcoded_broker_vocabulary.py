@@ -56,6 +56,10 @@ FORBIDDEN = {
     "average_price": set(),
     "filled_price": set(),
     "execution_price": set(),
+    # The history backfill's words: its creation-time filter and its
+    # filled-amount field. The map translates `since` and `filled_quantity`.
+    "created_at_gte": set(),
+    "cumulative_quantity": set(),
     "buying_power": {"capability.py", "edge/runtime.py"},
     "account_number": {"config.py", "edge/portfolio.py", "edge/supervision.py"},
 }
