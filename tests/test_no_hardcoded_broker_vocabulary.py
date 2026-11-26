@@ -60,6 +60,10 @@ FORBIDDEN = {
     # filled-amount field. The map translates `since` and `filled_quantity`.
     "created_at_gte": set(),
     "cumulative_quantity": set(),
+    # Closed trades: the broker's tool and its profit-or-loss field. The map
+    # translates `list_closed_trades` and `realized_pnl`.
+    "get_pnl_trade_history": set(),
+    "realized_gain": set(),
     "buying_power": {"capability.py", "edge/runtime.py"},
     "account_number": {"config.py", "edge/portfolio.py", "edge/supervision.py"},
 }

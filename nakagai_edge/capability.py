@@ -32,7 +32,7 @@ COERCIONS = {
     "side": SIDE,
     "quantity": FLOAT, "price": FLOAT, "stop": FLOAT, "day_pnl": FLOAT,
     "bid": FLOAT, "ask": FLOAT, "avg_price": FLOAT, "fill_price": FLOAT,
-    "notional": FLOAT, "filled_quantity": FLOAT,
+    "notional": FLOAT, "filled_quantity": FLOAT, "realized_pnl": FLOAT,
 }
 # `notional` is FLOAT beside `quantity` and `fill_price`: it is an order's SIZE
 # and a reader does arithmetic on it. That is the opposite call from `equity`
@@ -41,7 +41,7 @@ COERCIONS = {
 #
 # Everything absent from COERCIONS is VERBATIM: equity, cash, buying_power,
 # market_value, currency, nickname, type, status, order_id, filled_at,
-# created_at, account.
+# created_at, closed_at, account.
 # The edge relays those figures and never does arithmetic on them.
 #
 # `filled_at` is verbatim for the same reason `status` is. Brokers spell
@@ -85,6 +85,16 @@ CANONICAL_ORDER_ENUMS = {
     "order_type": frozenset(("limit", "market")),
 }
 
+# How far back `list_closed_trades` reaches, in canonical words, narrowest
+# first, each with the days it covers (None: everything the broker keeps). A
+# map translates each word into the broker's own under `values.span`; a word it
+# does not translate cannot be asked for, and is never sent raw.
+SPANS = (("week", 7), ("month", 30), ("quarter", 90), ("all", None))
+CANONICAL_SPANS = frozenset(word for word, _days in SPANS)
+
+# The capabilities whose map may declare `next`, each paging through `cursor`.
+PAGED = frozenset(("list_orders", "list_closed_trades"))
+
 CAPABILITIES: dict[str, CapabilitySpec] = {
     "list_accounts": CapabilitySpec(
         args=(), required=("account",), optional=("nickname", "type"),
@@ -126,6 +136,15 @@ CAPABILITIES: dict[str, CapabilitySpec] = {
         required=("order_id", "symbol"),
         optional=("side", "quantity", "filled_quantity", "notional", "status",
                   "fill_price", "filled_at", "created_at"),
+        is_list=True, is_write=False),
+    # One row per CLOSING trade, with the broker's own realized profit or loss
+    # for it. The broker pairs the opening lots; nothing here recomputes that.
+    # `span` is a canonical word from SPANS, translated through `values.span`.
+    # `closed_at` is verbatim for the reason `filled_at` is.
+    "list_closed_trades": CapabilitySpec(
+        args=("account", "span", "cursor"),
+        required=("symbol", "closed_at"),
+        optional=("side", "quantity", "price", "realized_pnl"),
         is_list=True, is_write=False),
     # `optional` here is the RESULT of placing an order, not its arguments:
     # `args` above is what goes out, these are what can be read back. The fill
@@ -188,7 +207,9 @@ def first(payload: Any, paths: list[str]) -> Any:
 
 
 async def pages(cap: Capability, fetch: Callable[[dict], Awaitable[Any]],
-                args: dict, *, limit: int) -> tuple[list[Any], bool]:
+                args: dict, *, limit: int,
+                enough: Callable[[Any], bool] | None = None
+                ) -> tuple[list[Any], bool]:
     """Every payload of a paged read, at most `limit` of them, and whether the
     read stopped at `limit` with a further page still on offer.
 
@@ -197,14 +218,16 @@ async def pages(cap: Capability, fetch: Callable[[dict], Awaitable[Any]],
     the canonical `cursor`. Paging stops at the first payload with no token, an
     empty one, a non-scalar one, or one already sent: a broker that hands back
     the same token twice would otherwise be asked for the same page until the
-    cap. A map declaring no `next` reads exactly one page.
+    cap. It also stops at a payload for which `enough` is true, the caller
+    saying it has read as far back as it needs. A map declaring no `next`
+    reads exactly one page.
     """
     out: list[Any] = []
     sent: set = set()
     while True:
         payload = await fetch(args)
         out.append(payload)
-        if not cap.next:
+        if not cap.next or (enough is not None and enough(payload)):
             return out, False
         token = first(payload, cap.next)
         if (isinstance(token, bool) or not isinstance(token, (str, int))
@@ -393,6 +416,10 @@ def resolve(name: str, cap: Capability, args: dict) -> tuple[str, dict]:
                 f"{name!r}")
         if name == "place_order":
             out[key] = _outbound_value(canonical, value, cap)
+        elif canonical == "span":
+            if value not in CANONICAL_SPANS:
+                raise CapabilityError(f"unsupported canonical 'span': {value!r}")
+            out[key] = _outbound_enum(canonical, value, cap)
         else:
             out[key] = _outbound_enum(canonical, value, cap) if canonical == "side" else value
     return cap.tool, out

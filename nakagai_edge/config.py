@@ -15,8 +15,8 @@ from typing import Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from nakagai_edge._env import read_env_ref
-from nakagai_edge.capability import (CANONICAL_ORDER_ENUMS, CAPABILITIES, OUTBOUND_ORDER_FIELDS, OUTBOUND_TYPES, Capability,
-                                     CapabilityError)
+from nakagai_edge.capability import (CANONICAL_ORDER_ENUMS, CANONICAL_SPANS, CAPABILITIES, OUTBOUND_ORDER_FIELDS,
+                                     OUTBOUND_TYPES, PAGED, Capability, CapabilityError)
 from nakagai_edge.slug import safe_slug
 
 # Verb prefixes that mark a downstream tool as state-changing when the server
@@ -187,21 +187,34 @@ class ConnectorSpec(BaseModel):
         """`next` is only meaningful where its token can be sent back.
 
         A token read off a page and never sent would ask for page one again
-        until the page cap, and read as a complete history. Only `list_orders`
-        pages, and only through its `cursor` argument.
+        until the page cap, and read as a complete history. Only the PAGED
+        capabilities page, and only through their `cursor` argument.
         """
         cid = (info.data or {}).get("id", "?")
         for name in sorted(v):
             if not v[name].next:
                 continue
-            if name != "list_orders":
+            if name not in PAGED:
                 raise ValueError(
                     f"connector {cid!r} declares next on {name}; only "
-                    f"list_orders pages")
+                    f"{' and '.join(sorted(PAGED))} page")
             if "cursor" not in v[name].args:
                 raise ValueError(
-                    f"connector {cid!r} declares next on list_orders but maps "
+                    f"connector {cid!r} declares next on {name} but maps "
                     f"no cursor argument to send the token back")
+        return v
+
+    @field_validator("capabilities")
+    @classmethod
+    def _span_values_are_closed(cls, v: dict, info) -> dict:
+        """A map translates canonical span words only; it cannot add one."""
+        cid = (info.data or {}).get("id", "?")
+        for name in sorted(v):
+            unknown = sorted(set(v[name].values.get("span") or {}) - CANONICAL_SPANS)
+            if unknown:
+                raise ValueError(
+                    f"connector {cid!r} declares unsupported canonical span "
+                    f"values on {name}: {', '.join(unknown)}")
         return v
 
     @field_validator("capabilities")

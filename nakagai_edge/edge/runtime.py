@@ -25,6 +25,7 @@ from nakagai_edge.edge.audit import EdgeAudit
 from nakagai_edge.edge.brake import BRAKE_INTERVAL_S, Brake, normalize_quote
 from nakagai_edge.edge.client import EdgeClientError, PlatformClient
 from nakagai_edge.edge.executor import poll_once
+from nakagai_edge.edge.closed_trades import ClosedTradesReporter
 from nakagai_edge.edge.fills import FILLS_INTERVAL_S, FillsReporter
 from nakagai_edge.edge.portfolio import PORTFOLIO_INTERVAL_S, PortfolioReporter
 from nakagai_edge.edge.remote import RemoteApprovalQueue
@@ -902,7 +903,7 @@ async def _quotes(hub, state: EdgeState, symbols: list[str]) -> dict:
 
 
 async def _loops(state: EdgeState, hub, client: PlatformClient, audit: EdgeAudit,
-                 reporter, brake: Brake, fills):
+                 reporter, brake: Brake, fills, closed):
     async def syncer():
         while True:
             await asyncio.to_thread(sync_once, state, client)
@@ -986,6 +987,13 @@ async def _loops(state: EdgeState, hub, client: PlatformClient, audit: EdgeAudit
             except Exception as e:  # noqa: BLE001 (same posture as the loops above)
                 logging.getLogger("nakagai.edge").warning(
                     "fill journal sweep failed this cycle: %s", e)
+            try:
+                # Same cadence, its own catch: a broker that will not give its
+                # closed trades must not cost the fill journal, nor the reverse.
+                await closed.sweep()
+            except Exception as e:  # noqa: BLE001 (same posture as the loops above)
+                logging.getLogger("nakagai.edge").warning(
+                    "closed trades sweep failed this cycle: %s", e)
             await asyncio.sleep(FILLS_INTERVAL_S)
 
     async def brake_loop():
@@ -1025,6 +1033,7 @@ def run(root, port: int = 8330) -> None:
     audit = EdgeAudit(state)
     reporter = PortfolioReporter(state, hub, client)
     fills = FillsReporter(state, hub, client)
+    closed = ClosedTradesReporter(state, hub, client)
     brake = Brake(state, hub, client, audit)
     for pid in recover_interrupted(state):
         # Spent its warrant, then the edge stopped before the broker answered.
@@ -1039,7 +1048,8 @@ def run(root, port: int = 8330) -> None:
         # surface. It never raises: a platform that will not answer costs the
         # promoted names, not the daemon.
         await mcp.promote_platform_tools()
-        tasks = await _loops(state, hub, client, audit, reporter, brake, fills)
+        tasks = await _loops(state, hub, client, audit, reporter, brake, fills,
+                             closed)
         try:
             # The bind address is an argument to the serve call, not a field on
             # `mcp.settings`: MCPServer.settings carries the construction-time
