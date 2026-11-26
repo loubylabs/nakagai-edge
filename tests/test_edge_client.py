@@ -170,6 +170,21 @@ def test_report_fills_carries_filled_quantity_to_the_platform():
     assert seen["fills"][0]["filled_quantity"] == 4.0
 
 
+def test_report_closed_trades_posts_the_trades_body():
+    seen = {}
+
+    def handler(req):
+        seen["path"] = req.url.path
+        seen["body"] = json.loads(req.content)
+        return httpx.Response(200, json={"ok": True})
+    c = PlatformClient("https://api.test", "nk_agent_t", transport=_transport(handler))
+    row = {"connector_id": "c", "account": "1", "symbol": "NVDA", "side": "sell",
+           "quantity": 10.0, "price": 101.25, "realized_pnl": -3.5,
+           "closed_at": "2026-11-25T15:00:00Z", "trade_key": "k"}
+    c.report_closed_trades([row])
+    assert seen == {"path": "/api/agent/closed-trades", "body": {"trades": [row]}}
+
+
 def test_state_agent_json_round_trip(tmp_path):
     s = EdgeState(tmp_path)
     assert s.agent() is None

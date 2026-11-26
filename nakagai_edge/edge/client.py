@@ -275,6 +275,13 @@ class PlatformClient:
         return self._check(self._client.post("/api/agent/fills",
                                              json={"fills": fills}))
 
+    def report_closed_trades(self, trades: list[dict]) -> dict:
+        # The broker's own closed trades, with the profit or loss it realized
+        # on each. Rows carry `trade_key`, the edge's identity for a row the
+        # broker gives no id, which is what the platform dedupes on.
+        return self._check(self._client.post("/api/agent/closed-trades",
+                                             json={"trades": trades}))
+
     def renew_warrants(self, positions: list[dict]) -> dict:
         # Warrants expire in 24h so a stolen one dies quickly; the edge
         # re-asks on its ordinary sync cadence and the platform re-signs what

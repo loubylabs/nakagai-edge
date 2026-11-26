@@ -160,10 +160,12 @@ class HistoryMarker:
         tmp.replace(self.path)
 
 
-def _fetcher(hub, spec, cap):
-    """One list_orders call, canonical arguments in, the payload out."""
+def fetcher(hub, spec, name: str):
+    """One capability call, canonical arguments in, the payload out."""
+    cap = spec.capability(name)
+
     async def fetch(args: dict):
-        tool, resolved = resolve("list_orders", cap, args)
+        tool, resolved = resolve(name, cap, args)
         return (await hub.call(
             spec.id, tool, resolved, account_key=hub.account_key
         )).get("data")
@@ -184,7 +186,7 @@ async def _order_rows(hub, spec, account: str, *, status: str = "",
     args: dict = {"account": account}
     if status:
         args["status"] = status
-    payload = await _fetcher(hub, spec, cap)(args)
+    payload = await fetcher(hub, spec, "list_orders")(args)
     return _read_orders(cap, payload, retain_unknown=retain_unknown)
 
 
@@ -235,27 +237,42 @@ def history_since(days: int, now: float) -> str:
     return start.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _in_window(row: dict, since: str) -> bool:
-    """True only when the row PROVABLY falls at or after `since`.
+def parse_instant(stamp) -> datetime | None:
+    """An ISO 8601 instant that names its zone, or None.
 
-    Fail closed behind the broker's own filter: a broker that ignored `since`
-    must not turn the backfill into the whole history. The row's `created_at`
-    decides when it has one, else its `filled_at` (an order filled inside the
-    window may still have been created before it, which is why creation time
-    wins). A row with neither, or with a timestamp that does not parse or
-    names no zone, proves nothing and is dropped from the backfill. The
-    regular sweep still journals it once it changes.
+    A stamp that is missing, not a string, does not parse, or names no zone
+    proves nothing about when it happened.
     """
-    stamp = row.get("created_at") or row.get("filled_at")
     if not isinstance(stamp, str):
-        return False
+        return None
     try:
         moment = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
     except ValueError:
-        return False
-    if moment.tzinfo is None:
-        return False
-    return moment >= datetime.fromisoformat(since.replace("Z", "+00:00"))
+        return None
+    return moment if moment.tzinfo is not None else None
+
+
+def at_or_after(stamp, bound: datetime) -> bool:
+    """True only when `stamp` is PROVABLY an instant at or after `bound`.
+
+    Fail closed: a stamp parse_instant cannot read reads as False. Both
+    history readers filter on this behind the broker's own filter, so a broker
+    that ignored the window cannot turn a backfill into the whole history.
+    """
+    moment = parse_instant(stamp)
+    return moment is not None and moment >= bound
+
+
+def _in_window(row: dict, since: str) -> bool:
+    """True only when the order PROVABLY falls at or after `since`.
+
+    The row's `created_at` decides when it has one, else its `filled_at` (an
+    order filled inside the window may still have been created before it,
+    which is why creation time wins). A row neither proves is dropped from the
+    backfill; the regular sweep still journals it once it changes.
+    """
+    return at_or_after(row.get("created_at") or row.get("filled_at"),
+                       datetime.fromisoformat(since.replace("Z", "+00:00")))
 
 
 async def history_rows(hub, spec, account: str, since: str) -> list[dict] | None:
@@ -268,7 +285,7 @@ async def history_rows(hub, spec, account: str, since: str) -> list[dict] | None
     orders never read.
     """
     cap = spec.capability("list_orders")
-    payloads, truncated = await pages(cap, _fetcher(hub, spec, cap),
+    payloads, truncated = await pages(cap, fetcher(hub, spec, "list_orders"),
                                       {"account": account, "since": since},
                                       limit=HISTORY_PAGES)
     out: list[dict] = []
@@ -469,18 +486,25 @@ class FillsReporter:
         return self._journal_new(rows, skip=anchored)
 
     async def _ship(self) -> None:
-        """Send unshipped rows in batches until none wait, marking LINES
-        consumed rather than rows sent so an unreadable line cannot strand the
-        watermark behind it forever. A history backfill can journal many
-        batches at once; it drains in one sweep rather than one per cycle."""
-        while batch := self._journal.pending(SHIP_LIMIT):
-            rows = [row for row in batch if row is not None]
-            try:
-                if rows:
-                    await asyncio.to_thread(self._client.report_fills, rows)
-                self._journal.mark_shipped(len(batch))
-            except Exception as e:  # noqa: BLE001 (a down platform must not hurt the edge)
-                log.warning("fill journal not shipped to the platform this "
-                            "cycle, so %d rows wait for the next: %s",
-                            len(batch), e)
-                return
+        await ship(self._journal, self._client.report_fills, SHIP_LIMIT,
+                   "fill journal")
+
+
+async def ship(journal: Journal, send, limit: int, what: str) -> None:
+    """Send a journal's unshipped rows in batches until none wait.
+
+    Marks LINES consumed rather than rows sent, so an unreadable line cannot
+    strand the watermark behind it forever. A history backfill can journal
+    many batches at once; it drains in one sweep rather than one per cycle.
+    The first failure stops the drain and leaves the rest for the next cycle.
+    """
+    while batch := journal.pending(limit):
+        rows = [row for row in batch if row is not None]
+        try:
+            if rows:
+                await asyncio.to_thread(send, rows)
+            journal.mark_shipped(len(batch))
+        except Exception as e:  # noqa: BLE001 (a down platform must not hurt the edge)
+            log.warning("%s not shipped to the platform this cycle, so %d rows "
+                        "wait for the next: %s", what, len(batch), e)
+            return

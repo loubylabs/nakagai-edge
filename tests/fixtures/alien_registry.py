@@ -1,6 +1,6 @@
 """Registry entries used across the capability tests.
 
-Two connectors that do the same seven things in completely different words.
+Two connectors that do the same eight things in completely different words.
 Every migrated path is tested against both.
 """
 
@@ -15,7 +15,7 @@ ALIEN_CONNECTOR = {
     "guardrails": {
         "allow_writes": True,
         "read_only_tools": ["accounts_list", "balances", "holdings", "ticker",
-                            "orders"],
+                            "orders", "realized"],
         "accounts": {"allow": ["AL-1"], "arg_names": ["acct"]},
         "approvals": {"require_for": ["submit", "scrub"]},
     },
@@ -73,6 +73,19 @@ ALIEN_CONNECTOR = {
         "cancel_order": {
             "tool": "scrub",
             "args": {"order_id": "ref", "account": "acct"}},
+        # One page, no `next`, and only the widest span translated: the narrow
+        # spans are unusable here, so a sweep widens to `all` rather than
+        # sending a canonical word this broker never agreed to.
+        "list_closed_trades": {
+            "tool": "realized",
+            "args": {"account": "acct", "span": "range"},
+            "items": ["closes"],
+            "fields": {"symbol": ["tkr"], "closed_at": ["at"],
+                       "side": ["action"], "quantity": ["qty"],
+                       "price": ["px"], "realized_pnl": ["pl"]},
+            "values": {"side": {"buy": ["BUY", "BUY_TO_COVER"],
+                                "sell": ["SELL", "SELL_TO_CLOSE"]},
+                       "span": {"all": ["EVERYTHING"]}}},
     },
 }
 
@@ -179,5 +192,17 @@ ROBINHOOD_CONNECTOR = {
         "cancel_order": {
             "tool": "cancel_order",
             "args": {"order_id": "order_id", "account": "account_number"}},
+        "list_closed_trades": {
+            "tool": "get_pnl_trade_history",
+            "args": {"account": "account_number", "span": "span",
+                     "cursor": "cursor"},
+            "items": ["data.trades"],
+            "next": ["data.next_cursor"],
+            "fields": {"symbol": ["symbol"], "closed_at": ["timestamp"],
+                       "side": ["side"], "quantity": ["quantity"],
+                       "price": ["price"], "realized_pnl": ["realized_gain"]},
+            "values": {"side": {"buy": ["buy"], "sell": ["sell"]},
+                       "span": {"week": ["week"], "month": ["month"],
+                                "quarter": ["3month"], "all": ["all"]}}},
     },
 }

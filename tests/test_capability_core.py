@@ -78,10 +78,10 @@ def test_coerce_verbatim_rejects_a_container():
     assert coerce("equity", {"buying_power": "1.00"}, cap) is None
 
 
-def test_vocabulary_covers_the_seven_v1_capabilities():
+def test_vocabulary_covers_the_eight_capabilities():
     assert set(CAPABILITIES) == {
         "list_accounts", "get_balance", "list_positions", "get_quote",
-        "list_orders", "place_order", "cancel_order"}
+        "list_orders", "place_order", "cancel_order", "list_closed_trades"}
 
 
 def test_write_capabilities_are_marked_as_writes():
@@ -276,7 +276,8 @@ def test_next_without_a_cursor_argument_is_refused():
 
 def test_next_on_any_other_capability_is_refused():
     import pytest
-    with pytest.raises(ValueError, match="only list_orders pages"):
+    with pytest.raises(ValueError,
+                       match="only list_closed_trades and list_orders page"):
         _spec_with("list_positions", {
             "tool": "holdings", "args": {"account": "acct",
                                          "cursor": "page"}, "next": ["next"],
@@ -288,6 +289,77 @@ def test_next_with_a_cursor_argument_parses():
         "tool": "orders", "args": {"account": "acct", "cursor": "page"},
         "next": ["next"], "fields": {"order_id": ["id"], "symbol": ["s"]}})
     assert spec.capability("list_orders").next == ["next"]
+
+
+def test_next_on_closed_trades_pages_through_its_cursor():
+    import pytest
+    spec = _spec_with("list_closed_trades", {
+        "tool": "pnl", "args": {"account": "acct", "cursor": "page"},
+        "next": ["next"], "fields": {"symbol": ["s"], "closed_at": ["at"]}})
+    assert spec.capability("list_closed_trades").next == ["next"]
+    with pytest.raises(ValueError, match="next on list_closed_trades but maps "
+                                         "no cursor argument"):
+        _spec_with("list_closed_trades", {
+            "tool": "pnl", "args": {"account": "acct"}, "next": ["next"],
+            "fields": {"symbol": ["s"], "closed_at": ["at"]}})
+
+
+CLOSED = Capability(tool="pnl", args={"account": "acct", "span": "range"},
+                    fields={"symbol": ["s"], "closed_at": ["at"]},
+                    values={"span": {"quarter": ["3month", "90d"]}})
+
+
+def test_list_closed_trades_shape():
+    vocab = CAPABILITIES["list_closed_trades"]
+    assert vocab.args == ("account", "span", "cursor")
+    assert vocab.required == ("symbol", "closed_at")
+    assert vocab.optional == ("side", "quantity", "price", "realized_pnl")
+    assert (vocab.is_list, vocab.is_write) == (True, False)
+
+
+def test_a_span_is_sent_as_the_first_broker_word():
+    from nakagai_edge.capability import resolve
+    assert resolve("list_closed_trades", CLOSED,
+                   {"account": "1", "span": "quarter"}) == (
+        "pnl", {"acct": "1", "range": "3month"})
+
+
+def test_an_untranslated_span_is_refused_never_sent_raw():
+    import pytest
+
+    from nakagai_edge.capability import CapabilityError, resolve
+    with pytest.raises(CapabilityError, match="no 'week' spelling"):
+        resolve("list_closed_trades", CLOSED, {"account": "1", "span": "week"})
+    with pytest.raises(CapabilityError, match="unsupported canonical 'span'"):
+        resolve("list_closed_trades", CLOSED, {"account": "1", "span": "decade"})
+
+
+def test_a_map_cannot_add_a_span_word():
+    import pytest
+    with pytest.raises(ValueError, match="unsupported canonical span values"):
+        _spec_with("list_closed_trades", {
+            "tool": "pnl", "args": {"account": "acct", "span": "range"},
+            "fields": {"symbol": ["s"], "closed_at": ["at"]},
+            "values": {"span": {"decade": ["10y"]}}})
+
+
+def test_a_mapped_span_argument_needs_a_translation():
+    import pytest
+    with pytest.raises(ValueError, match="maps a span argument on "
+                                         "list_closed_trades but declares no "
+                                         "values.span translation"):
+        _spec_with("list_closed_trades", {
+            "tool": "pnl", "args": {"account": "acct", "span": "range"},
+            "fields": {"symbol": ["s"], "closed_at": ["at"]}})
+    spec = _spec_with("list_closed_trades", {
+        "tool": "pnl", "args": {"account": "acct"},
+        "fields": {"symbol": ["s"], "closed_at": ["at"]}})
+    assert "span" not in spec.capability("list_closed_trades").args
+
+
+def test_realized_pnl_is_a_float_and_may_be_negative():
+    assert coerce("realized_pnl", "-42.17", CLOSED) == -42.17
+    assert coerce("realized_pnl", "inf", CLOSED) is None
 
 
 def test_created_at_is_a_verbatim_list_orders_field():
