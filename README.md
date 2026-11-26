@@ -586,8 +586,8 @@ that out; the broker already knows which lots a sale closed.
   digest (`trade_key`) of the account, the close time in UTC seconds, the
   symbol, side and quantity, numbered in the broker's order when two trades
   share all of those. Price and realized profit are content: when the broker
-  revises them, or spells the time differently, the row is sent again under
-  the same key and the platform keeps the latest.
+  revises them, the row is sent again under the same key and the platform
+  keeps the latest. The same time spelled differently sends nothing.
 
 The map translates the canonical span (`week`, `month`, `quarter`, `all`) into
 the broker's own word under `values.span`, and pages through `next` and

@@ -323,11 +323,14 @@ async def test_a_negative_realized_pnl_survives(tmp_path):
 
 # ---- identity versus content ---------------------------------------------
 
-async def test_a_re_spelled_timestamp_keeps_one_key(tmp_path):
+@pytest.mark.parametrize("respell", [
+    lambda s: s.replace("Z", "+00:00"),
+    lambda s: s.replace("Z", ".000Z"),
+    lambda s: s.replace("Z", ".417+00:00"),
+], ids=["offset", "millis", "millis-offset"])
+async def test_a_re_spelled_timestamp_ships_nothing(tmp_path, respell):
     # The probe: a re-spelled close time used to mint a second key, and the
-    # platform held the trade twice. The key now holds. The verbatim spelling
-    # is content, so each new spelling re-ships once under that same key (an
-    # overwrite on the platform), and a repeated spelling ships nothing.
+    # platform held the trade twice. Same instant, same key, same content.
     state = _state(tmp_path)
     _grant(state, 30)
     at = time.time() - DAY
@@ -335,16 +338,11 @@ async def test_a_re_spelled_timestamp_keeps_one_key(tmp_path):
     client = Client()
     r = ClosedTradesReporter(state, broker, client)
     await r.sweep()
-    first_key = _rows(client)[0]["trade_key"]
-    spellings = (_iso(at).replace("Z", "+00:00"),
-                 _iso(at).replace("Z", ".000Z"),
-                 _iso(at).replace("Z", ".417+00:00"))
-    for spelling in spellings:
-        broker.trades = [{**_trade("A", at), "timestamp": spelling}]
-        await r.sweep()
-        await r.sweep()                               # same spelling again
-    assert {row["trade_key"] for row in _rows(client)} == {first_key}
-    assert len(_rows(client)) == 1 + len(spellings)
+    assert len(_rows(client)) == 1
+    broker.trades = [{**_trade("A", at), "timestamp": respell(_iso(at))}]
+    await r.sweep()
+    await ClosedTradesReporter(state, broker, client).sweep()   # restart
+    assert len(_rows(client)) == 1
 
 
 async def test_a_revised_gain_ships_once_under_the_same_key(tmp_path):

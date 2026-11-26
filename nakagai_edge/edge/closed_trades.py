@@ -26,8 +26,8 @@ hashes what identifies a trade (connector, account, the close instant
 normalized to UTC seconds, symbol, side, quantity) plus its ordinal among rows
 sharing that identity in one read, so two trades of the same size closed in
 the same second stay two. Price and realized profit are content: a broker
-that revises them, or re-spells the timestamp, ships the same key again with
-the new content, and the platform overwrites.
+that revises them ships the same key again with the new content, and the
+platform overwrites. A re-spelled timestamp changes neither, and ships nothing.
 """
 
 import asyncio
@@ -89,10 +89,12 @@ def trade_key(row: dict, ordinal: int = 0) -> str:
 
 
 def content(row: dict) -> str:
-    """What may change under one identity: price, realized profit or loss, and
-    the broker's own spelling of the close time."""
-    return json.dumps([row.get("price"), row.get("realized_pnl"),
-                       row.get("closed_at")], separators=(",", ":"))
+    """What may change under one identity: price and realized profit or loss.
+    The broker's spelling of the close time is not content: a re-spelling
+    names the same instant, and a broker that alternated spellings would
+    otherwise re-ship every row and defeat the quiet-sweep early stop."""
+    return json.dumps([row.get("price"), row.get("realized_pnl")],
+                      separators=(",", ":"))
 
 
 class SendFrom:
