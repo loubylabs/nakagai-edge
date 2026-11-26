@@ -572,22 +572,31 @@ that out; the broker already knows which lots a sale closed.
 - **Nothing from before you connected is sent** unless you turn on a history
   window for that broker on the platform (the same "Trade history" choice the
   fill journal reads). The first time an account answers, the edge records
-  that moment and sends only trades that closed after it. A window moves that
-  moment back once, never forward.
+  that moment and sends only trades that closed after it. A window reaches
+  back that many days from now and is applied as it stands on every sweep:
+  lowering it or turning it off narrows the next sweep, and nothing before the
+  earlier of first sight and the window is ever sent.
 - **A row is sent only when its own close time proves it falls inside**, so a
   broker that answers with older trades than it was asked for sends none of
-  them. A row without a readable close time is not sent.
+  them. A row without a readable close time is not sent, and a read where
+  every row lacks one is logged as a warning.
 - **At most 25 pages per account per read.** A window holding more sends its
   newest 25 pages; older closed trades inside it are not sent.
 - **The broker gives these rows no id**, so the edge identifies each by a
-  digest of everything it says (`trade_key`). Two identical rows in one read,
-  the same size closed at the same price in the same second, are numbered in
-  the broker's order and stay two trades.
+  digest (`trade_key`) of the account, the close time in UTC seconds, the
+  symbol, side and quantity, numbered in the broker's order when two trades
+  share all of those. Price and realized profit are content: when the broker
+  revises them, or spells the time differently, the row is sent again under
+  the same key and the platform keeps the latest.
 
 The map translates the canonical span (`week`, `month`, `quarter`, `all`) into
 the broker's own word under `values.span`, and pages through `next` and
-`cursor`. A span the map does not translate is never sent; the edge widens to
-the next one it does. A connector declaring no `list_closed_trades` is skipped.
+`cursor`. The edge asks for the narrowest span reaching at least two days past
+the window; a span the map does not translate is never sent, and the edge
+widens to the next one it does. A map that maps a `span` argument must
+translate at least one word. **The capability must return trades newest
+first**: a quiet sweep stops at the first page with nothing new, and relies on
+that order. A connector declaring no `list_closed_trades` is skipped.
 
 ## Failure modes
 

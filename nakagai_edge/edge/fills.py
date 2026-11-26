@@ -237,23 +237,30 @@ def history_since(days: int, now: float) -> str:
     return start.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def at_or_after(stamp, bound: datetime) -> bool:
-    """True only when `stamp` is PROVABLY an instant at or after `bound`.
+def parse_instant(stamp) -> datetime | None:
+    """An ISO 8601 instant that names its zone, or None.
 
-    Fail closed: a stamp that is missing, not a string, does not parse, or
-    names no zone proves nothing and reads as False. Both history readers
-    filter on this behind the broker's own filter, so a broker that ignored
-    the window cannot turn a backfill into the whole history.
+    A stamp that is missing, not a string, does not parse, or names no zone
+    proves nothing about when it happened.
     """
     if not isinstance(stamp, str):
-        return False
+        return None
     try:
         moment = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
     except ValueError:
-        return False
-    if moment.tzinfo is None:
-        return False
-    return moment >= bound
+        return None
+    return moment if moment.tzinfo is not None else None
+
+
+def at_or_after(stamp, bound: datetime) -> bool:
+    """True only when `stamp` is PROVABLY an instant at or after `bound`.
+
+    Fail closed: a stamp parse_instant cannot read reads as False. Both
+    history readers filter on this behind the broker's own filter, so a broker
+    that ignored the window cannot turn a backfill into the whole history.
+    """
+    moment = parse_instant(stamp)
+    return moment is not None and moment >= bound
 
 
 def _in_window(row: dict, since: str) -> bool:

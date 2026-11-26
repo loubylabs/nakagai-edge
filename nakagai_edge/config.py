@@ -207,9 +207,17 @@ class ConnectorSpec(BaseModel):
     @field_validator("capabilities")
     @classmethod
     def _span_values_are_closed(cls, v: dict, info) -> dict:
-        """A map translates canonical span words only; it cannot add one."""
+        """A map translates canonical span words only; it cannot add one. A map
+        that maps a span argument must translate at least one word, or every
+        read it could make would be refused at call time, in silence."""
         cid = (info.data or {}).get("id", "?")
         for name in sorted(v):
+            if "span" in v[name].args and not v[name].values.get("span"):
+                raise ValueError(
+                    f"connector {cid!r} maps a span argument on {name} but "
+                    f"declares no values.span translation; map at least one of "
+                    f"{', '.join(sorted(CANONICAL_SPANS))}, or map no span "
+                    f"argument to ask for the broker's default")
             unknown = sorted(set(v[name].values.get("span") or {}) - CANONICAL_SPANS)
             if unknown:
                 raise ValueError(

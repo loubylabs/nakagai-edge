@@ -343,6 +343,20 @@ def test_a_map_cannot_add_a_span_word():
             "values": {"span": {"decade": ["10y"]}}})
 
 
+def test_a_mapped_span_argument_needs_a_translation():
+    import pytest
+    with pytest.raises(ValueError, match="maps a span argument on "
+                                         "list_closed_trades but declares no "
+                                         "values.span translation"):
+        _spec_with("list_closed_trades", {
+            "tool": "pnl", "args": {"account": "acct", "span": "range"},
+            "fields": {"symbol": ["s"], "closed_at": ["at"]}})
+    spec = _spec_with("list_closed_trades", {
+        "tool": "pnl", "args": {"account": "acct"},
+        "fields": {"symbol": ["s"], "closed_at": ["at"]}})
+    assert "span" not in spec.capability("list_closed_trades").args
+
+
 def test_realized_pnl_is_a_float_and_may_be_negative():
     assert coerce("realized_pnl", "-42.17", CLOSED) == -42.17
     assert coerce("realized_pnl", "inf", CLOSED) is None

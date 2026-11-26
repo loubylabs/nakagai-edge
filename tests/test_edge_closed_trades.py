@@ -101,13 +101,17 @@ def _grant(state, days, connector_id="robinhood-trading"):
          "trade_history": {connector_id: {"days": days}} if days else {}}))
 
 
+def _rows(client):
+    return [row for batch in client.batches for row in batch]
+
+
 def _shipped(client):
-    return [row["symbol"] for batch in client.batches for row in batch]
+    return [row["symbol"] for row in _rows(client)]
 
 
-# ---- first sight and the send-from instant -------------------------------
+# ---- first sight and the window ------------------------------------------
 
-async def test_first_sight_sends_nothing_and_records_send_from(tmp_path):
+async def test_first_sight_sends_nothing_and_records_first_sight(tmp_path):
     now = time.time()
     broker = Broker([_trade("OLD", now - 2 * DAY), _trade("OLDER", now - 3 * DAY)])
     client = Client()
@@ -115,12 +119,14 @@ async def test_first_sight_sends_nothing_and_records_send_from(tmp_path):
     assert client.batches == []
     entry = SendFrom(tmp_path).get(KEY)
     assert entry["days"] == 0
-    assert now - 1 <= entry["from"] <= time.time()
+    assert now - 1 <= entry["first_sight"] <= time.time()
+    assert json.loads((tmp_path / "cache" / "closed-trades-from.json").read_text()) \
+        == {KEY: {"first_sight": entry["first_sight"], "days": 0}}
     assert len(broker.reads()) == 1
     assert broker.reads()[0]["span"] == "week"
 
 
-async def test_a_trade_after_send_from_ships_once_and_survives_a_restart(tmp_path):
+async def test_a_trade_after_first_sight_ships_once_and_survives_a_restart(tmp_path):
     state = _state(tmp_path)
     broker = Broker([_trade("OLD", time.time() - DAY)])
     client = Client()
@@ -151,21 +157,51 @@ async def test_a_failed_read_creates_and_moves_nothing(tmp_path):
     assert client.batches == []
 
 
-async def test_an_unreadable_page_moves_nothing(tmp_path):
+async def test_a_failed_read_does_not_raise_the_stored_grant(tmp_path):
+    state = _state(tmp_path)
+    broker = Broker([])
+    r = ClosedTradesReporter(state, broker, Client())
+    await r.sweep()                                   # first sight, days 0
+    _grant(state, 90)
+    broker.fail = True
+    await r.sweep()
+    assert SendFrom(tmp_path).get(KEY)["days"] == 0
+
+
+async def test_an_unreadable_page_moves_nothing_and_is_not_paged(tmp_path):
     class NotAList(Broker):
         async def call(self, connector_id, tool, args, **kw):
             out = await super().call(connector_id, tool, args, **kw)
             if tool == "get_pnl_trade_history":
                 out["data"]["data"]["trades"] = "nope"
+                out["data"]["data"]["next_cursor"] = "more"
             return out
 
-    await ClosedTradesReporter(_state(tmp_path), NotAList([]), Client()).sweep()
+    broker = NotAList([])
+    await ClosedTradesReporter(_state(tmp_path), broker, Client()).sweep()
     assert SendFrom(tmp_path).get(KEY) is None
+    assert len(broker.reads()) == 1
+
+
+async def test_a_send_from_that_cannot_be_written_journals_nothing(
+        tmp_path, monkeypatch):
+    state = _state(tmp_path)
+    _grant(state, 30)
+
+    def refuse(self, *a):
+        raise OSError("read-only cache")
+
+    monkeypatch.setattr(SendFrom, "set", refuse)
+    client = Client()
+    await ClosedTradesReporter(state, Broker([_trade("A", time.time() - DAY)]),
+                               client).sweep()
+    assert client.batches == []
+    assert not (tmp_path / "results" / "closed-trades.jsonl").exists()
 
 
 # ---- the history window --------------------------------------------------
 
-async def test_a_grant_moves_send_from_back_once_and_ships_only_inside_it(tmp_path):
+async def test_a_grant_reaches_back_and_ships_only_inside_it(tmp_path):
     state = _state(tmp_path)
     now = time.time()
     broker = Broker([_trade("D2", now - 2 * DAY), _trade("D20", now - 20 * DAY),
@@ -176,16 +212,15 @@ async def test_a_grant_moves_send_from_back_once_and_ships_only_inside_it(tmp_pa
     _grant(state, 30)
     await r.sweep()
     assert sorted(_shipped(client)) == ["D2", "D20"]
-    assert broker.reads()[-1]["span"] == "month"
+    assert broker.reads()[-1]["span"] == "3month"     # 30 days + slack
     entry = SendFrom(tmp_path).get(KEY)
     assert entry["days"] == 30
-    assert abs(entry["from"] - (now - 30 * DAY)) < 60
     await r.sweep()
     assert sorted(_shipped(client)) == ["D2", "D20"]
     assert SendFrom(tmp_path).get(KEY) == entry
 
 
-async def test_a_larger_grant_moves_again_and_a_smaller_one_does_not(tmp_path):
+async def test_30_then_90_then_30(tmp_path):
     state = _state(tmp_path)
     now = time.time()
     broker = Broker([_trade("D5", now - 5 * DAY), _trade("D60", now - 60 * DAY),
@@ -198,13 +233,36 @@ async def test_a_larger_grant_moves_again_and_a_smaller_one_does_not(tmp_path):
     _grant(state, 90)
     await r.sweep()
     assert _shipped(client) == ["D5", "D60"]
-    assert broker.reads()[-1]["span"] == "3month"
-    moved = SendFrom(tmp_path).get(KEY)
-    assert moved["days"] == 90
+    assert broker.reads()[-1]["span"] == "all"        # 90 days + slack
+    assert SendFrom(tmp_path).get(KEY)["days"] == 90
     _grant(state, 30)
     await r.sweep()
-    assert SendFrom(tmp_path).get(KEY) == moved
+    assert SendFrom(tmp_path).get(KEY)["days"] == 30
+    # D60 is outside again: revised, it does not ship.
+    broker.trades[1] = _trade("D60", now - 60 * DAY, pnl="99.00")
+    await r.sweep()
     assert _shipped(client) == ["D5", "D60"]
+
+
+async def test_revoking_a_grant_ships_nothing_older_than_first_sight(tmp_path):
+    state = _state(tmp_path)
+    now = time.time()
+    broker = Broker([_trade("OLD", now - 100 * DAY)], page_size=10)
+    client = Client()
+    r = ClosedTradesReporter(state, broker, client)
+    _grant(state, 365)
+    await r.sweep()
+    assert _shipped(client) == ["OLD"]
+    _grant(state, 0)
+    await r.sweep()
+    assert SendFrom(tmp_path).get(KEY)["days"] == 0
+    # Revised, and re-keyed (a different quantity), it stays unsent.
+    broker.trades = [_trade("OLD", now - 100 * DAY, pnl="1.00"),
+                     _trade("OLD", now - 100 * DAY, quantity="11")]
+    broker.honors_span = False
+    await r.sweep()
+    await ClosedTradesReporter(state, broker, client).sweep()
+    assert _shipped(client) == ["OLD"]
 
 
 async def test_a_grant_beyond_a_quarter_asks_for_all(tmp_path):
@@ -242,6 +300,17 @@ async def test_unreadable_naive_or_missing_closed_at_is_dropped(tmp_path):
     assert _shipped(client) == ["GOOD"]
 
 
+async def test_a_read_with_no_readable_close_time_warns(tmp_path, caplog):
+    caplog.set_level(logging.WARNING, logger="nakagai.edge")
+    state = _state(tmp_path)
+    _grant(state, 30)
+    broker = Broker([{**_trade("A", time.time() - DAY), "timestamp": "soon"},
+                     {**_trade("B", time.time() - DAY), "timestamp": None}],
+                    page_size=10, honors_span=False)
+    await ClosedTradesReporter(state, broker, Client()).sweep()
+    assert "all 2 closed trades robinhood-trading returned" in caplog.text
+
+
 async def test_a_negative_realized_pnl_survives(tmp_path):
     state = _state(tmp_path)
     _grant(state, 30)
@@ -252,10 +321,48 @@ async def test_a_negative_realized_pnl_survives(tmp_path):
     assert client.batches[0][0]["realized_pnl"] == -42.17
 
 
-# ---- identical rows are separate trades -----------------------------------
-#
-# Timestamps stop at the second, so the same size closed at the same price
-# twice in one second reads as two identical rows. Both are real trades.
+# ---- identity versus content ---------------------------------------------
+
+async def test_a_re_spelled_timestamp_keeps_one_key(tmp_path):
+    # The probe: a re-spelled close time used to mint a second key, and the
+    # platform held the trade twice. The key now holds. The verbatim spelling
+    # is content, so each new spelling re-ships once under that same key (an
+    # overwrite on the platform), and a repeated spelling ships nothing.
+    state = _state(tmp_path)
+    _grant(state, 30)
+    at = time.time() - DAY
+    broker = Broker([_trade("A", at)])
+    client = Client()
+    r = ClosedTradesReporter(state, broker, client)
+    await r.sweep()
+    first_key = _rows(client)[0]["trade_key"]
+    spellings = (_iso(at).replace("Z", "+00:00"),
+                 _iso(at).replace("Z", ".000Z"),
+                 _iso(at).replace("Z", ".417+00:00"))
+    for spelling in spellings:
+        broker.trades = [{**_trade("A", at), "timestamp": spelling}]
+        await r.sweep()
+        await r.sweep()                               # same spelling again
+    assert {row["trade_key"] for row in _rows(client)} == {first_key}
+    assert len(_rows(client)) == 1 + len(spellings)
+
+
+async def test_a_revised_gain_ships_once_under_the_same_key(tmp_path):
+    state = _state(tmp_path)
+    _grant(state, 30)
+    at = time.time() - DAY
+    broker = Broker([_trade("A", at, pnl="12.50")])
+    client = Client()
+    r = ClosedTradesReporter(state, broker, client)
+    await r.sweep()
+    broker.trades = [_trade("A", at, pnl="11.75")]
+    await r.sweep()
+    await r.sweep()
+    await ClosedTradesReporter(state, broker, client).sweep()   # restart
+    rows = _rows(client)
+    assert [row["realized_pnl"] for row in rows] == [12.5, 11.75]
+    assert rows[0]["trade_key"] == rows[1]["trade_key"]
+
 
 async def test_two_identical_rows_ship_as_two_trades_and_only_once(tmp_path):
     state = _state(tmp_path)
@@ -265,14 +372,14 @@ async def test_two_identical_rows_ship_as_two_trades_and_only_once(tmp_path):
     client = Client()
     r = ClosedTradesReporter(state, broker, client)
     await r.sweep()
-    shipped = [row for batch in client.batches for row in batch]
+    shipped = _rows(client)
     assert [row["symbol"] for row in shipped] == ["TWIN", "TWIN"]
     keys = [row["trade_key"] for row in shipped]
     assert len(set(keys)) == 2
-    assert keys[0] == trade_key(shipped[0])           # ordinal 0: the plain key
-    await r.sweep()                                   # the same read again
-    await ClosedTradesReporter(state, broker, client).sweep()   # a restart
-    assert len([row for batch in client.batches for row in batch]) == 2
+    assert keys[0] == trade_key(shipped[0])
+    await r.sweep()
+    await ClosedTradesReporter(state, broker, client).sweep()
+    assert len(_rows(client)) == 2
 
 
 async def test_ordinals_count_across_pages(tmp_path):
@@ -282,19 +389,28 @@ async def test_ordinals_count_across_pages(tmp_path):
     broker = Broker([_trade("TRIP", at)] * 3, page_size=2)
     client = Client()
     await ClosedTradesReporter(state, broker, client).sweep()
-    assert len(broker.reads()) == 2                   # 2 rows, then 1
-    shipped = [row for batch in client.batches for row in batch]
+    assert len(broker.reads()) == 2
+    shipped = _rows(client)
     assert [row["trade_key"] for row in shipped] == [
         trade_key(shipped[0], n) for n in (0, 1, 2)]
-    assert len({row["trade_key"] for row in shipped}) == 3
 
 
-def test_ordinal_zero_hashes_as_before_and_others_differ():
+def test_trade_key_hashes_identity_only():
+    import hashlib
     row = {"connector_id": "c", "account": "1", "closed_at": "2026-11-25T15:00:00Z",
            "symbol": "NVDA", "side": "sell", "quantity": 10.0, "price": 101.25,
            "realized_pnl": -3.5}
-    assert trade_key(row, 0) == trade_key(row) == (
-        "34aae4ad8ef05f2dffd03d0716841cc6b584e24f3d4a57315016b650d1a6d3d3")
+    identity = {"connector_id": "c", "account": "1",
+                "closed_at": "2026-11-25T15:00:00Z", "symbol": "NVDA",
+                "side": "sell", "quantity": 10.0}
+    assert trade_key(row) == hashlib.sha256(json.dumps(
+        identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    assert trade_key(row) == (
+        "e0e3e72c823235bdb117a98b011c2e52ba673cbd0f75b699ce6aa240bbf6c2b2")
+    assert trade_key({**row, "price": 1.0, "realized_pnl": 9.0}) == trade_key(row)
+    assert trade_key({**row, "closed_at": "2026-11-25T10:00:00.5-05:00"}) \
+        == trade_key(row)
+    assert trade_key({**row, "quantity": 11.0}) != trade_key(row)
     assert trade_key(row, 1) != trade_key(row)
     assert trade_key(row, 1) != trade_key(row, 2)
 
@@ -364,16 +480,15 @@ async def test_exactly_the_page_cap_and_done_does_not_warn(tmp_path, monkeypatch
 
 # ---- spans ---------------------------------------------------------------
 
-def test_the_narrowest_covering_span_is_chosen():
+@pytest.mark.parametrize("back,span", [(0, "week"), (5, "week"), (6, "month"),
+                                       (28, "month"), (29, "quarter"),
+                                       (88, "quarter"), (89, "all")])
+def test_a_span_reaches_two_days_past_the_window(back, span):
     from nakagai_edge.config import load_specs
     cap = load_specs({"connectors": [ROBINHOOD_CONNECTOR]})[
         "robinhood-trading"].capability("list_closed_trades")
     now = 1_000_000_000.0
-    assert choose_span(cap, now, now) == "week"
-    assert choose_span(cap, now - 7 * DAY, now) == "week"
-    assert choose_span(cap, now - 8 * DAY, now) == "month"
-    assert choose_span(cap, now - 90 * DAY, now) == "quarter"
-    assert choose_span(cap, now - 91 * DAY, now) == "all"
+    assert choose_span(cap, now - back * DAY, now) == span
 
 
 def test_an_untranslated_span_widens_to_one_the_map_knows():
@@ -422,7 +537,7 @@ async def test_a_connector_without_closed_trades_is_skipped(tmp_path):
     assert broker.calls == []
 
 
-# ---- shipping and identity -----------------------------------------------
+# ---- shipping ------------------------------------------------------------
 
 async def test_a_platform_failure_leaves_rows_for_the_next_cycle(tmp_path):
     state = _state(tmp_path)
@@ -446,24 +561,6 @@ async def test_large_batches_drain_in_one_sweep(tmp_path, monkeypatch):
     await ClosedTradesReporter(state, Broker(
         [_trade(f"S{i}", now - i * 3600) for i in range(1, 6)]), client).sweep()
     assert [len(b) for b in client.batches] == [2, 2, 1]
-
-
-def test_trade_key_is_stable_and_covers_every_value():
-    row = {"connector_id": "c", "account": "1", "closed_at": "2026-11-25T15:00:00Z",
-           "symbol": "NVDA", "side": "sell", "quantity": 10.0, "price": 101.25,
-           "realized_pnl": -3.5}
-    assert trade_key(row) == trade_key(dict(reversed(list(row.items()))))
-    # Pinned: the platform dedupes on this, so it must not drift between runs
-    # or releases.
-    assert trade_key(row) == (
-        "34aae4ad8ef05f2dffd03d0716841cc6b584e24f3d4a57315016b650d1a6d3d3")
-    import hashlib
-    expected = hashlib.sha256(json.dumps(
-        {k: row[k] for k in sorted(row)}, separators=(",", ":")).encode()
-    ).hexdigest()
-    assert trade_key(row) == expected
-    assert trade_key({**row, "realized_pnl": -3.51}) != trade_key(row)
-    assert trade_key({**row, "account": "2"}) != trade_key(row)
 
 
 # ---- the runtime loop ----------------------------------------------------

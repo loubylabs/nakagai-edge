@@ -64,6 +64,8 @@ FORBIDDEN = {
     # translates `list_closed_trades` and `realized_pnl`.
     "get_pnl_trade_history": set(),
     "realized_gain": set(),
+    "next_cursor": set(),
+    "3month": set(),
     "buying_power": {"capability.py", "edge/runtime.py"},
     "account_number": {"config.py", "edge/portfolio.py", "edge/supervision.py"},
 }
