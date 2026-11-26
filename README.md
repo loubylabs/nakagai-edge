@@ -535,8 +535,13 @@ Four properties are deliberate:
   (Settings, Connectors, "Trade history": Off by default, 30 days, 90 days or
   1 year). The edge then asks for orders created inside that window, through
   the map's `since` and `next`, and sends each once. Orders older than the
-  window are never sent. A larger window later sends the difference; nothing
-  is sent twice. A connector whose map declares no `since` never sends history.
+  window are never sent: a row is kept only when its own `created_at` (else
+  `filled_at`) proves it falls inside the window, whatever the broker
+  returned. A window sends at most 25 pages of the broker's newest orders per
+  account; older orders inside the window are not sent. A larger window later
+  sends the difference; nothing is sent twice. A connector whose map declares
+  no `since` never sends history, and the edge never reads a window longer
+  than 365 days.
 - **Rows carry what filled.** `quantity` is what was ordered and
   `filled_quantity`, when the map declares it, is what actually filled.
 - **Attribution joins on the broker's own order id.** When the edge places an

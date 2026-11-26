@@ -642,29 +642,40 @@ async def test_a_map_with_no_since_never_backfills(tmp_path):
     assert HistoryMarker(tmp_path).days("alien-broker\x1fAL-1") == 0
 
 
-async def test_a_broker_ignoring_the_filter_still_ships_nothing_provably_older(
+class IgnoresTheFilter(HistoryHub):
+    """A broker that returns every order whatever `since` says."""
+
+    async def call(self, connector_id, tool, args, **kw):
+        self.calls.append((connector_id, tool, dict(args)))
+        if tool == "get_accounts":
+            out = {"accounts": [{"account_number": "463605220"}]}
+        else:
+            out = {"orders": self.orders}
+        return {"data": {"data": out, "guide": "ignore me"}}
+
+
+async def test_a_broker_ignoring_the_filter_ships_only_provably_in_window_rows(
         tmp_path):
-    # Defense behind the broker's own filter: a fill before the window opened
-    # was created before it too.
+    # Fail closed behind the broker's own filter. Creation time decides; a row
+    # with no readable moment proves nothing and is dropped.
     state = _rh_only(tmp_path)
     _grant(state, 30)
-
-    class Ignores(HistoryHub):
-        async def call(self, connector_id, tool, args, **kw):
-            self.calls.append((connector_id, tool, dict(args)))
-            if tool == "get_accounts":
-                out = {"accounts": [{"account_number": "463605220"}]}
-            else:
-                out = {"orders": self.orders}
-            return {"data": {"data": out, "guide": "ignore me"}}
-
+    old_but_recently_filled = {**_order("old-made", 90),
+                               "last_transaction_at": _iso(2 * DAY)}
+    no_stamps = {**ORDER, "id": "bare", "last_transaction_at": None}
+    naive = {**_order("naive", 2), "created_at": "2026-11-20T10:00:00",
+             "last_transaction_at": None}
+    filled_only = {**_order("filled-only", 2), "created_at": None}
     client = Client()
-    await FillsReporter(state, Ignores([_order("in", 2), _order("old", 90)]),
-                        client).sweep()
-    assert _shipped(client) == ["in"]
+    await FillsReporter(state, IgnoresTheFilter(
+        [_order("in", 2), _order("old", 90), old_but_recently_filled,
+         no_stamps, naive, filled_only]), client).sweep()
+    assert _shipped(client) == ["in", "filled-only"]
 
 
-async def test_the_backfill_reads_at_most_its_page_cap(tmp_path, monkeypatch):
+async def test_the_backfill_reads_at_most_its_page_cap(tmp_path, monkeypatch,
+                                                       caplog):
+    # The marker still moves: re-reading the cap every sweep forever is worse.
     from nakagai_edge.edge import fills
     monkeypatch.setattr(fills, "HISTORY_PAGES", 3)
     state = _rh_only(tmp_path)
@@ -674,6 +685,33 @@ async def test_the_backfill_reads_at_most_its_page_cap(tmp_path, monkeypatch):
     await FillsReporter(state, hub, client).sweep()
     assert len(hub.history_calls()) == 3
     assert len(_shipped(client)) == 6
+    assert "older orders inside the window are not sent" in caplog.text
+    assert HistoryMarker(tmp_path).days(ACCOUNT_KEY) == 365
+
+
+async def test_exactly_the_page_cap_and_done_does_not_warn(tmp_path, monkeypatch,
+                                                          caplog):
+    from nakagai_edge.edge import fills
+    monkeypatch.setattr(fills, "HISTORY_PAGES", 3)
+    state = _rh_only(tmp_path)
+    _grant(state, 365)
+    hub = HistoryHub([_order(f"o{i}", i) for i in range(6)], page_size=2)
+    client = Client()
+    await FillsReporter(state, hub, client).sweep()
+    assert len(hub.history_calls()) == 3
+    assert len(_shipped(client)) == 6
+    assert "older orders inside the window" not in caplog.text
+    assert HistoryMarker(tmp_path).days(ACCOUNT_KEY) == 365
+
+
+async def test_an_absurd_grant_reads_as_a_year_and_does_not_raise(tmp_path):
+    state = _rh_only(tmp_path)
+    _grant(state, 10**9)
+    hub = HistoryHub([_order("in", 300), _order("old", 400)])
+    client = Client()
+    await FillsReporter(state, hub, client).sweep()
+    assert _shipped(client) == ["in"]
+    assert HistoryMarker(tmp_path).days(ACCOUNT_KEY) == 365
 
 
 async def test_a_large_backfill_ships_in_batches_in_one_sweep(tmp_path, monkeypatch):
@@ -705,6 +743,10 @@ def test_the_grant_is_read_off_the_stored_bundle(tmp_path):
     _grant(state, 90)
     assert trade_history_days(state, "robinhood-trading") == 90
     assert trade_history_days(state, "other") == 0
+    _grant(state, 3650)
+    assert trade_history_days(state, "robinhood-trading") == 365
+    _grant(state, 10**9)
+    assert trade_history_days(state, "robinhood-trading") == 365
     state.bundle_path.write_text(json.dumps(
         {"trade_history": {"robinhood-trading": {"days": True}}}))
     assert trade_history_days(state, "robinhood-trading") == 0

@@ -235,46 +235,52 @@ def history_since(days: int, now: float) -> str:
     return start.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _before(filled_at, since: str) -> bool:
-    """True only when `filled_at` provably predates the window.
+def _in_window(row: dict, since: str) -> bool:
+    """True only when the row PROVABLY falls at or after `since`.
 
-    A second check behind the broker's own filter, which is on creation time:
-    an order that filled before the window opened was created before it too.
-    A timestamp this cannot read proves nothing and is left to the broker's
-    filter, which is the authority here.
+    Fail closed behind the broker's own filter: a broker that ignored `since`
+    must not turn the backfill into the whole history. The row's `created_at`
+    decides when it has one, else its `filled_at` (an order filled inside the
+    window may still have been created before it, which is why creation time
+    wins). A row with neither, or with a timestamp that does not parse or
+    names no zone, proves nothing and is dropped from the backfill. The
+    regular sweep still journals it once it changes.
     """
-    if not isinstance(filled_at, str):
+    stamp = row.get("created_at") or row.get("filled_at")
+    if not isinstance(stamp, str):
         return False
     try:
-        moment = datetime.fromisoformat(filled_at.replace("Z", "+00:00"))
+        moment = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
     except ValueError:
         return False
     if moment.tzinfo is None:
         return False
-    return moment < datetime.fromisoformat(since.replace("Z", "+00:00"))
+    return moment >= datetime.fromisoformat(since.replace("Z", "+00:00"))
 
 
 async def history_rows(hub, spec, account: str, since: str) -> list[dict] | None:
     """Every order on one account created since `since`, any status.
 
-    Follows the map's `next` for up to HISTORY_PAGES pages. None when any page
-    is not the list the map declares: a partial history must not read as a
-    complete one, or the marker would move past orders never read.
+    Follows the map's `next` for up to HISTORY_PAGES pages: the broker's
+    newest orders, so a window holding more than that sends only its newest
+    pages. None when any page is not the list the map declares: a partial
+    history must not read as a complete one, or the marker would move past
+    orders never read.
     """
     cap = spec.capability("list_orders")
-    payloads = await pages(cap, _fetcher(hub, spec, cap),
-                           {"account": account, "since": since},
-                           limit=HISTORY_PAGES)
-    if cap.next and len(payloads) == HISTORY_PAGES:
-        log.warning("order history on %s account %s filled %d pages; older "
-                    "orders inside the window are not sent",
-                    spec.id, account, HISTORY_PAGES)
+    payloads, truncated = await pages(cap, _fetcher(hub, spec, cap),
+                                      {"account": account, "since": since},
+                                      limit=HISTORY_PAGES)
     out: list[dict] = []
     for payload in payloads:
         rows = _read_orders(cap, payload)
         if rows is None:
             return None
-        out.extend(row for row in rows if not _before(row.get("filled_at"), since))
+        out.extend(row for row in rows if _in_window(row, since))
+    if truncated:
+        log.warning("order history on %s account %s holds more than %d pages; "
+                    "older orders inside the window are not sent",
+                    spec.id, account, HISTORY_PAGES)
     return out
 
 

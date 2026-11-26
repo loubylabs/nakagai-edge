@@ -40,13 +40,16 @@ COERCIONS = {
 # worded them.
 #
 # Everything absent from COERCIONS is VERBATIM: equity, cash, buying_power,
-# market_value, currency, nickname, type, status, order_id, filled_at, account.
+# market_value, currency, nickname, type, status, order_id, filled_at,
+# created_at, account.
 # The edge relays those figures and never does arithmetic on them.
 #
 # `filled_at` is verbatim for the same reason `status` is. Brokers spell
 # timestamps a dozen ways, and a moment this module parsed into a float would
 # be a moment it had done arithmetic on. The platform reads it; the edge only
-# carries it.
+# carries it. `created_at` is verbatim for the same reason. The history
+# backfill is the one reader that compares either to its window, and a moment
+# it cannot read is dropped there rather than guessed.
 
 
 class CapabilityError(Exception):
@@ -122,7 +125,7 @@ CAPABILITIES: dict[str, CapabilitySpec] = {
         args=("account", "status", "since", "cursor"),
         required=("order_id", "symbol"),
         optional=("side", "quantity", "filled_quantity", "notional", "status",
-                  "fill_price", "filled_at"),
+                  "fill_price", "filled_at", "created_at"),
         is_list=True, is_write=False),
     # `optional` here is the RESULT of placing an order, not its arguments:
     # `args` above is what goes out, these are what can be read back. The fill
@@ -185,8 +188,9 @@ def first(payload: Any, paths: list[str]) -> Any:
 
 
 async def pages(cap: Capability, fetch: Callable[[dict], Awaitable[Any]],
-                args: dict, *, limit: int) -> list[Any]:
-    """Every payload of a paged read, at most `limit` of them.
+                args: dict, *, limit: int) -> tuple[list[Any], bool]:
+    """Every payload of a paged read, at most `limit` of them, and whether the
+    read stopped at `limit` with a further page still on offer.
 
     `fetch` takes canonical arguments and returns one payload, so the I/O stays
     the caller's. The next page's token is read off `cap.next` and sent back as
@@ -200,12 +204,14 @@ async def pages(cap: Capability, fetch: Callable[[dict], Awaitable[Any]],
     while True:
         payload = await fetch(args)
         out.append(payload)
-        if not cap.next or len(out) >= limit:
-            return out
+        if not cap.next:
+            return out, False
         token = first(payload, cap.next)
         if (isinstance(token, bool) or not isinstance(token, (str, int))
                 or token == "" or token in sent):
-            return out
+            return out, False
+        if len(out) >= limit:
+            return out, True
         sent.add(token)
         args = {**args, "cursor": token}
 

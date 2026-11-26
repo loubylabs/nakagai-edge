@@ -206,8 +206,8 @@ def _paged(cap, payloads, limit):
 
     from nakagai_edge.capability import pages
     fetch, calls = _pager(payloads)
-    out = asyncio.run(pages(cap, fetch, {"account": "1"}, limit=limit))
-    return out, calls
+    out, truncated = asyncio.run(pages(cap, fetch, {"account": "1"}, limit=limit))
+    return out, truncated, calls
 
 
 PAGED = Capability(tool="orders", next=["data.next"],
@@ -215,35 +215,85 @@ PAGED = Capability(tool="orders", next=["data.next"],
 
 
 def test_pages_follow_next_until_it_runs_out():
-    out, calls = _paged(PAGED, {None: {"data": {"next": "b"}},
-                                "b": {"data": {"next": "c"}},
-                                "c": {"data": {"next": None}}}, limit=25)
+    out, truncated, calls = _paged(PAGED, {None: {"data": {"next": "b"}},
+                                           "b": {"data": {"next": "c"}},
+                                           "c": {"data": {"next": None}}},
+                                   limit=25)
     assert len(out) == 3
+    assert truncated is False
     assert [c.get("cursor") for c in calls] == [None, "b", "c"]
 
 
 def test_pages_stop_on_an_empty_token():
-    out, _ = _paged(PAGED, {None: {"data": {"next": "b"}},
-                            "b": {"data": {"next": ""}}}, limit=25)
-    assert len(out) == 2
+    out, truncated, _ = _paged(PAGED, {None: {"data": {"next": "b"}},
+                                       "b": {"data": {"next": ""}}}, limit=25)
+    assert (len(out), truncated) == (2, False)
 
 
 def test_pages_stop_on_a_repeated_token():
-    out, calls = _paged(PAGED, {None: {"data": {"next": "b"}},
-                                "b": {"data": {"next": "b"}}}, limit=25)
-    assert len(out) == 2
+    out, truncated, calls = _paged(PAGED, {None: {"data": {"next": "b"}},
+                                           "b": {"data": {"next": "b"}}},
+                                   limit=25)
+    assert (len(out), truncated) == (2, False)
     assert [c.get("cursor") for c in calls] == [None, "b"]
 
 
-def test_pages_are_bounded():
+def test_pages_are_bounded_and_say_a_page_remains():
     endless = {None: {"data": {"next": 1}}}
     endless.update({i: {"data": {"next": i + 1}} for i in range(1, 100)})
-    out, _ = _paged(PAGED, endless, limit=25)
-    assert len(out) == 25
+    out, truncated, _ = _paged(PAGED, endless, limit=25)
+    assert (len(out), truncated) == (25, True)
+
+
+def test_exactly_the_limit_and_done_is_not_truncated():
+    exact = {None: {"data": {"next": 1}}}
+    exact.update({i: {"data": {"next": i + 1}} for i in range(1, 24)})
+    exact[24] = {"data": {"next": None}}
+    out, truncated, _ = _paged(PAGED, exact, limit=25)
+    assert (len(out), truncated) == (25, False)
 
 
 def test_a_map_with_no_next_reads_one_page():
     cap = Capability(tool="orders", fields={"order_id": ["id"], "symbol": ["s"]})
-    out, calls = _paged(cap, {None: {"data": {"next": "b"}}}, limit=25)
-    assert len(out) == 1
+    out, truncated, calls = _paged(cap, {None: {"data": {"next": "b"}}}, limit=25)
+    assert (len(out), truncated) == (1, False)
     assert "cursor" not in calls[0]
+
+
+def _spec_with(name, cap):
+    from nakagai_edge.config import ConnectorSpec
+    return ConnectorSpec(id="b", kind="mcp-http", role="broker",
+                         capabilities={name: cap})
+
+
+def test_next_without_a_cursor_argument_is_refused():
+    import pytest
+    with pytest.raises(ValueError, match="maps no cursor argument"):
+        _spec_with("list_orders", {
+            "tool": "orders", "args": {"account": "acct"}, "next": ["next"],
+            "fields": {"order_id": ["id"], "symbol": ["s"]}})
+
+
+def test_next_on_any_other_capability_is_refused():
+    import pytest
+    with pytest.raises(ValueError, match="only list_orders pages"):
+        _spec_with("list_positions", {
+            "tool": "holdings", "args": {"account": "acct",
+                                         "cursor": "page"}, "next": ["next"],
+            "fields": {"symbol": ["s"], "quantity": ["q"]}})
+
+
+def test_next_with_a_cursor_argument_parses():
+    spec = _spec_with("list_orders", {
+        "tool": "orders", "args": {"account": "acct", "cursor": "page"},
+        "next": ["next"], "fields": {"order_id": ["id"], "symbol": ["s"]}})
+    assert spec.capability("list_orders").next == ["next"]
+
+
+def test_created_at_is_a_verbatim_list_orders_field():
+    from nakagai_edge.capability import read_row
+    assert "created_at" in CAPABILITIES["list_orders"].optional
+    cap = _orders_cap(created_at=["made"])
+    row = read_row("list_orders", cap,
+                   {"id": "o", "symbol": "a", "made": "2026-11-01T00:00:00Z"})
+    assert row["created_at"] == "2026-11-01T00:00:00Z"
