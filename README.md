@@ -5,9 +5,10 @@ the only place a broker credential is ever written to disk. Your agent talks to
 exactly one MCP endpoint, the edge, and never sees a token. The platform never
 sees one either.
 
-Version 0.8.0 is the current release. It can send a broker's order history
-from before you connected, only when you turn that on for the broker (see "The
-fill journal"). Autopilot and execution candidates are
+Version 0.9.0 is the current release. It reports each broker's own closed
+trades with the profit or loss the broker realized on them (see "Closed
+trades"), and sends history from before you connected only when you turn that
+on for the broker. Autopilot and execution candidates are
 removed: orders reach a broker only as owner-approved order proposals. It
 speaks proposal protocol 1: when an
 outside agent proposes an order on the platform and the owner approves it, the
@@ -314,9 +315,10 @@ for a position's quantity. When those names live in the edge, a second broker
 is not a config change, and the failure is not a loud one. The brake stops
 seeing positions while every display goes on reporting them as guarded.
 
-So the generic broker surface knows seven things a broker can be asked to do, and nothing about
+So the generic broker surface knows eight things a broker can be asked to do, and nothing about
 how any particular broker spells them: `list_accounts`, `get_balance`,
-`list_positions`, `get_quote`, `list_orders`, `place_order`, `cancel_order`.
+`list_positions`, `get_quote`, `list_orders`, `list_closed_trades`,
+`place_order`, `cancel_order`.
 
 Code owns the meaning and the type of every canonical field. `quantity` is a
 number, `symbol` is upper-cased, `side` is `buy` or `sell`. A connector's map
@@ -324,7 +326,7 @@ owns location only: which downstream tool, which argument keys, which response
 paths. That split is the safety property. A wrong map produces a visibly wrong
 number or an extraction failure; it can never make `quantity` mean notional.
 
-**The vocabulary is closed on purpose.** These seven cover shares. Options,
+**The vocabulary is closed on purpose.** These eight cover shares. Options,
 futures and crypto each need their own notional math and their own envelope
 reasoning before they can be let in. Four option contracts at $2.50 compute as
 $10 of notional against a $2,000 per-order cap, when the real exposure is
@@ -558,6 +560,33 @@ Four properties are deliberate:
 The journal is local-first: it is written here before the platform is told, so
 an outage costs latency and never a record. The audit trail of what the agent
 did, `results/audit.jsonl`, is local too, and never leaves this machine.
+
+## Closed trades
+
+On the same 300s cadence, the edge reads each broker's closed trades through
+its `list_closed_trades` capability and sends one row per closing trade: the
+symbol, side, quantity, price, when it closed, and the profit or loss **the
+broker itself realized** on it. The edge never pairs buys with sells to work
+that out; the broker already knows which lots a sale closed.
+
+- **Nothing from before you connected is sent** unless you turn on a history
+  window for that broker on the platform (the same "Trade history" choice the
+  fill journal reads). The first time an account answers, the edge records
+  that moment and sends only trades that closed after it. A window moves that
+  moment back once, never forward.
+- **A row is sent only when its own close time proves it falls inside**, so a
+  broker that answers with older trades than it was asked for sends none of
+  them. A row without a readable close time is not sent.
+- **At most 25 pages per account per read.** A window holding more sends its
+  newest 25 pages; older closed trades inside it are not sent.
+- **The broker gives these rows no id**, so the edge identifies each by a
+  digest of everything it says (`trade_key`). Two byte-identical rows are one
+  trade.
+
+The map translates the canonical span (`week`, `month`, `quarter`, `all`) into
+the broker's own word under `values.span`, and pages through `next` and
+`cursor`. A span the map does not translate is never sent; the edge widens to
+the next one it does. A connector declaring no `list_closed_trades` is skipped.
 
 ## Failure modes
 
