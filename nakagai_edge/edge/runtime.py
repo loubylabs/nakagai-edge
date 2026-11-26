@@ -490,7 +490,9 @@ def create_edge_mcp(state: EdgeState, hub, client: PlatformClient, audit: EdgeAu
         """Orders on one account, open or otherwise.
 
         Returns `data`: a list of `{"order_id", "symbol", "side", "quantity",
-        "status"}`. `side` is canonical (`buy` or `sell`) however the broker
+        "filled_quantity", "status", "created_at"}`, each present when the
+        broker's map declares it. `quantity` is what was ordered and
+        `filled_quantity` what filled. `side` is canonical (`buy` or `sell`) however the broker
         spells it; `status` is the broker's own word, relayed verbatim, because
         brokers do not agree on what the states mean and inventing a shared
         set here would flatten a distinction you may need.

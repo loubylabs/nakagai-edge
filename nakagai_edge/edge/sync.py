@@ -20,6 +20,7 @@ from nakagai_edge.edge.state import EdgeState
 POLICY_TTL_S = 900          # deny everything on staler policy
 SYNC_INTERVAL_S = 60        # etag check cadence
 BUNDLE_SCHEMA = 2           # bump when the bundle's shape changes
+MAX_HISTORY_DAYS = 365      # the longest trade history window the edge sends
 
 log = logging.getLogger("nakagai.edge")
 
@@ -215,6 +216,27 @@ def server_edge_version(state: EdgeState) -> str:
     except (OSError, json.JSONDecodeError, AttributeError):
         return ""
     return version if isinstance(version, str) else ""
+
+
+def trade_history_days(state: EdgeState, connector_id: str) -> int:
+    """How many days of order history the owner chose to send for a connector.
+
+    Read off the cached bundle's top-level `trade_history` key, which lists
+    only connectors whose owner turned history on. Zero covers every other
+    case: no bundle yet, a platform that predates the key, a connector not
+    listed, or a value that is not a positive whole number. Zero means no
+    backfill, the journal's default. Anything above MAX_HISTORY_DAYS reads as
+    MAX_HISTORY_DAYS: the platform offers no longer window, and the edge does
+    not take a larger number on trust.
+    """
+    try:
+        doc = json.loads(state.bundle_path.read_text())
+        days = ((doc.get("trade_history") or {}).get(connector_id) or {}).get("days")
+    except (OSError, json.JSONDecodeError, AttributeError):
+        return 0
+    if isinstance(days, bool) or not isinstance(days, int) or days < 0:
+        return 0
+    return min(days, MAX_HISTORY_DAYS)
 
 
 def sync_once(state: EdgeState, client: PlatformClient) -> bool:

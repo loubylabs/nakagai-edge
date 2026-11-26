@@ -8,12 +8,20 @@ approval claims remains an owner-placed trade when the rows reach the platform.
 Three rules govern this module, and each of them inverts a rule that holds
 elsewhere in the edge. They are worth reading before changing anything.
 
-**First sight anchors; it does not backfill.** The first sweep of an account
-records the order ids it sees and ships NOTHING. Only what appears afterwards
-is journaled. `list_orders` has no `since` argument, so without this the first
-sweep would upload however much personal trading history the broker chooses to
-return. The anchor is never evicted: losing it re-ships that history, and that
-is the single outcome this design exists to prevent.
+**First sight anchors; it does not backfill, except inside a window the owner
+grants.** The first sweep of an account records the order ids it sees and
+ships NOTHING. Only what appears afterwards is journaled. The sweep asks for
+the broker's default page with no `since`, so without this it would upload
+however much personal trading history the broker chooses to return. The anchor
+is never evicted: losing it re-ships that history, and that is the single
+outcome this design exists to prevent.
+
+The one exception is a history window the owner turned on for that broker on
+the platform (the bundle's `trade_history`). The edge then asks for orders
+created since the window opened, through the map's `since`, and journals each
+one once, anchored or not, then records the window in `fills-history.json` so
+it is read once. Anything older than the window stays anchored and unsent. A
+map with no `since` never backfills.
 
 **Rows are read with `read_row`, not `read_partial`.** portfolio._positions
 does the opposite, deliberately, because a position dropped for an unreadable
@@ -34,20 +42,24 @@ import asyncio
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
-from nakagai_edge.capability import (CapabilityError, first, read_partial,
-                                     read_row, resolve)
+from nakagai_edge.capability import (CapabilityError, first, pages,
+                                     read_partial, read_row, resolve)
 from nakagai_edge.edge.audit import EdgeAudit
 from nakagai_edge.edge.journal import Journal
 from nakagai_edge.edge.portfolio import (broker_specs, listed_accounts,
                                          tiered_accounts)
 from nakagai_edge.edge.remote import intents
+from nakagai_edge.edge.sync import trade_history_days
 
 FILLS_INTERVAL_S = 300          # the timer loop's cadence
 SHIP_LIMIT = 200                # rows per POST
+HISTORY_PAGES = 25              # pages one history backfill may read
 
 ANCHOR_RELPATH = Path("cache") / "fills-anchor.json"
+HISTORY_RELPATH = Path("cache") / "fills-history.json"
 JOURNAL_RELPATH = Path("results") / "fills.jsonl"
 
 log = logging.getLogger("nakagai.edge")
@@ -117,6 +129,47 @@ class Anchor:
         tmp.replace(self.path)
 
 
+class HistoryMarker:
+    """The largest history window already sent, per (connector, account).
+
+    Moved only after a backfill completes, so a failed or partial read is
+    retried on the next sweep. A larger grant later reads again with the larger
+    window; the seen-set keeps rows already journaled from journaling twice.
+    """
+
+    def __init__(self, root) -> None:
+        self.path = Path(root) / HISTORY_RELPATH
+
+    def _load(self) -> dict:
+        try:
+            doc = json.loads(self.path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return doc if isinstance(doc, dict) else {}
+
+    def days(self, account_key: str) -> int:
+        value = self._load().get(account_key)
+        return value if isinstance(value, int) and not isinstance(value, bool) else 0
+
+    def move(self, account_key: str, days: int) -> None:
+        doc = self._load()
+        doc[account_key] = days
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(doc, indent=2))
+        tmp.replace(self.path)
+
+
+def _fetcher(hub, spec, cap):
+    """One list_orders call, canonical arguments in, the payload out."""
+    async def fetch(args: dict):
+        tool, resolved = resolve("list_orders", cap, args)
+        return (await hub.call(
+            spec.id, tool, resolved, account_key=hub.account_key
+        )).get("data")
+    return fetch
+
+
 async def _order_rows(hub, spec, account: str, *, status: str = "",
                       retain_unknown: bool = False) -> list[dict] | None:
     """One list_orders call and parse path for fills and exposure.
@@ -131,10 +184,12 @@ async def _order_rows(hub, spec, account: str, *, status: str = "",
     args: dict = {"account": account}
     if status:
         args["status"] = status
-    tool, resolved = resolve("list_orders", cap, args)
-    payload = (await hub.call(
-        spec.id, tool, resolved, account_key=hub.account_key
-    )).get("data")
+    payload = await _fetcher(hub, spec, cap)(args)
+    return _read_orders(cap, payload, retain_unknown=retain_unknown)
+
+
+def _read_orders(cap, payload, *, retain_unknown: bool = False) -> list[dict] | None:
+    """One list_orders payload read into canonical rows. See _order_rows."""
     rows = first(payload, cap.items) if cap.items else payload
     if not isinstance(rows, list):
         return None
@@ -172,6 +227,61 @@ async def open_order_rows(hub, spec, account: str) -> list[dict] | None:
     autonomous entry instead of vanishing into an apparently empty book.
     """
     return await _order_rows(hub, spec, account, retain_unknown=True)
+
+
+def history_since(days: int, now: float) -> str:
+    """The window's lower bound as an ISO 8601 UTC instant ending in `Z`."""
+    start = datetime.fromtimestamp(now - days * 86400, tz=timezone.utc)
+    return start.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _in_window(row: dict, since: str) -> bool:
+    """True only when the row PROVABLY falls at or after `since`.
+
+    Fail closed behind the broker's own filter: a broker that ignored `since`
+    must not turn the backfill into the whole history. The row's `created_at`
+    decides when it has one, else its `filled_at` (an order filled inside the
+    window may still have been created before it, which is why creation time
+    wins). A row with neither, or with a timestamp that does not parse or
+    names no zone, proves nothing and is dropped from the backfill. The
+    regular sweep still journals it once it changes.
+    """
+    stamp = row.get("created_at") or row.get("filled_at")
+    if not isinstance(stamp, str):
+        return False
+    try:
+        moment = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if moment.tzinfo is None:
+        return False
+    return moment >= datetime.fromisoformat(since.replace("Z", "+00:00"))
+
+
+async def history_rows(hub, spec, account: str, since: str) -> list[dict] | None:
+    """Every order on one account created since `since`, any status.
+
+    Follows the map's `next` for up to HISTORY_PAGES pages: the broker's
+    newest orders, so a window holding more than that sends only its newest
+    pages. None when any page is not the list the map declares: a partial
+    history must not read as a complete one, or the marker would move past
+    orders never read.
+    """
+    cap = spec.capability("list_orders")
+    payloads, truncated = await pages(cap, _fetcher(hub, spec, cap),
+                                      {"account": account, "since": since},
+                                      limit=HISTORY_PAGES)
+    out: list[dict] = []
+    for payload in payloads:
+        rows = _read_orders(cap, payload)
+        if rows is None:
+            return None
+        out.extend(row for row in rows if _in_window(row, since))
+    if truncated:
+        log.warning("order history on %s account %s holds more than %d pages; "
+                    "older orders inside the window are not sent",
+                    spec.id, account, HISTORY_PAGES)
+    return out
 
 
 async def connector_accounts(hub, spec) -> tuple[str, list[tuple[str, list[dict]]]]:
@@ -219,6 +329,7 @@ class FillsReporter:
         self._state, self._hub, self._client = state, hub, client
         self._journal = Journal(Path(state.root) / JOURNAL_RELPATH)
         self._anchor = Anchor(state.root)
+        self._history = HistoryMarker(state.root)
         self._lock = asyncio.Lock()
         self._seen = {key(r) for r in self._journal.records()}
 
@@ -288,8 +399,54 @@ class FillsReporter:
                             if not submitted:
                                 break
                     journaled.extend(self._absorb(spec.id, account, rows))
+                    journaled.extend(await self._backfill(spec, account))
             await self._ship()
             return journaled
+
+    async def _backfill(self, spec, account: str) -> list[dict]:
+        """Send the history window the owner granted, once per window.
+
+        The one exception to first-sight anchoring: inside a granted window
+        every row is journaled, anchored or not. Nothing runs without a grant
+        larger than the window already sent, or for a map with no `since`.
+        """
+        days = trade_history_days(self._state, spec.id)
+        account_key = f"{spec.id}\x1f{account}"
+        if days <= self._history.days(account_key):
+            return []
+        if "since" not in spec.capability("list_orders").args:
+            return []
+        try:
+            rows = await history_rows(self._hub, spec, account,
+                                      history_since(days, time.time()))
+        except Exception as e:  # noqa: BLE001 (retry next sweep)
+            log.warning("order history unreadable for %s account %s, so its "
+                        "%d-day history is not sent this cycle: %s",
+                        spec.id, account, days, e)
+            return []
+        if rows is None:
+            log.warning("order history on %s account %s did not read as a "
+                        "list, so its %d-day history is not sent this cycle",
+                        spec.id, account, days)
+            return []
+        journaled = self._journal_new(
+            [{**row, "connector_id": spec.id, "account": account} for row in rows])
+        self._history.move(account_key, days)
+        log.info("sent %d orders of %d-day history on %s account %s",
+                 len(journaled), days, spec.id, account)
+        return journaled
+
+    def _journal_new(self, rows: list[dict], skip=frozenset()) -> list[dict]:
+        """Journal each row not journaled before and not in `skip`."""
+        journaled = []
+        for row in rows:
+            k = key(row)
+            if k in self._seen or k in skip:
+                continue
+            self._seen.add(k)
+            self._journal.append({**row, "reported_at": time.time()})
+            journaled.append(row)
+        return journaled
 
     def _absorb(self, connector_id: str, account: str,
                 rows: list[dict]) -> list[dict]:
@@ -302,33 +459,28 @@ class FillsReporter:
         account_key = f"{connector_id}\x1f{account}"
         anchored = self._anchor.known(account_key)
         if anchored is None:
+            # The seen-set stays "journaled", not "seen": a history backfill
+            # must still be able to journal an anchored row inside its window.
             self._anchor.anchor(account_key, (key(r) for r in rows))
-            self._seen.update(key(r) for r in rows)
             log.info("anchored %d existing orders on %s account %s; only what "
-                     "happens from here is journaled",
-                     len(rows), connector_id, account)
+                     "happens from here, or inside a history window the owner "
+                     "grants, is journaled", len(rows), connector_id, account)
             return []
-        journaled = []
-        for row in rows:
-            k = key(row)
-            if k in self._seen or k in anchored:
-                continue
-            self._seen.add(k)
-            self._journal.append({**row, "reported_at": time.time()})
-            journaled.append(row)
-        return journaled
+        return self._journal_new(rows, skip=anchored)
 
     async def _ship(self) -> None:
-        """Send unshipped rows, marking LINES consumed rather than rows sent so
-        an unreadable line cannot strand the watermark behind it forever."""
-        batch = self._journal.pending(SHIP_LIMIT)
-        if not batch:
-            return
-        rows = [row for row in batch if row is not None]
-        try:
-            if rows:
-                await asyncio.to_thread(self._client.report_fills, rows)
-            self._journal.mark_shipped(len(batch))
-        except Exception as e:  # noqa: BLE001 (a down platform must not hurt the edge)
-            log.warning("fill journal not shipped to the platform this cycle, "
-                        "so %d rows wait for the next: %s", len(batch), e)
+        """Send unshipped rows in batches until none wait, marking LINES
+        consumed rather than rows sent so an unreadable line cannot strand the
+        watermark behind it forever. A history backfill can journal many
+        batches at once; it drains in one sweep rather than one per cycle."""
+        while batch := self._journal.pending(SHIP_LIMIT):
+            rows = [row for row in batch if row is not None]
+            try:
+                if rows:
+                    await asyncio.to_thread(self._client.report_fills, rows)
+                self._journal.mark_shipped(len(batch))
+            except Exception as e:  # noqa: BLE001 (a down platform must not hurt the edge)
+                log.warning("fill journal not shipped to the platform this "
+                            "cycle, so %d rows wait for the next: %s",
+                            len(batch), e)
+                return

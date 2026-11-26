@@ -5,7 +5,9 @@ the only place a broker credential is ever written to disk. Your agent talks to
 exactly one MCP endpoint, the edge, and never sees a token. The platform never
 sees one either.
 
-Version 0.7.2 is the current release. Autopilot and execution candidates are
+Version 0.8.0 is the current release. It can send a broker's order history
+from before you connected, only when you turn that on for the broker (see "The
+fill journal"). Autopilot and execution candidates are
 removed: orders reach a broker only as owner-approved order proposals. It
 speaks proposal protocol 1: when an
 outside agent proposes an order on the platform and the owner approves it, the
@@ -520,13 +522,28 @@ its `list_orders` capability, records what it has not seen before, and ships it
 to the platform. A connector that declares no `list_orders` has no history to
 read and is skipped in silence.
 
-Three properties are deliberate:
+Four properties are deliberate:
 
-- **First sight anchors; it does not backfill.** The first sweep of an account
-  records the order ids it finds and ships **nothing**. `list_orders` has no
-  `since` argument, so without this the first sweep would upload however much
-  of your personal trading history the broker chose to return. The journal
-  means "since you connected", and the anchor is never evicted.
+- **First sight anchors; history is off unless you turn it on.** The first
+  sweep of an account records the order ids it finds and ships **nothing**.
+  The sweep asks the broker for its default page with no `since`, so without
+  this it would upload however much of your personal trading history the
+  broker chose to return. The journal means "since you connected", and the
+  anchor is never evicted.
+
+  The one exception is a history window you choose per broker on the platform
+  (Settings, Connectors, "Trade history": Off by default, 30 days, 90 days or
+  1 year). The edge then asks for orders created inside that window, through
+  the map's `since` and `next`, and sends each once. Orders older than the
+  window are never sent: a row is kept only when its own `created_at` (else
+  `filled_at`) proves it falls inside the window, whatever the broker
+  returned. A window sends at most 25 pages of the broker's newest orders per
+  account; older orders inside the window are not sent. A larger window later
+  sends the difference; nothing is sent twice. A connector whose map declares
+  no `since` never sends history, and the edge never reads a window longer
+  than 365 days.
+- **Rows carry what filled.** `quantity` is what was ordered and
+  `filled_quantity`, when the map declares it, is what actually filled.
 - **Attribution joins on the broker's own order id.** When the edge places an
   order it reads the broker's id for it off the `place_order` map and reports
   it, so the platform can match a fill to the approval that caused it. A fill

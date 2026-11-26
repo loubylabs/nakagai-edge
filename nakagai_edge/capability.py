@@ -15,6 +15,7 @@ CAPABILITIES from here, and the dependency stays one-directional.
 """
 
 import math
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -31,7 +32,7 @@ COERCIONS = {
     "side": SIDE,
     "quantity": FLOAT, "price": FLOAT, "stop": FLOAT, "day_pnl": FLOAT,
     "bid": FLOAT, "ask": FLOAT, "avg_price": FLOAT, "fill_price": FLOAT,
-    "notional": FLOAT,
+    "notional": FLOAT, "filled_quantity": FLOAT,
 }
 # `notional` is FLOAT beside `quantity` and `fill_price`: it is an order's SIZE
 # and a reader does arithmetic on it. That is the opposite call from `equity`
@@ -39,13 +40,16 @@ COERCIONS = {
 # worded them.
 #
 # Everything absent from COERCIONS is VERBATIM: equity, cash, buying_power,
-# market_value, currency, nickname, type, status, order_id, filled_at, account.
+# market_value, currency, nickname, type, status, order_id, filled_at,
+# created_at, account.
 # The edge relays those figures and never does arithmetic on them.
 #
 # `filled_at` is verbatim for the same reason `status` is. Brokers spell
 # timestamps a dozen ways, and a moment this module parsed into a float would
 # be a moment it had done arithmetic on. The platform reads it; the edge only
-# carries it.
+# carries it. `created_at` is verbatim for the same reason. The history
+# backfill is the one reader that compares either to its window, and a moment
+# it cannot read is dropped there rather than guessed.
 
 
 class CapabilityError(Exception):
@@ -109,10 +113,19 @@ CAPABILITIES: dict[str, CapabilitySpec] = {
     # words is what makes that true rather than aspirational.
     #
     # Neither is required, so an order sized either way still journals.
+    #
+    # `filled_quantity` is what actually filled, beside `quantity`, what was
+    # ordered. A partial fill differs, and only the broker knows by how much.
+    #
+    # `since` is an inclusive lower bound on when an order was created, an ISO
+    # 8601 UTC instant; `cursor` is the broker's opaque next-page token, read
+    # off the map's `next` paths. Both are optional for a map: one declaring
+    # neither reads one page, exactly as before they existed.
     "list_orders": CapabilitySpec(
-        args=("account", "status"), required=("order_id", "symbol"),
-        optional=("side", "quantity", "notional", "status", "fill_price",
-                  "filled_at"),
+        args=("account", "status", "since", "cursor"),
+        required=("order_id", "symbol"),
+        optional=("side", "quantity", "filled_quantity", "notional", "status",
+                  "fill_price", "filled_at", "created_at"),
         is_list=True, is_write=False),
     # `optional` here is the RESULT of placing an order, not its arguments:
     # `args` above is what goes out, these are what can be read back. The fill
@@ -143,6 +156,9 @@ class Capability(BaseModel):
     # paths are rooted and which are absolute. Empty means the response root,
     # which is how a broker that wraps nothing at all maps.
     items: list[str] = Field(default_factory=list)
+    # Where the next-page token sits in the payload, same path syntax as
+    # `items`. Empty means the capability answers in one page.
+    next: list[str] = Field(default_factory=list)
     fields: dict[str, list[str]] = Field(default_factory=dict)
     values: dict[str, dict[str, list[str]]] = Field(default_factory=dict)
     outbound_types: dict[str, str] = Field(default_factory=dict)
@@ -169,6 +185,35 @@ def first(payload: Any, paths: list[str]) -> Any:
         if value is not None:
             return value
     return None
+
+
+async def pages(cap: Capability, fetch: Callable[[dict], Awaitable[Any]],
+                args: dict, *, limit: int) -> tuple[list[Any], bool]:
+    """Every payload of a paged read, at most `limit` of them, and whether the
+    read stopped at `limit` with a further page still on offer.
+
+    `fetch` takes canonical arguments and returns one payload, so the I/O stays
+    the caller's. The next page's token is read off `cap.next` and sent back as
+    the canonical `cursor`. Paging stops at the first payload with no token, an
+    empty one, a non-scalar one, or one already sent: a broker that hands back
+    the same token twice would otherwise be asked for the same page until the
+    cap. A map declaring no `next` reads exactly one page.
+    """
+    out: list[Any] = []
+    sent: set = set()
+    while True:
+        payload = await fetch(args)
+        out.append(payload)
+        if not cap.next:
+            return out, False
+        token = first(payload, cap.next)
+        if (isinstance(token, bool) or not isinstance(token, (str, int))
+                or token == "" or token in sent):
+            return out, False
+        if len(out) >= limit:
+            return out, True
+        sent.add(token)
+        args = {**args, "cursor": token}
 
 
 def coerce(field: str, value: Any, cap: Capability) -> Any | None:

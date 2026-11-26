@@ -183,6 +183,29 @@ class ConnectorSpec(BaseModel):
 
     @field_validator("capabilities")
     @classmethod
+    def _next_pages_through_a_cursor(cls, v: dict, info) -> dict:
+        """`next` is only meaningful where its token can be sent back.
+
+        A token read off a page and never sent would ask for page one again
+        until the page cap, and read as a complete history. Only `list_orders`
+        pages, and only through its `cursor` argument.
+        """
+        cid = (info.data or {}).get("id", "?")
+        for name in sorted(v):
+            if not v[name].next:
+                continue
+            if name != "list_orders":
+                raise ValueError(
+                    f"connector {cid!r} declares next on {name}; only "
+                    f"list_orders pages")
+            if "cursor" not in v[name].args:
+                raise ValueError(
+                    f"connector {cid!r} declares next on list_orders but maps "
+                    f"no cursor argument to send the token back")
+        return v
+
+    @field_validator("capabilities")
+    @classmethod
     def _order_args_are_mapped(cls, v: dict, info) -> dict:
         """A declared `place_order` must say where every order field goes.
 
