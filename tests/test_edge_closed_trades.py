@@ -252,6 +252,53 @@ async def test_a_negative_realized_pnl_survives(tmp_path):
     assert client.batches[0][0]["realized_pnl"] == -42.17
 
 
+# ---- identical rows are separate trades -----------------------------------
+#
+# Timestamps stop at the second, so the same size closed at the same price
+# twice in one second reads as two identical rows. Both are real trades.
+
+async def test_two_identical_rows_ship_as_two_trades_and_only_once(tmp_path):
+    state = _state(tmp_path)
+    _grant(state, 30)
+    at = time.time() - DAY
+    broker = Broker([_trade("TWIN", at), _trade("TWIN", at)], page_size=10)
+    client = Client()
+    r = ClosedTradesReporter(state, broker, client)
+    await r.sweep()
+    shipped = [row for batch in client.batches for row in batch]
+    assert [row["symbol"] for row in shipped] == ["TWIN", "TWIN"]
+    keys = [row["trade_key"] for row in shipped]
+    assert len(set(keys)) == 2
+    assert keys[0] == trade_key(shipped[0])           # ordinal 0: the plain key
+    await r.sweep()                                   # the same read again
+    await ClosedTradesReporter(state, broker, client).sweep()   # a restart
+    assert len([row for batch in client.batches for row in batch]) == 2
+
+
+async def test_ordinals_count_across_pages(tmp_path):
+    state = _state(tmp_path)
+    _grant(state, 30)
+    at = time.time() - DAY
+    broker = Broker([_trade("TRIP", at)] * 3, page_size=2)
+    client = Client()
+    await ClosedTradesReporter(state, broker, client).sweep()
+    assert len(broker.reads()) == 2                   # 2 rows, then 1
+    shipped = [row for batch in client.batches for row in batch]
+    assert [row["trade_key"] for row in shipped] == [
+        trade_key(shipped[0], n) for n in (0, 1, 2)]
+    assert len({row["trade_key"] for row in shipped}) == 3
+
+
+def test_ordinal_zero_hashes_as_before_and_others_differ():
+    row = {"connector_id": "c", "account": "1", "closed_at": "2026-11-25T15:00:00Z",
+           "symbol": "NVDA", "side": "sell", "quantity": 10.0, "price": 101.25,
+           "realized_pnl": -3.5}
+    assert trade_key(row, 0) == trade_key(row) == (
+        "34aae4ad8ef05f2dffd03d0716841cc6b584e24f3d4a57315016b650d1a6d3d3")
+    assert trade_key(row, 1) != trade_key(row)
+    assert trade_key(row, 1) != trade_key(row, 2)
+
+
 # ---- paging --------------------------------------------------------------
 
 async def test_a_regular_sweep_with_nothing_new_makes_one_call(tmp_path):

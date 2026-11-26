@@ -580,8 +580,9 @@ that out; the broker already knows which lots a sale closed.
 - **At most 25 pages per account per read.** A window holding more sends its
   newest 25 pages; older closed trades inside it are not sent.
 - **The broker gives these rows no id**, so the edge identifies each by a
-  digest of everything it says (`trade_key`). Two byte-identical rows are one
-  trade.
+  digest of everything it says (`trade_key`). Two identical rows in one read,
+  the same size closed at the same price in the same second, are numbered in
+  the broker's order and stay two trades.
 
 The map translates the canonical span (`week`, `month`, `quarter`, `all`) into
 the broker's own word under `values.span`, and pages through `next` and

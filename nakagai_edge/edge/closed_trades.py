@@ -21,7 +21,8 @@ ignores the span cannot send older rows. A row with no readable zoned instant
 is dropped.
 
 **The broker gives these rows no id.** `trade_key` is a digest of everything
-the row says, so two byte-identical rows are one trade. That is the only
+the row says plus its ordinal among identical rows in one read, so two
+separate trades that happen to read identically stay two. That is the only
 identity available, and it is what dedupes the journal and the platform.
 """
 
@@ -30,6 +31,7 @@ import hashlib
 import json
 import logging
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -52,13 +54,22 @@ ROW_FIELDS = KEY_FIELDS[2:]
 log = logging.getLogger("nakagai.edge")
 
 
-def trade_key(row: dict) -> str:
+def trade_key(row: dict, ordinal: int = 0) -> str:
     """A stable identity for one closed trade: sha256 over canonical JSON of
-    every value the row carries. The broker gives no id, so two byte-identical
-    rows are one trade."""
-    doc = json.dumps({f: row.get(f) for f in KEY_FIELDS}, sort_keys=True,
-                     separators=(",", ":"))
-    return hashlib.sha256(doc.encode()).hexdigest()
+    every value the row carries, plus its ordinal among identical rows.
+
+    The broker gives no id, and its timestamps stop at the second, so the same
+    size closed at the same price twice in one second arrives as two identical
+    rows. `ordinal` is n for the n-th such row in one read, in the broker's
+    order; the broker returns both on every read, so the numbering is stable.
+    Ordinal 0 hashes exactly the eight values, unchanged from before ordinals
+    existed, so keys already journaled stay valid.
+    """
+    doc = {f: row.get(f) for f in KEY_FIELDS}
+    if ordinal > 0:
+        doc["ordinal"] = ordinal
+    return hashlib.sha256(json.dumps(doc, sort_keys=True, separators=(",", ":"))
+                          .encode()).hexdigest()
 
 
 class SendFrom:
@@ -183,16 +194,27 @@ class ClosedTradesReporter:
             return at_or_after(row["closed_at"], bound) and (
                 moved or row["trade_key"] not in self._seen)
 
-        def enough(payload) -> bool:
-            rows = self._rows(spec, account, payload)
+        # Each payload is read exactly once, in the broker's order, as it
+        # arrives, so identical rows are numbered across every page of this
+        # read and the early stop judges the same keys that get journaled.
+        read_pages: list[list[dict] | None] = []
+        ordinals: Counter = Counter()
+        fetch = fetcher(self._hub, spec, CAPABILITY)
+
+        async def fetch_and_read(args: dict):
+            payload = await fetch(args)
+            read_pages.append(self._rows(spec, account, payload, ordinals))
+            return payload
+
+        def enough(_payload) -> bool:
+            rows = read_pages[-1]
             return rows is not None and not any(fresh(r) for r in rows)
 
         args = {"account": account, "span": span or None}
-        payloads, truncated = await pages(cap, fetcher(self._hub, spec, CAPABILITY),
-                                          args, limit=PAGE_LIMIT, enough=enough)
+        _payloads, truncated = await pages(cap, fetch_and_read, args,
+                                           limit=PAGE_LIMIT, enough=enough)
         rows: list[dict] = []
-        for payload in payloads:
-            read = self._rows(spec, account, payload)
+        for read in read_pages:
             if read is None:
                 log.warning("closed trades on %s account %s did not read as a "
                             "list, so none are sent this cycle", spec.id, account)
@@ -216,11 +238,11 @@ class ClosedTradesReporter:
         return journaled
 
     @staticmethod
-    def _rows(spec, account: str, payload) -> list[dict] | None:
+    def _rows(spec, account: str, payload, ordinals: Counter) -> list[dict] | None:
         """One payload read into wire rows, or None when it is not the list
         the map declares. Unreadable rows are dropped: with no instant they
         cannot be placed against send-from, and with no symbol they mean
-        nothing."""
+        nothing. `ordinals` counts identical rows across one whole read."""
         cap = spec.capability(CAPABILITY)
         node = first(payload, cap.items) if cap.items else payload
         if not isinstance(node, list):
@@ -232,6 +254,8 @@ class ClosedTradesReporter:
                 continue
             row = {"connector_id": spec.id, "account": account,
                    **{f: read.get(f) for f in ROW_FIELDS}}
-            row["trade_key"] = trade_key(row)
+            base = trade_key(row)
+            row["trade_key"] = trade_key(row, ordinals[base])
+            ordinals[base] += 1
             out.append(row)
         return out
