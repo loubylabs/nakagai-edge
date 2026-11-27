@@ -8,6 +8,7 @@ tokens persist under `secrets/tokens/<connector-id>.json` (mode 0600, and
 
 import json
 import os
+import time
 from pathlib import Path
 
 from nakagai_edge._env import read_env_ref
@@ -73,7 +74,34 @@ class FileTokenStorage:
         return OAuthToken.model_validate(raw) if raw else None
 
     async def set_tokens(self, tokens) -> None:
-        self._write({**self._read(), "tokens": tokens.model_dump(mode="json")})
+        # The absolute expiry, computed now from `expires_in`. The SDK keeps
+        # it only in memory and never restores it on load (see
+        # StoredOAuthProvider), so without this a token read back from disk
+        # looks valid forever. None records "the server gave no expiry",
+        # which is different from a file that never recorded one.
+        expires_at = (time.time() + tokens.expires_in
+                      if tokens.expires_in is not None else None)
+        self._write({**self._read(), "tokens": tokens.model_dump(mode="json"),
+                     "expires_at": expires_at})
+
+    def get_expiry(self) -> tuple[bool, float | None]:
+        """(recorded, expires_at). `recorded` is False for a file written
+        before expiries were kept."""
+        doc = self._read()
+        return "expires_at" in doc, doc.get("expires_at")
+
+    def get_oauth_metadata(self):
+        from mcp.shared.auth import OAuthMetadata
+        raw = self._read().get("oauth_metadata")
+        try:
+            return OAuthMetadata.model_validate(raw) if raw else None
+        except Exception:      # noqa: BLE001
+            return None
+
+    def set_oauth_metadata(self, metadata) -> None:
+        if metadata is not None:
+            self._write({**self._read(),
+                         "oauth_metadata": metadata.model_dump(mode="json")})
 
     async def get_client_info(self):
         from mcp.shared.auth import OAuthClientInformationFull
@@ -126,7 +154,44 @@ def build_oauth_provider(spec: ConnectorSpec, root: Path,
     # connector sets `oauth.client_id` today; the first that does should seed
     # storage instead.
 
-    return OAuthClientProvider(
+    class StoredOAuthProvider(OAuthClientProvider):
+        """The SDK provider, plus what it forgets between processes.
+
+        `OAuthClientProvider._initialize` loads tokens but not their expiry,
+        and `is_token_valid()` reads a missing expiry as valid. A provider
+        built from disk (the hub builds one per connect) therefore never
+        refreshed: it sent an expired token, took the 401 into the full
+        browser flow, and failed without a browser. So the expiry is restored
+        here, and a file that never recorded one (0.9.0) reads as expired, so
+        a refresh is tried first. The authorization server metadata is kept
+        too: without it the refresh goes to `<host>/token`, which is not
+        every server's token endpoint.
+        """
+
+        async def _initialize(self) -> None:
+            await super()._initialize()
+            storage = self.context.storage
+            recorded, expires_at = storage.get_expiry()
+            if self.context.current_tokens is not None:
+                if not recorded:
+                    self.context.token_expiry_time = 1.0      # long expired
+                elif expires_at is not None:
+                    self.context.token_expiry_time = float(expires_at)
+            if self.context.oauth_metadata is None:
+                self.context.oauth_metadata = storage.get_oauth_metadata()
+
+        async def _handle_token_response(self, response) -> None:
+            await super()._handle_token_response(response)
+            self.context.storage.set_oauth_metadata(self.context.oauth_metadata)
+
+        async def _handle_refresh_response(self, response) -> bool:
+            ok = await super()._handle_refresh_response(response)
+            if ok:
+                self.context.storage.set_oauth_metadata(
+                    self.context.oauth_metadata)
+            return ok
+
+    return StoredOAuthProvider(
         server_url=spec.url,
         client_metadata=metadata,
         storage=FileTokenStorage(token_path(root, spec.id)),
