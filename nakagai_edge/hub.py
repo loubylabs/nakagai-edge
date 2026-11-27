@@ -19,6 +19,7 @@ stops being true.
 
 import asyncio
 import json
+import os
 import logging
 import time
 from dataclasses import dataclass, field
@@ -371,8 +372,7 @@ class ConnectorHub:
                     conn.server_info = init.server_info.model_dump(
                         mode="json", by_alias=True)
                 conn.status, conn.last_error = "connected", ""
-                self._oauth_failures.pop(spec.id, None)
-                self._oauth_failed_at.pop(spec.id, None)
+                self._clear_login_failed(spec.id)
                 conn.connected_at = time.monotonic()
                 if conn._ready and not conn._ready.done():
                     conn._ready.set_result(True)
@@ -392,6 +392,9 @@ class ConnectorHub:
                 self._oauth_failures[spec.id] = (
                     self._oauth_failures.get(spec.id, 0) + 1)
                 self._oauth_failed_at[spec.id] = time.time()
+                if (self._oauth_failures[spec.id] >= OAUTH_FAILURES_FOR_LOGIN
+                        and self._read_login_failed_mark(spec.id) is None):
+                    self._write_login_failed_mark(spec.id)
             conn.error_until = time.monotonic() + RECONNECT_BACKOFF_S
             if conn._ready and not conn._ready.done():
                 conn._ready.set_exception(ConnectorError(
@@ -532,20 +535,59 @@ class ConnectorHub:
                 "tools": [t.get("name") for t in conn.tools],
                 "server_info": conn.server_info}
 
-    def _forget_failures_before_a_login(self, connector_id: str) -> None:
-        """A token file newer than the last OAuth failure is a login the
-        failures predate, so they no longer say anything."""
-        failed_at = self._oauth_failed_at.get(connector_id)
-        if failed_at is None:
-            return
+    def _login_failed_mark(self, connector_id: str) -> Path:
+        """Where a tripped two-failure rule is remembered across restarts.
+
+        The count is in memory, so without this a restarted daemon's first
+        report says `ok` and the next trip reads to the platform as a new
+        crossing, which emails the owner again.
+        """
         from nakagai_edge.auth import token_path
+        return token_path(self.root, connector_id).with_name(
+            f"{connector_id}.login-failed.json")
+
+    def _write_login_failed_mark(self, connector_id: str) -> None:
+        path = self._login_failed_mark(connector_id)
         try:
-            written = token_path(self.root, connector_id).stat().st_mtime
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps({"at": time.time()}))
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, path)
         except OSError:
-            return
-        if written > failed_at:
-            self._oauth_failures.pop(connector_id, None)
-            self._oauth_failed_at.pop(connector_id, None)
+            log.warning("could not record the failed login for %r", connector_id)
+
+    def _read_login_failed_mark(self, connector_id: str) -> float | None:
+        try:
+            return float(json.loads(
+                self._login_failed_mark(connector_id).read_text())["at"])
+        except (OSError, ValueError, KeyError, TypeError):
+            return None
+
+    def _clear_login_failed(self, connector_id: str) -> None:
+        self._oauth_failures.pop(connector_id, None)
+        self._oauth_failed_at.pop(connector_id, None)
+        self._login_failed_mark(connector_id).unlink(missing_ok=True)
+
+    def _login_failed(self, connector_id: str) -> bool:
+        """The two-failure rule, in memory or remembered on disk. A token
+        file newer than the last failure (or the mark) is a login those
+        failures predate, so it clears them."""
+        from nakagai_edge.auth import token_path
+        marked_at = self._read_login_failed_mark(connector_id)
+        failed_at = max(self._oauth_failed_at.get(connector_id, 0.0),
+                        marked_at or 0.0)
+        if failed_at:
+            try:
+                written = token_path(self.root, connector_id).stat().st_mtime
+            except OSError:
+                written = 0.0
+            if written > failed_at:
+                self._clear_login_failed(connector_id)
+                return False
+        return (marked_at is not None
+                or self._oauth_failures.get(connector_id, 0)
+                >= OAUTH_FAILURES_FOR_LOGIN)
 
     def status(self, *, with_tools: bool = False) -> dict:
         """Runtime view of every registered connector (no connection attempted).
@@ -557,9 +599,7 @@ class ConnectorHub:
         specs = self.load_specs()
         out = []
         for cid, spec in specs.items():
-            self._forget_failures_before_a_login(cid)
-            login_failed = (self._oauth_failures.get(cid, 0)
-                            >= OAUTH_FAILURES_FOR_LOGIN)
+            login_failed = self._login_failed(cid)
             conn = self._conns.get(cid)
             if conn:
                 conn.spec = spec

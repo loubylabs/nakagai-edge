@@ -258,6 +258,91 @@ async def test_a_fresh_login_clears_needs_login_without_waiting_for_a_connect(
     assert hub.status()["connectors"][0]["auth_state"] == "ok"
 
 
+def _registry(tmp_path):
+    import yaml
+    (tmp_path / "config").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "config" / "connectors.yaml").write_text(
+        yaml.safe_dump({"connectors": [OAUTH]}))
+
+
+async def _trip(tmp_path):
+    """Two OAuth failures in a row on a fresh hub: the rule trips."""
+    from nakagai_edge.hub import ConnectorError
+    hub = ConnectorHub(tmp_path, connect=_Sequence(
+        [_oauth_failure(), _oauth_failure()]))
+    for _ in range(2):
+        with pytest.raises(ConnectorError):
+            await hub._ensure_connected(hub.spec(OAUTH["id"]))
+        hub._conns[OAUTH["id"]].error_until = 0.0
+    assert hub.status()["connectors"][0]["auth_state"] == "needs_login"
+    return hub
+
+
+def _mark(tmp_path):
+    return token_path(tmp_path, OAUTH["id"]).with_name(
+        f"{OAUTH['id']}.login-failed.json")
+
+
+@pytest.mark.anyio
+async def test_a_restart_keeps_reporting_a_dead_login_with_no_ok_first(tmp_path):
+    """The failure count is in memory. Without the mark on disk, the first
+    report after a restart says ok and the next crossing to needs_login
+    emails the owner again."""
+    import os
+    import stat
+    import time
+    old = time.time() - 600
+    _tokens(tmp_path)
+    os.utime(token_path(tmp_path, OAUTH["id"]), (old, old))
+    _registry(tmp_path)
+    await _trip(tmp_path)
+    assert _mark(tmp_path).exists()
+    assert stat.S_IMODE(_mark(tmp_path).stat().st_mode) == 0o600
+
+    restarted = ConnectorHub(tmp_path)
+    assert restarted.status()["connectors"][0]["auth_state"] == "needs_login"
+
+
+@pytest.mark.anyio
+async def test_a_login_after_the_mark_clears_it(tmp_path):
+    import os
+    import time
+    old = time.time() - 600
+    _tokens(tmp_path)
+    os.utime(token_path(tmp_path, OAUTH["id"]), (old, old))
+    _registry(tmp_path)
+    await _trip(tmp_path)
+    _tokens(tmp_path)                        # `nakagai-edge login`, after it
+    restarted = ConnectorHub(tmp_path)
+    assert restarted.status()["connectors"][0]["auth_state"] == "ok"
+    assert not _mark(tmp_path).exists()
+
+
+@pytest.mark.anyio
+async def test_a_successful_connect_clears_the_mark(tmp_path):
+    import os
+    import time
+    old = time.time() - 600
+    _tokens(tmp_path)
+    os.utime(token_path(tmp_path, OAUTH["id"]), (old, old))
+    _registry(tmp_path)
+    await _trip(tmp_path)
+    hub = ConnectorHub(tmp_path, connect=_Sequence([None]))
+    await hub._ensure_connected(hub.spec(OAUTH["id"]))
+    try:
+        assert not _mark(tmp_path).exists()
+        assert hub.status()["connectors"][0]["auth_state"] == "ok"
+    finally:
+        await hub.aclose()
+
+
+def test_a_connector_with_no_mark_is_unchanged(tmp_path):
+    _tokens(tmp_path)
+    _registry(tmp_path)
+    assert ConnectorHub(tmp_path).status()["connectors"][0]["auth_state"] == "ok"
+    assert not _mark(tmp_path).exists()
+
+
 @pytest.mark.anyio
 async def test_no_tokens_on_disk_needs_login_at_once(tmp_path):
     assert await _attempts(tmp_path, [NoTokensError("no tokens")]) == [
