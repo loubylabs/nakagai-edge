@@ -1016,17 +1016,37 @@ async def _loops(state: EdgeState, hub, client: PlatformClient, audit: EdgeAudit
 
 
 def run(root, port: int = 8330) -> None:
+    """Serve until stopped. Returns at once, touching nothing, when the edge
+    is not paired or the port is already served.
+
+    Those two refusals come first and are clean exits (status 0) on purpose.
+    The login service restarts the daemon only after a failed exit, so a
+    refusal stays down instead of looping; and a second daemon must not get as
+    far as the pidfile (it would overwrite the live daemon's record) or
+    `recover_interrupted` (it would mark the live brake's in-flight exit
+    `outcome_unknown`).
+    """
+    import sys
+
+    from nakagai_edge.edge.daemon import (port_listening, release_pidfile,
+                                          write_pidfile)
     state = EdgeState(root)
     agent = state.agent()
     if agent is None:
-        raise SystemExit("edge is not paired: run `nakagai-edge pair <code> "
-                         "--platform <url>` first")
+        print("nakagai-edge: not serving: this edge is not paired. Run "
+              "`nakagai-edge setup <code> --platform <url>` first",
+              file=sys.stderr)
+        return
+    if port_listening(port):
+        print(f"nakagai-edge: not serving: 127.0.0.1:{port} is already served "
+              "(another edge is running); this one stays down",
+              file=sys.stderr)
+        return
     client = PlatformClient(agent["platform_url"], agent["token"])
     sync_once(state, client)                 # best-effort warm start
 
     # So `restart` has something it can prove. Best effort by design: a daemon
     # that cannot write this still serves.
-    from nakagai_edge.edge.daemon import release_pidfile, write_pidfile
     write_pidfile(state, port=port)
 
     hub = build_hub(state, client)
