@@ -32,7 +32,7 @@ def test_malformed_index_is_never_fatal():
 
 
 def test_a_prerelease_is_not_advised():
-    """The line we print says to run `uvx nakagai-edge@latest`, which resolves
+    """The line we print says to run `uv tool upgrade nakagai-edge`, which resolves
     to the latest stable. Naming an rc would advise a version that command does
     not install, so pre-releases are not upgrades as far as this is concerned.
     """

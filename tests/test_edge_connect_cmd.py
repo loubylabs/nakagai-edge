@@ -146,7 +146,8 @@ def test_setup_connects_before_it_serves(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr("nakagai_edge.edge.runtime.run",
                         lambda root, port: order.append("serve"))
 
-    assert cli.main(["setup", "--platform", "http://platform.test"]) == 0
+    assert cli.main(["setup", "--platform", "http://platform.test",
+                     "--foreground"]) == 0
     assert order == ["connect", "serve"]
     assert "mcpServers" in capsys.readouterr().out
 
@@ -166,6 +167,6 @@ def test_setup_no_register_prints_the_endpoint_and_touches_no_config(
     monkeypatch.setattr("nakagai_edge.edge.runtime.run", lambda root, port: None)
 
     assert cli.main(["setup", "--platform", "http://platform.test",
-                     "--no-register"]) == 0
+                     "--no-register", "--foreground"]) == 0
     assert called == []
     assert "127.0.0.1:8330/mcp/" in capsys.readouterr().out

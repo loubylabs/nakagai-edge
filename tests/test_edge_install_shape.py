@@ -2,25 +2,29 @@
 A heuristic that names what it detected is honest; one that emits a command
 with no rationale is not, because a wrong guess is then invisible."""
 
-from nakagai_edge.edge.install_shape import detect
+from nakagai_edge.edge.freshness import UPGRADE_LINE
+from nakagai_edge.edge.install_shape import detect, is_ephemeral
 
-def test_uvx_ephemeral_cache_is_one_command_with_no_follow_up():
-    """The install shape the README and every packaged skill tell users to
-    adopt, so this row matters more than the other three combined.
+UVX = "/Users/x/.cache/uv/archive-v0/abc123"
 
-    Both halves of the two-command version were unrunnable. `uvx
-    nakagai-edge@latest run` cannot bind, because the daemon it is replacing
-    still holds the port. And a uvx user has no `nakagai-edge` on PATH, so a
-    follow-up line names a command they cannot type. `restart` stops the old
-    daemon and relaunches through argv[0], so under `uvx nakagai-edge@latest`
-    it is what leaves latest serving.
-    """
-    desc, cmd, then = detect("/Users/x/.cache/uv/archive-v0/abc123",
-                             "/Users/x/.cache/uv/archive-v0/abc123/bin/nakagai-edge")
+
+def test_uvx_ephemeral_cache_moves_onto_the_durable_tool():
+    """One install story: the durable uv tool. A uvx cache is not something
+    to upgrade in place, and a login service pointed into it would break the
+    day uv cleans its cache. So the advice installs the tool, then runs setup
+    from it by absolute path (a fresh tool dir may not be on PATH yet), which
+    installs the login service and replaces the uvx daemon."""
+    desc, cmd, then = detect(UVX, f"{UVX}/bin/nakagai-edge")
     assert "uvx" in desc
-    assert cmd == "uvx nakagai-edge@latest restart"
-    assert then == ""
-    assert "run" not in cmd.split()
+    assert cmd == "uv tool install --upgrade nakagai-edge && uv tool update-shell"
+    assert then == '"$(uv tool dir --bin)/nakagai-edge" setup'
+    assert "uvx" not in cmd + then
+
+
+def test_is_ephemeral_names_only_the_uvx_cache():
+    assert is_ephemeral(UVX) is True
+    assert is_ephemeral("/Users/x/.local/share/uv/tools/nakagai-edge") is False
+    assert is_ephemeral("/usr") is False
 
 
 def test_uv_tool_install():
@@ -29,6 +33,8 @@ def test_uv_tool_install():
     assert "uv tool" in desc
     assert cmd == "uv tool upgrade nakagai-edge"
     assert then == "nakagai-edge restart"
+    # The same line the version notice gives everywhere else.
+    assert f"{cmd} && {then}" == UPGRADE_LINE
 
 
 def test_project_venv_names_its_project(tmp_path):
@@ -60,11 +66,11 @@ def test_unknown_shape_falls_back():
     assert desc
 
 
-def test_only_uvx_suppresses_the_follow_up():
-    """The control case. A `then` of "" everywhere would pass the uvx test
-    above and quietly drop the restart line from every other shape, leaving
-    three installs upgraded on disk and still serving the old code."""
+def test_every_shape_has_a_follow_up():
+    """An upgrade on disk leaves the old code serving until something
+    relaunches it, so no shape may drop its follow-up line."""
     shapes = [("/Users/x/.local/share/uv/tools/nakagai-edge", "/Users/x/.local/bin/x"),
+              (UVX, f"{UVX}/bin/nakagai-edge"),
               ("/usr", "/usr/bin/nakagai-edge"),
               ("/opt/homebrew", "/opt/homebrew/bin/nakagai-edge")]
     assert all(detect(p, a)[2] for p, a in shapes)

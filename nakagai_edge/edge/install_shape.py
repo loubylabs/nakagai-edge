@@ -7,28 +7,37 @@ DESCRIPTION alongside the commands. An owner who can see "project venv at
 ~/git/nakagai" next to the line can tell at a glance that we guessed wrong. An
 owner handed only a command cannot.
 
-Three strings rather than two because the follow-up differs by shape. Three
-installs upgrade in place and then need the daemon bounced onto the new code;
-uvx has nothing to upgrade in place and no `nakagai-edge` on PATH to bounce it
-with, so its one command does both and there is no follow-up to print. The
-table owns that asymmetry rather than the caller guessing at it.
+Three strings rather than two because every in-place upgrade leaves the old
+code serving until something relaunches it, and what relaunches it differs by
+shape. The durable uv tool is the one install story; a uvx cache is advised
+onto it rather than upgraded where it is.
 """
 
 from pathlib import Path
+
+from nakagai_edge.edge.freshness import RESTART, UPGRADE
 
 FALLBACK = "pip install -U nakagai-edge"
 
 # Every in-place upgrade leaves the OLD code still serving: the running daemon
 # holds the port and has the previous version already imported.
-THEN = "nakagai-edge restart"
+THEN = RESTART
+
+
+def is_ephemeral(prefix: str | Path) -> bool:
+    """Whether this interpreter lives in uv's cache, which is what a `uvx`
+    run is. Nothing durable (a login service above all) may point into it:
+    uv deletes that directory whenever it cleans its cache."""
+    parts = Path(prefix).parts
+    return ("uv" in parts and "tools" not in parts
+            and any(p.startswith("archive") for p in parts))
 
 
 def detect(prefix: str, argv0: str) -> tuple[str, str, str]:
     """(description, upgrade command, follow-up command).
 
-    The follow-up is "" when the upgrade command already relaunches. Never
-    raises: a status command that dies deciding how to phrase its own advice is
-    worse than no advice.
+    Never raises: a status command that dies deciding how to phrase its own
+    advice is worse than no advice.
     """
     try:
         return _detect(Path(prefix), Path(argv0))
@@ -42,18 +51,15 @@ def _detect(prefix: Path, argv0: Path) -> tuple[str, str, str]:
     # .../uv/tools/... and the cache under .../uv/archive-v0/..., so the
     # narrower match has to win or every tool install reads as ephemeral.
     if "uv" in parts and "tools" in parts:
-        return f"uv tool install at {prefix}", "uv tool upgrade nakagai-edge", THEN
-    if "uv" in parts and any(p.startswith("archive") for p in parts):
-        # One command, and the asymmetry is the point. `uvx nakagai-edge@latest
-        # run` cannot bind, because the daemon it is replacing still holds the
-        # port; and a uvx user has no `nakagai-edge` on PATH to type a
-        # follow-up with. `restart` stops the old daemon and relaunches through
-        # argv[0], so running it under `uvx nakagai-edge@latest` is what leaves
-        # latest serving. This is the install shape the README and every
-        # packaged skill tell users to adopt, so a wrong line here costs more
-        # than a wrong line anywhere else in this table.
-        return ("uvx ephemeral cache (nothing to upgrade in place)",
-                "uvx nakagai-edge@latest restart", "")
+        return f"uv tool install at {prefix}", UPGRADE, THEN
+    if is_ephemeral(prefix):
+        # Onto the durable tool, then `setup` from it by absolute path: a
+        # fresh tool dir may not be on PATH in this shell yet. A paired edge's
+        # setup needs no code; it installs the login service, which stops the
+        # uvx daemon first.
+        return ("uvx ephemeral cache (not a durable install)",
+                "uv tool install --upgrade nakagai-edge && uv tool update-shell",
+                '"$(uv tool dir --bin)/nakagai-edge" setup')
     if prefix.name in (".venv", "venv"):
         project = prefix.parent
         if (project / "pyproject.toml").exists():

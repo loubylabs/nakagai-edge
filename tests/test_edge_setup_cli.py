@@ -26,6 +26,15 @@ def no_real_client_wiring(monkeypatch):
     monkeypatch.setattr("nakagai_edge.edge.clients.detected", lambda: [])
 
 
+@pytest.fixture(autouse=True)
+def never_asks(monkeypatch):
+    """`setup` asks nothing. Any prompt is a step someone can't be bothered
+    with, so reaching input() fails the test."""
+    def ask(*a, **k):
+        raise AssertionError("setup prompted")
+    monkeypatch.setattr("builtins.input", ask)
+
+
 def _platform_answered(state, etag="v1"):
     """What the real sync_once does whenever the platform answers us, on both a
     200 and a 304: stamp the fetch. Neither failure path writes it, which is
@@ -202,7 +211,6 @@ def test_setup_no_run_pairs_syncs_and_reports(edge_root, monkeypatch, capsys):
         return {"ok": True, "connector": connector_id, "tool_count": 47}
 
     monkeypatch.setattr("nakagai_edge.oauth_login.login", fake_login)
-    monkeypatch.setattr("builtins.input", lambda *_: "y")
 
     rc = edge_main(["setup", "CODE1", "--platform", "http://platform.test",
                "--no-run"])
@@ -212,15 +220,14 @@ def test_setup_no_run_pairs_syncs_and_reports(edge_root, monkeypatch, capsys):
     assert "paired" in out and "synced" in out and "robinhood-trading" in out
     assert ("preflight", "http://platform.test") in calls
     assert ("sync", None) in calls
-    # the login was pointed at the EDGE root: broker tokens live nowhere else
+    # the login ran without asking, pointed at the EDGE root: broker tokens
+    # live nowhere else
     assert ("login", "robinhood-trading", edge_root) in calls
     assert (edge_root / "agent.json").exists()
-    # the planner's login reason is printed on its own line, not buried in
-    # input()'s prompt argument where no monkeypatched input can see it
     assert "needs a one-time browser login" in out
 
 
-def test_setup_declining_login_warns_and_continues(edge_root, monkeypatch, capsys):
+def test_setup_no_login_skips_it_and_prints_the_command(edge_root, monkeypatch, capsys):
     monkeypatch.setattr("nakagai_edge.edge.preflight.check_platform", lambda url, **kw: None)
     monkeypatch.setattr("nakagai_edge.edge.client.pair",
                         lambda url, code, **kw: {"agent_id": "ag1", "token": "nk_agent_x"})
@@ -228,11 +235,16 @@ def test_setup_declining_login_warns_and_continues(edge_root, monkeypatch, capsy
                         lambda state, client: _registry(state))
     monkeypatch.setattr("nakagai_edge.edge.client.PlatformClient.__init__",
                         lambda self, *a, **k: None)
-    monkeypatch.setattr("builtins.input", lambda *_: "n")
+
+    async def must_not_login(root, connector_id):
+        raise AssertionError("logged in under --no-login")
+
+    monkeypatch.setattr("nakagai_edge.oauth_login.login", must_not_login)
 
     assert edge_main(["setup", "CODE1", "--platform", "http://platform.test",
-                 "--no-run"]) == 0
+                      "--no-login", "--no-run"]) == 0
     out = capsys.readouterr().out
+    assert "skipped (--no-login)" in out
     assert "nakagai-edge login robinhood-trading" in out
 
 
@@ -250,7 +262,6 @@ def test_setup_failed_login_stops_with_the_command_to_finish_it(
         raise RuntimeError("the browser never came back")
 
     monkeypatch.setattr("nakagai_edge.oauth_login.login", boom_login)
-    monkeypatch.setattr("builtins.input", lambda *_: "y")
 
     assert edge_main(["setup", "CODE1", "--platform", "http://platform.test",
                  "--no-run"]) == 1
@@ -279,10 +290,10 @@ def test_setup_without_a_code_skips_pairing_and_login_when_both_are_done(
     monkeypatch.setattr("nakagai_edge.edge.client.PlatformClient.__init__",
                         lambda self, *a, **k: None)
 
-    def must_not_ask(*a, **k):
-        raise AssertionError("asked to log in despite existing tokens")
+    async def must_not_login(root, connector_id):
+        raise AssertionError("logged in despite existing tokens")
 
-    monkeypatch.setattr("builtins.input", must_not_ask)
+    monkeypatch.setattr("nakagai_edge.oauth_login.login", must_not_login)
 
     assert edge_main(["setup", "--platform", "http://platform.test",
                  "--no-run"]) == 0
@@ -325,11 +336,6 @@ def test_setup_failed_sync_stops_before_login(edge_root, monkeypatch, capsys):
     monkeypatch.setattr("nakagai_edge.edge.client.PlatformClient.__init__",
                         lambda self, *a, **k: None)
 
-    def must_not_input(*a, **k):
-        raise AssertionError("prompted for login despite a failed sync")
-
-    monkeypatch.setattr("builtins.input", must_not_input)
-
     async def must_not_login(root, connector_id):
         raise AssertionError("logged in despite a failed sync")
 
@@ -364,11 +370,6 @@ def test_setup_failed_sync_on_a_previously_synced_edge_stops_before_login(
     monkeypatch.setattr("nakagai_edge.edge.client.PlatformClient.__init__",
                         lambda self, *a, **k: None)
 
-    def must_not_input(*a, **k):
-        raise AssertionError("prompted for login despite a failed sync")
-
-    monkeypatch.setattr("builtins.input", must_not_input)
-
     async def must_not_login(root, connector_id):
         raise AssertionError("logged in despite a failed sync")
 
@@ -387,10 +388,9 @@ def test_setup_failed_sync_on_a_previously_synced_edge_stops_before_login(
     assert "synced     1 connectors" not in out    # never the stale count
 
 
-def test_setup_default_mode_serves_the_edge_root_on_the_default_port(
-        edge_root, monkeypatch, capsys):
-    """Every other setup test passes --no-run, so the actual `run(...)` call
-    at the end of the command is otherwise never exercised."""
+def _ready_edge(edge_root, monkeypatch):
+    """Paired, logged in, and a sync that answers: setup's last step is all
+    that is left to decide."""
     from nakagai_edge.edge.state import EdgeState
 
     state = EdgeState(edge_root)
@@ -399,43 +399,182 @@ def test_setup_default_mode_serves_the_edge_root_on_the_default_port(
     tokens.mkdir(parents=True)
     (tokens / "robinhood-trading.json").write_text(
         json.dumps({"tokens": {"access_token": "x"}}))
-
     monkeypatch.setattr("nakagai_edge.edge.sync.sync_once",
                         lambda st, client: _registry(st))
     monkeypatch.setattr("nakagai_edge.edge.client.PlatformClient.__init__",
                         lambda self, *a, **k: None)
+    return state
 
+
+def _service_here(tmp_path, monkeypatch, platform="darwin", **rc_by_verb):
+    """A Service on a tmp home whose manager is a recording fake."""
+    from nakagai_edge.edge import service
     calls = []
+
+    def runner(cmd):
+        calls.append(cmd)
+        return rc_by_verb.get(cmd[1], 0)
+
+    svc = service.Service(platform=platform, home=tmp_path / "home", uid=501,
+                          runner=runner)
+    monkeypatch.setattr(service.Service, "here", classmethod(lambda cls: svc))
+    return svc, calls
+
+
+def _nothing_running(monkeypatch):
+    import nakagai_edge.edge.daemon as d
+    monkeypatch.setattr(d, "find_running", lambda state: (None, ""))
+
+
+def _must_not_serve_here(monkeypatch):
+    def must_not_run(root, port):
+        raise AssertionError("served in the foreground")
+    monkeypatch.setattr("nakagai_edge.edge.runtime.run", must_not_run)
+
+
+def test_setup_hands_the_edge_to_the_login_service_and_returns(
+        edge_root, tmp_path, monkeypatch, capsys):
+    """The default: nothing blocks the terminal, and the edge comes back by
+    itself at login. Proof, not assertion: the port is waited on."""
+    import nakagai_edge.edge.daemon as d
+    _ready_edge(edge_root, monkeypatch)
+    svc, calls = _service_here(tmp_path, monkeypatch)
+    _nothing_running(monkeypatch)
+    _must_not_serve_here(monkeypatch)
+    waited = []
+    monkeypatch.setattr(d, "wait_until_serving",
+                        lambda port, **kw: waited.append(port) or True)
+
+    assert edge_main(["setup", "--platform", "http://platform.test"]) == 0
+    out = capsys.readouterr().out
+    assert "running in the background" in out
+    assert "starts by itself at login" in out
+    assert waited == [8330]
+    assert svc.installed()
+    assert [c[:2] for c in calls] == [["launchctl", "bootout"],
+                                      ["launchctl", "bootstrap"]]
+
+
+def test_setup_service_carries_the_port(edge_root, tmp_path, monkeypatch, capsys):
+    import plistlib
+
+    import nakagai_edge.edge.daemon as d
+    _ready_edge(edge_root, monkeypatch)
+    svc, _ = _service_here(tmp_path, monkeypatch)
+    _nothing_running(monkeypatch)
+    _must_not_serve_here(monkeypatch)
+    monkeypatch.setattr(d, "wait_until_serving", lambda port, **kw: port == 9999)
+
+    assert edge_main(["setup", "--platform", "http://platform.test",
+                      "--port", "9999"]) == 0
+    body = plistlib.loads(svc.path.read_bytes())
+    assert body["ProgramArguments"][1:] == ["run", "--port", "9999"]
+    assert body["EnvironmentVariables"] == {"NAKAGAI_EDGE_ROOT": str(edge_root)}
+
+
+def test_setup_stops_a_detached_daemon_before_the_service_starts(
+        edge_root, tmp_path, monkeypatch, capsys):
+    """Two daemons on one port is the failure: the old one must be gone
+    before the manager starts the new one."""
+    import nakagai_edge.edge.daemon as d
+    _ready_edge(edge_root, monkeypatch)
+    svc, calls = _service_here(tmp_path, monkeypatch)
+    _must_not_serve_here(monkeypatch)
+    old = d.RunningEdge(pid=4242, port=8330, started_at=1.0, version="0.9.0")
+    running = [old]
+    monkeypatch.setattr(d, "find_running",
+                        lambda state: (running[0] if running else None, ""))
+
+    def stop(edge, **kw):
+        calls.append(["stop", edge.pid])
+        running.clear()
+        return True
+
+    monkeypatch.setattr(d, "stop", stop)
+    monkeypatch.setattr(d, "wait_until_serving", lambda port, **kw: True)
+
+    assert edge_main(["setup", "--platform", "http://platform.test"]) == 0
+    assert [c[:2] for c in calls] == [["launchctl", "bootout"], ["stop", 4242],
+                                      ["launchctl", "bootstrap"]]
+
+
+def test_setup_reports_a_service_that_never_answers(
+        edge_root, tmp_path, monkeypatch, capsys):
+    import nakagai_edge.edge.daemon as d
+    _ready_edge(edge_root, monkeypatch)
+    _service_here(tmp_path, monkeypatch)
+    _nothing_running(monkeypatch)
+    _must_not_serve_here(monkeypatch)
+    monkeypatch.setattr(d, "wait_until_serving", lambda port, **kw: False)
+
+    assert edge_main(["setup", "--platform", "http://platform.test"]) != 0
+    assert "edge.log" in capsys.readouterr().out
+
+
+def test_setup_reports_a_manager_that_refuses_the_unit(
+        edge_root, tmp_path, monkeypatch, capsys):
+    _ready_edge(edge_root, monkeypatch)
+    _service_here(tmp_path, monkeypatch, bootstrap=5)
+    _nothing_running(monkeypatch)
+    _must_not_serve_here(monkeypatch)
+
+    assert edge_main(["setup", "--platform", "http://platform.test"]) != 0
+    assert "service" in capsys.readouterr().out
+
+
+def test_setup_foreground_serves_here_and_installs_nothing(
+        edge_root, tmp_path, monkeypatch, capsys):
+    _ready_edge(edge_root, monkeypatch)
+    svc, calls = _service_here(tmp_path, monkeypatch)
+    served = []
     monkeypatch.setattr("nakagai_edge.edge.runtime.run",
-                        lambda root, port: calls.append((root, port)))
+                        lambda root, port: served.append((root, port)))
 
-    rc = edge_main(["setup", "--platform", "http://platform.test"])
-    assert rc == 0
-    assert calls == [(edge_root, 8330)]
+    assert edge_main(["setup", "--platform", "http://platform.test",
+                      "--foreground", "--port", "9999"]) == 0
+    assert served == [(edge_root, 9999)]
+    assert calls == [] and not svc.installed()
 
 
-def test_setup_default_mode_honors_an_explicit_port(edge_root, monkeypatch, capsys):
-    from nakagai_edge.edge.state import EdgeState
-
-    state = EdgeState(edge_root)
-    state.save_agent("http://platform.test", "ag1", "nk_agent_x")
-    tokens = edge_root / "secrets" / "tokens"
-    tokens.mkdir(parents=True)
-    (tokens / "robinhood-trading.json").write_text(
-        json.dumps({"tokens": {"access_token": "x"}}))
-
-    monkeypatch.setattr("nakagai_edge.edge.sync.sync_once",
-                        lambda st, client: _registry(st))
-    monkeypatch.setattr("nakagai_edge.edge.client.PlatformClient.__init__",
-                        lambda self, *a, **k: None)
-
-    calls = []
+def test_setup_with_no_service_here_serves_in_the_foreground(
+        edge_root, tmp_path, monkeypatch, capsys):
+    _ready_edge(edge_root, monkeypatch)
+    _, calls = _service_here(tmp_path, monkeypatch, platform="win32")
+    served = []
     monkeypatch.setattr("nakagai_edge.edge.runtime.run",
-                        lambda root, port: calls.append((root, port)))
+                        lambda root, port: served.append((root, port)))
 
-    rc = edge_main(["setup", "--platform", "http://platform.test", "--port", "9999"])
-    assert rc == 0
-    assert calls == [(edge_root, 9999)]
+    assert edge_main(["setup", "--platform", "http://platform.test"]) == 0
+    assert served == [(edge_root, 8330)]
+    assert calls == []
+
+
+def test_setup_from_a_uvx_cache_installs_no_service(
+        edge_root, tmp_path, monkeypatch, capsys):
+    """A unit pointed into uv's cache breaks the day uv cleans it, so a uvx
+    run serves in the foreground and says how to get the durable install."""
+    import sys
+    _ready_edge(edge_root, monkeypatch)
+    _, calls = _service_here(tmp_path, monkeypatch)
+    monkeypatch.setattr(sys, "prefix", "/Users/x/.cache/uv/archive-v0/abc")
+    served = []
+    monkeypatch.setattr("nakagai_edge.edge.runtime.run",
+                        lambda root, port: served.append((root, port)))
+
+    assert edge_main(["setup", "--platform", "http://platform.test"]) == 0
+    assert served and calls == []
+    assert "uv tool install" in capsys.readouterr().out
+
+
+def test_setup_no_run_neither_installs_nor_serves(
+        edge_root, tmp_path, monkeypatch, capsys):
+    _ready_edge(edge_root, monkeypatch)
+    _, calls = _service_here(tmp_path, monkeypatch)
+    _must_not_serve_here(monkeypatch)
+
+    assert edge_main(["setup", "--platform", "http://platform.test", "--no-run"]) == 0
+    assert calls == []
+    assert "nakagai-edge service install" in capsys.readouterr().out
 
 
 # --- the "no tokens" error names the login that will actually work ----------

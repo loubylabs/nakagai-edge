@@ -446,15 +446,9 @@ def test_the_note_is_empty_when_nothing_is_listening(tmp_path, monkeypatch, caps
     assert daemon_doc["note"] == ""
 
 
-def test_the_uvx_advisory_is_a_single_runnable_command(tmp_path, monkeypatch, capsys):
-    """The install shape the README and every packaged skill tell users to
-    adopt, so a wrong line here is the one that reaches the most people.
-
-    `uvx nakagai-edge@latest run` cannot bind while the daemon it replaces
-    holds the port, and a uvx user has no `nakagai-edge` on PATH to type a
-    follow-up with, so the "then" line has to be suppressed for this shape
-    rather than printed unrunnable.
-    """
+def test_a_uvx_run_is_advised_onto_the_durable_tool(tmp_path, monkeypatch, capsys):
+    """One install story. A uvx run is told to install the uv tool and run
+    setup from it, never to run uvx again."""
     monkeypatch.setenv("NAKAGAI_EDGE_ROOT", str(tmp_path))
     monkeypatch.setattr("nakagai_edge.edge.daemon.DEFAULT_PORT", 1)
     monkeypatch.setattr("nakagai_edge.edge.freshness.latest_release",
@@ -462,15 +456,41 @@ def test_the_uvx_advisory_is_a_single_runnable_command(tmp_path, monkeypatch, ca
     monkeypatch.setattr(sys, "prefix", "/Users/x/.cache/uv/archive-v0/abc123")
     assert main(["status"]) == 0
     out = capsys.readouterr()
-    assert json.loads(out.out)["upgrade"] == "uvx nakagai-edge@latest restart"
-    assert "uvx nakagai-edge@latest restart" in out.err
-    assert "then:" not in out.err
+    assert json.loads(out.out)["upgrade"] == (
+        "uv tool install --upgrade nakagai-edge && uv tool update-shell")
+    assert 'then:    "$(uv tool dir --bin)/nakagai-edge" setup' in out.err
+    assert "uvx" not in out.err.replace("uvx ephemeral cache", "")
+
+
+def test_status_reports_whether_the_login_service_is_installed(
+        tmp_path, monkeypatch, capsys):
+    from nakagai_edge.edge import service
+
+    monkeypatch.setenv("NAKAGAI_EDGE_ROOT", str(tmp_path))
+    monkeypatch.setattr("nakagai_edge.edge.daemon.DEFAULT_PORT", 1)
+    monkeypatch.setattr("nakagai_edge.edge.freshness.latest_release",
+                        lambda **kw: None)
+    svc = service.Service(platform="darwin", home=tmp_path / "home", uid=501,
+                          runner=lambda cmd: pytest.fail(f"status ran {cmd}"))
+    monkeypatch.setattr(service.Service, "here", classmethod(lambda cls: svc))
+
+    assert main(["status"]) == 0
+    assert json.loads(capsys.readouterr().out)["service"] == "not installed"
+    svc.path.parent.mkdir(parents=True)
+    svc.path.write_text("<plist/>")
+    assert main(["status"]) == 0
+    assert json.loads(capsys.readouterr().out)["service"] == "installed"
+
+    monkeypatch.setattr(service.Service, "here", classmethod(
+        lambda cls: service.Service(platform="win32", home=tmp_path, uid=0,
+                                    runner=svc.runner)))
+    assert main(["status"]) == 0
+    assert json.loads(capsys.readouterr().out)["service"] == "unsupported"
 
 
 def test_every_other_shape_keeps_its_restart_line(tmp_path, monkeypatch, capsys):
-    """The control. Suppressing the follow-up everywhere would pass the uvx
-    test above and leave three install shapes upgraded on disk while the old
-    code goes on serving, which is the failure that is hardest to notice."""
+    """The control: an upgrade on disk leaves the old code serving until the
+    restart line runs, which is the failure that is hardest to notice."""
     monkeypatch.setenv("NAKAGAI_EDGE_ROOT", str(tmp_path))
     monkeypatch.setattr("nakagai_edge.edge.daemon.DEFAULT_PORT", 1)
     monkeypatch.setattr("nakagai_edge.edge.freshness.latest_release",

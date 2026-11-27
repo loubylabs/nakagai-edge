@@ -136,6 +136,65 @@ def _cmd_run(args) -> int:
     return 0
 
 
+def _refused_while_armed(state, force: bool, command: str) -> bool:
+    """True (after saying why) when the brake watches an open position and
+    stopping the daemon now was not forced. Anything that stops the running
+    edge asks this first: a restart and a service install both cut the watch
+    for a few seconds."""
+    from nakagai_edge.edge import daemon as d
+    armed = d.armed_positions(state)
+    if not armed or force:
+        return False
+    print("refused: the brake is watching "
+          f"{len(armed)} open position"
+          f"{'' if len(armed) == 1 else 's'}", file=sys.stderr)
+    for row in armed:
+        # A firing position has an exit order in flight to the broker right
+        # now: the worse of the two moments to cut the watch, so it is
+        # labelled distinctly rather than folded into an undifferentiated
+        # count.
+        tag = "  <- exit in flight" if row["state"] == "firing" else ""
+        print(f"  {row['symbol']:<6} {row['qty']} @ stop {row['stop']}{tag}",
+              file=sys.stderr)
+    print("\nStopping the edge stops the brake for a few seconds.\n"
+          "Run during a session only if you mean it:\n"
+          f"\n  {command} --force", file=sys.stderr)
+    return True
+
+
+def _start_service(state, svc, port: int, *, force: bool,
+                   command: str) -> tuple[int, str]:
+    """Hand the port to the login service: (0, "") once it answers there.
+
+    The order is the point. The unit is unloaded first, so a re-install
+    replaces rather than collides; then any detached daemon still on the port
+    is stopped, so the service never starts beside it; only then is the unit
+    written and loaded. A port held by something this edge cannot prove is
+    its own is refused before anything is touched.
+    """
+    from nakagai_edge.edge import daemon as d
+    edge, reason = d.find_running(state)
+    if reason:
+        return 2, reason
+    if edge is not None and _refused_while_armed(state, force, command):
+        return 3, "the brake is watching an open position"
+    svc.unload()
+    edge, reason = d.find_running(state)
+    if reason:
+        return 2, reason
+    if edge is not None and not d.stop(edge, timeout_s=10.0):
+        return 4, (f"pid {edge.pid} is still serving 127.0.0.1:{edge.port} ten "
+                   "seconds after SIGTERM. Not escalating to SIGKILL on a "
+                   "process holding broker credentials; stop it by hand.")
+    if not svc.install(argv0=d.relaunch_argv0(), port=port, root=state.root):
+        return 6, (f"the service manager would not load {svc.path}. "
+                   f"Look at {state.log_path}")
+    if not d.wait_until_serving(port):
+        return 5, (f"the login service started, but 127.0.0.1:{port} never "
+                   f"answered. Look at {state.log_path}")
+    return 0, ""
+
+
 def _cmd_restart(args) -> int:
     """Stop what we can prove is ours, then start a replacement we can see.
 
@@ -143,8 +202,13 @@ def _cmd_restart(args) -> int:
     will actually happen on an existing machine is the missing pidfile: a
     daemon started before this version predates the file, so the first restart
     after upgrading is still done by hand, and every one after it is not.
+
+    An edge the login service owns is restarted by the service manager. A
+    detached spawn beside a unit that keeps itself alive would be two daemons
+    racing for one port.
     """
     from nakagai_edge.edge import daemon as d
+    from nakagai_edge.edge.service import Service
     from nakagai_edge.edge.state import EdgeState, default_root
 
     state = EdgeState(default_root())
@@ -161,24 +225,26 @@ def _cmd_restart(args) -> int:
     # daemon, which is what `run --port` is for.
     port = (edge.port if edge
             else (d.read_pidfile(state) or {}).get("port") or d.DEFAULT_PORT)
+    if edge is not None and _refused_while_armed(state, args.force,
+                                                 "nakagai-edge restart"):
+        return 3
+
+    svc = Service.here()
+    if svc.installed():
+        if not svc.restart():
+            print(f"refused: the login service would not restart ({svc.path}). "
+                  "Reinstall it with: nakagai-edge service install",
+                  file=sys.stderr)
+            return 6
+        if not d.wait_until_serving(port):
+            print(f"the login service restarted, but 127.0.0.1:{port} never "
+                  f"answered. Look at {state.log_path}", file=sys.stderr)
+            return 5
+        print(f"serving 127.0.0.1:{port}, restarted by the login service")
+        print(f"log: {state.log_path}")
+        return 0
+
     if edge is not None:
-        armed = d.armed_positions(state)
-        if armed and not args.force:
-            print("refused: the brake is watching "
-                  f"{len(armed)} open position"
-                  f"{'' if len(armed) == 1 else 's'}", file=sys.stderr)
-            for row in armed:
-                # A firing position has an exit order in flight to the
-                # broker right now: the worse of the two moments to cut the
-                # watch, so it is labelled distinctly rather than folded
-                # into an undifferentiated count.
-                tag = "  <- exit in flight" if row["state"] == "firing" else ""
-                print(f"  {row['symbol']:<6} {row['qty']} @ stop {row['stop']}{tag}",
-                      file=sys.stderr)
-            print("\nA restart stops the brake for a few seconds.\n"
-                  "Run during a session only if you mean it:\n"
-                  "\n  nakagai-edge restart --force", file=sys.stderr)
-            return 3
         if not d.stop(edge, timeout_s=10.0):
             print(f"refused: pid {edge.pid} is still serving 127.0.0.1:{port} "
                   "ten seconds after SIGTERM. Not escalating to SIGKILL on a "
@@ -230,14 +296,6 @@ def _edge_facts(state, broker: str) -> dict:
     }
 
 
-def _confirm(question: str) -> bool:
-    try:
-        answer = input(f"{question} [Y/n] ").strip().lower()
-    except (EOFError, KeyboardInterrupt):
-        return False
-    return answer in ("", "y", "yes")
-
-
 def _cmd_connect(args) -> int:
     """Print the connection contract, and wire up any client we recognise.
 
@@ -274,26 +332,33 @@ def _cmd_connect(args) -> int:
 
 
 def _cmd_setup(args) -> int:
-    """pair -> sync -> login -> connect -> run, in that order, skipping what is done.
+    """pair -> sync -> login -> connect -> service (or run), skipping what is done.
 
-    The planner decides; this only executes and prints. It is asked twice: once
-    on the edge as we found it (for pair and sync), and again once the sync has
-    landed (for login and run), because the login decision reads the registry
-    and the registry may not have existed a moment ago.
+    The planner decides; this only executes and prints, and it asks nothing.
+    It is asked twice: once on the edge as we found it (for pair and sync),
+    and again once the sync has landed (for login and the rest), because the
+    login decision reads the registry and the registry may not have existed a
+    moment ago.
     """
     from nakagai_edge.edge import clients
     from nakagai_edge.edge.client import EdgeClientError, pair
+    from nakagai_edge.edge.install_shape import is_ephemeral
     from nakagai_edge.edge.preflight import check_platform
     from nakagai_edge.edge.runtime import run
+    from nakagai_edge.edge.service import Service
     from nakagai_edge.edge.setup import BROKER, plan
     from nakagai_edge.edge.state import EdgeState, default_root
 
     state = EdgeState(default_root())
     code = args.code or ""
-    run_server = not args.no_run
+    svc = Service.here()
+    from_uvx = is_ephemeral(sys.prefix)
+    flags = {"login": not args.no_login, "run_server": not args.no_run,
+             "foreground": args.foreground,
+             "service_supported": svc.supported and not from_uvx}
 
     try:
-        steps = {s.name: s for s in plan(code=code, run_server=run_server,
+        steps = {s.name: s for s in plan(code=code, **flags,
                                          **_edge_facts(state, BROKER))}
     except ValueError as e:
         print(f"  x  {e}")
@@ -332,25 +397,24 @@ def _cmd_setup(args) -> int:
     # that read it. Pairing is behind us, hence code="": either the pair step
     # just ran or the planner already found this edge paired, so plan() cannot
     # object to the missing code.
-    steps = {s.name: s for s in plan(code="", run_server=run_server,
+    steps = {s.name: s for s in plan(code="", **flags,
                                      **_edge_facts(state, BROKER))}
 
-    # 3. login
+    # 3. login: the browser opens when the planner says so. No prompt.
     login_step = steps["login"]
-    if not login_step.run:
-        print(f"  -  login      {login_step.reason}")
-    else:
-        print(f"  ?  login      {login_step.reason}")
-        if _confirm("  do it now?"):
-            from nakagai_edge.oauth_login import login
-            if _gateway_run(login(state.root, BROKER)) != 0:
-                print(f"  x  login failed. Finish it later with: "
-                      f"nakagai-edge login {BROKER}")
-                return 1
-            print(f"  v  login      {BROKER}")
-        else:
-            print(f"  !  login      skipped. {BROKER} stays dead until you run: "
+    if login_step.run:
+        print(f"  .  login      {login_step.reason}: opening the browser")
+        from nakagai_edge.oauth_login import login
+        if _gateway_run(login(state.root, BROKER)) != 0:
+            print(f"  x  login failed. Finish it later with: "
                   f"nakagai-edge login {BROKER}")
+            return 1
+        print(f"  v  login      {BROKER}")
+    elif login_step.reason == "skipped (--no-login)":
+        print(f"  !  login      {login_step.reason}. {BROKER} stays dead until "
+              f"you run: nakagai-edge login {BROKER}")
+    else:
+        print(f"  -  login      {login_step.reason}")
 
     # 4. connect the agent. On this side of the serve on purpose: run() blocks
     # until Ctrl-C, so anything placed after it would simply never happen.
@@ -359,14 +423,76 @@ def _cmd_setup(args) -> int:
     print()
     _cmd_connect(args)
 
-    # 5. run
-    run_step = steps["run"]
+    # 5. the login service, or the foreground server, or neither.
+    service_step, run_step = steps["service"], steps["run"]
+    if service_step.run:
+        print(f"  .  service    {service_step.reason}")
+        rc, why = _start_service(state, svc, args.port, force=False,
+                                 command="nakagai-edge setup")
+        if rc:
+            print(f"  x  service    {why}")
+            return rc
+        print(f"  v  running in the background on {clients.url(args.port)}; "
+              "it starts by itself at login")
+        return 0
     if not run_step.run:
         print(f"  -  serving    {run_step.reason}")
-        print(f"  next: nakagai-edge run --port {args.port}")
+        nxt = ("nakagai-edge service install" if flags["service_supported"]
+               else f"nakagai-edge run --port {args.port}")
+        print(f"  next: {nxt}")
         return 0
+    if from_uvx and svc.supported and not args.foreground:
+        print("  !  service    not from a uvx run, which lives in uv's cache. For "
+              "an edge that starts by itself at login: uv tool install "
+              "nakagai-edge, then run setup from it")
     print(f"  -> {run_step.reason} on {clients.url(args.port)} (Ctrl-C to stop)")
     run(state.root, port=args.port)
+    return 0
+
+
+def _cmd_service(args) -> int:
+    """install | uninstall | status of the login service (see edge/service.py)."""
+    from nakagai_edge.edge import clients
+    from nakagai_edge.edge import daemon as d
+    from nakagai_edge.edge.install_shape import is_ephemeral
+    from nakagai_edge.edge.service import Service
+
+    state = EdgeState(default_root())
+    svc = Service.here()
+    if args.action == "status":
+        print(json.dumps({"service": svc.state(),
+                          "unit": str(svc.path) if svc.supported else "",
+                          "running": svc.installed() and svc.running()},
+                         indent=2))
+        return 0
+    if not svc.supported:
+        print(f"nakagai-edge service: no login service on {svc.platform}; "
+              "serve with `nakagai-edge run` instead", file=sys.stderr)
+        return 1
+    if args.action == "uninstall":
+        if not svc.uninstall():
+            print(f"refused: could not remove {svc.path}", file=sys.stderr)
+            return 1
+        print(f"removed {svc.path}; the edge is stopped. "
+              "`nakagai-edge service install` brings it back")
+        return 0
+    if is_ephemeral(sys.prefix):
+        print("refused: this is a uvx run, from uv's cache, which uv deletes "
+              "when it cleans up, so a login service cannot point at it. "
+              "Install the durable tool first: uv tool install nakagai-edge",
+              file=sys.stderr)
+        return 1
+    port = (args.port or (d.read_pidfile(state) or {}).get("port")
+            or d.DEFAULT_PORT)
+    rc, why = _start_service(state, svc, port, force=args.force,
+                             command="nakagai-edge service install")
+    if rc:
+        print(f"refused: {why}", file=sys.stderr)
+        return rc
+    print(f"running in the background on {clients.url(port)}; "
+          "it starts by itself at login")
+    print(f"unit: {svc.path}")
+    print(f"log: {state.log_path}")
     return 0
 
 
@@ -383,6 +509,7 @@ def _cmd_status(args) -> int:
     from nakagai_edge.edge.daemon import find_running
     from nakagai_edge.edge.freshness import latest_release
     from nakagai_edge.edge.install_shape import detect
+    from nakagai_edge.edge.service import Service
     from nakagai_edge.edge.state import EdgeState, default_root
     from nakagai_edge.edge.sync import (
         meta, policy_fresh, schema_error, server_edge_version,
@@ -420,6 +547,9 @@ def _cmd_status(args) -> int:
                        "log": str(state.log_path)}
                       if edge else {"running": False, "note": reason,
                                     "log": str(state.log_path)}),
+           # installed | not installed | unsupported. Read off the unit file
+           # alone: status never asks the service manager anything.
+           "service": Service.here().state(),
            "meta": meta(state), "root": str(state.root)}
     # Promoted beside policy_fresh, and only when there is one. A refused
     # bundle otherwise shows up here as nothing but `policy_fresh: false`,
@@ -442,15 +572,11 @@ def _cmd_status(args) -> int:
     behind = [v for v in (server, latest) if v and _behind(running, v)]
     if behind:
         newest = max(behind, key=_version_key)
-        lines = [f"\nnakagai-edge {newest} is available (you are on {running})",
-                 f"  install: {install}",
-                 f"  upgrade: {upgrade}"]
-        # Suppressed for the one shape whose upgrade command already
-        # relaunches. Printing `nakagai-edge restart` to a uvx user names a
-        # command they do not have on PATH.
-        if then:
-            lines.append(f"  then:    {then}")
-        print("\n".join(lines), file=sys.stderr)
+        print("\n".join([
+            f"\nnakagai-edge {newest} is available (you are on {running})",
+            f"  install: {install}",
+            f"  upgrade: {upgrade}",
+            f"  then:    {then}"]), file=sys.stderr)
     return 0
 
 
@@ -555,7 +681,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_pair.set_defaults(func=_cmd_pair)
 
     p_setup = sub.add_parser(
-        "setup", help="pair, sync, log in, and serve: everything, in order")
+        "setup", help="pair, sync, log in, and start the edge as a login "
+                      "service: everything, in order, asking nothing")
     p_setup.add_argument("code", nargs="?", default="",
                          help="pairing code from the Agents page (omit to reuse "
                               "an existing pairing)")
@@ -563,11 +690,30 @@ def _build_parser() -> argparse.ArgumentParser:
                          help="only used when pairing; an already-paired edge "
                               "syncs against the platform_url it paired with")
     p_setup.add_argument("--port", type=int, default=8330)
+    p_setup.add_argument("--no-login", action="store_true",
+                         help="skip the broker's browser login and print the "
+                              "command to run it later")
+    p_setup.add_argument("--foreground", action="store_true",
+                         help="serve in this terminal instead of installing "
+                              "the login service")
     p_setup.add_argument("--no-run", action="store_true",
-                         help="stop after login instead of serving")
+                         help="stop after login: neither install the service "
+                              "nor serve")
     p_setup.add_argument("--no-register", action="store_true",
                          help="do not touch any agent client config")
     p_setup.set_defaults(func=_cmd_setup)
+
+    p_service = sub.add_parser(
+        "service", help="the login service that runs the edge in the "
+                        "background and starts it by itself at login")
+    p_service.add_argument("action", choices=["install", "uninstall", "status"])
+    p_service.add_argument("--port", type=int, default=0,
+                           help="install only: the port to serve (default: "
+                                "the port this edge last served, else 8330)")
+    p_service.add_argument("--force", action="store_true",
+                           help="install only: replace a running edge even "
+                                "while the brake watches an armed position")
+    p_service.set_defaults(func=_cmd_service)
 
     p_connect = sub.add_parser(
         "connect", help="print the MCP endpoint, and wire up a detected agent client")
@@ -584,7 +730,8 @@ def _build_parser() -> argparse.ArgumentParser:
     p_run.set_defaults(func=_cmd_run)
 
     p_restart = sub.add_parser(
-        "restart", help="stop the running edge and start a fresh one, detached")
+        "restart", help="restart the running edge: through the login service "
+                        "when installed, else stop it and start one detached")
     # No --port. A restart serves the port the pidfile names, so it comes back
     # where it was; choosing a different port is starting a different daemon,
     # and `run --port` already does that.
