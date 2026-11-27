@@ -59,6 +59,29 @@ def describe_exception(e: BaseException) -> str:
     return f"{type(e).__name__}: {first_line}" if first_line else type(e).__name__
 
 
+def needs_login(e: BaseException) -> bool:
+    """Whether a connect failure is one a browser login fixes.
+
+    Two real types, never a message: the edge's own `NoTokensError` (no login
+    has ever happened here) and the MCP SDK's `OAuthFlowError` family, which
+    is what a dead refresh token ends in once the SDK falls back to a full
+    authorization it has no browser for. Every leaf of an anyio group is
+    checked, since that is how the transports deliver either one. A network
+    error or a timeout is deliberately not here: no login fixes those.
+    """
+    from mcp.client.auth.exceptions import OAuthFlowError
+
+    from nakagai_edge.auth import NoTokensError
+    pending = [e]
+    while pending:
+        leaf = pending.pop()
+        if isinstance(leaf, BaseExceptionGroup):
+            pending.extend(leaf.exceptions)
+        elif isinstance(leaf, NoTokensError | OAuthFlowError):
+            return True
+    return False
+
+
 class TolerantClientSession(ClientSession):
     """A session that refuses a broker's bad data, not its bad bookkeeping.
 
@@ -135,15 +158,32 @@ class Connection:
     last_used: float = 0.0
     connected_at: float = 0.0
     error_until: float = 0.0          # backoff deadline after a failure
+    login_failed: bool = False        # the last connect failed on OAuth (needs_login)
     _session: Any = None
     _task: asyncio.Task | None = None
     _ready: asyncio.Future | None = None
     _stop: asyncio.Event | None = None
 
-    def to_dict(self, *, with_tools: bool = False) -> dict:
+    def auth_state(self, root: Path) -> str:
+        """"ok" or "needs_login", the connector report's `auth_state`.
+
+        Only an OAuth connector can need a login. It does when this edge holds
+        no tokens for it, or when its last connect failed on OAuth: the SDK
+        drops a dead token only in memory, so the file alone still reads as
+        logged in after the broker has ended the session.
+        """
+        from nakagai_edge.auth import has_oauth_tokens
+        if self.spec.auth.mode != "oauth":
+            return "ok"
+        if self.login_failed or not has_oauth_tokens(root, self.spec.id):
+            return "needs_login"
+        return "ok"
+
+    def to_dict(self, *, root: Path, with_tools: bool = False) -> dict:
         """This connector's runtime state, as data.
 
-        `with_tools` adds the downstream's own tool schemas. Off by default
+        `root` is the edge root, where the OAuth tokens `auth_state` reads
+        live. `with_tools` adds the downstream's own tool schemas. Off by default
         because the two big readers want opposite things: the platform's
         connector report needs the schemas (it can never dial a broker to read
         them itself), while `list_connectors` is answered to an agent that pays
@@ -158,6 +198,7 @@ class Connection:
             "server_info": self.server_info,
             "allow_writes": self.spec.guardrails.allow_writes,
             "auth_mode": self.spec.auth.mode,
+            "auth_state": self.auth_state(root),
             # What this connector can be asked to DO, in the shared vocabulary.
             # An agent reads this to know which broker serves `place_order`
             # before it calls one, rather than discovering the gap as a refusal.
@@ -329,6 +370,7 @@ class ConnectorHub:
                 raise
             conn.status = "error"
             conn.last_error = describe_exception(e)
+            conn.login_failed = needs_login(e)
             conn.error_until = time.monotonic() + RECONNECT_BACKOFF_S
             if conn._ready and not conn._ready.done():
                 conn._ready.set_exception(ConnectorError(
@@ -482,7 +524,8 @@ class ConnectorHub:
             conn = self._conns.get(cid)
             if conn:
                 conn.spec = spec
-                out.append(conn.to_dict(with_tools=with_tools))
+                out.append(conn.to_dict(root=self.root, with_tools=with_tools))
             else:
-                out.append(Connection(spec=spec).to_dict(with_tools=with_tools))
+                out.append(Connection(spec=spec).to_dict(root=self.root,
+                                                         with_tools=with_tools))
         return {"connectors": out}

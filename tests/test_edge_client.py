@@ -262,6 +262,21 @@ class _Platform:
         return next(c for c in self.seen[cycle] if c["id"] == cid)
 
 
+def test_auth_state_rides_every_report_whatever_happens_to_the_tools():
+    """The platform's "log in again" state and email read this one key, so
+    it must survive all three tool branches: first send, `tools_unchanged`,
+    and a connector that is not connected (whose tools are withheld)."""
+    p = _Platform()
+    c = p.client()
+    c.report_connectors([{**_connector([GET_ACCOUNT]), "auth_state": "ok"}])
+    c.report_connectors([{**_connector([GET_ACCOUNT]), "auth_state": "ok"}])
+    c.report_connectors([{**_connector([], status="error"),
+                          "auth_state": "needs_login"}])
+    assert p.entry(0)["auth_state"] == "ok" and "tools" in p.entry(0)
+    assert p.entry(1)["auth_state"] == "ok" and p.entry(1)["tools_unchanged"]
+    assert p.entry(2)["auth_state"] == "needs_login" and "tools" not in p.entry(2)
+
+
 def test_the_first_report_carries_the_tool_schemas():
     p = _Platform()
     p.client().report_connectors([_connector([GET_ACCOUNT])])

@@ -135,16 +135,24 @@ def build_oauth_provider(spec: ConnectorSpec, root: Path,
     )
 
 
+class NoTokensError(ValueError):
+    """An OAuth connector this edge has never been logged in to.
+
+    A type of its own so the connector report can classify it as "needs a
+    login" without reading the message. A ValueError still, so nothing that
+    caught the old one changes.
+    """
+
+
 def no_tokens_message(spec: ConnectorSpec) -> str:
     """What to tell the operator when a connector has no OAuth tokens yet.
 
     Agents read this string and the web UI displays it, so it has to name a
-    command that will actually work. The edge login is the only connector
-    login there is: the platform has none, because OAuth tokens live only on
-    the edge.
+    command that will actually work. The edge login is the only connector login there is: the platform
+    has none, because OAuth tokens live only on the edge.
     """
     return (f"connector {spec.id!r} has no OAuth tokens; "
-            f"run `uv run nakagai-edge login {spec.id}` first")
+            f"run `nakagai-edge login {spec.id}` first")
 
 
 def build_http_client(spec: ConnectorSpec, root: Path):
@@ -161,7 +169,7 @@ def build_http_client(spec: ConnectorSpec, root: Path):
     auth = None
     if spec.auth.mode == "oauth":
         if not has_oauth_tokens(root, spec.id):
-            raise ValueError(no_tokens_message(spec))
+            raise NoTokensError(no_tokens_message(spec))
         auth = build_oauth_provider(spec, root)
 
     client = create_mcp_http_client(
