@@ -534,16 +534,43 @@ def _cmd_setup(args) -> int:
         print("  !  service    not from a uvx run, which lives in uv's cache. For "
               "an edge that starts by itself at login: uv tool install "
               "nakagai-edge, then run setup from it")
-    # An edge of ours already on the port would make run() refuse, leaving
-    # the old daemon (and its old token and code) serving while setup claims
-    # success. Stop it through the same brake gate, then serve.
+    # An edge of ours already on the port would make run() refuse. A current
+    # one is left serving: it may be the login service's own, and stopping
+    # it here would leave nothing up once this terminal closes. A stale one
+    # (older than the pairing or the code) is replaced: through the service
+    # manager when it is the service's daemon, by a stop and a serve here
+    # only when it was started by hand.
     edge, reason = d.find_running(state)
     if reason:
         print(f"  x  serving    {reason}")
         return 2
+    if edge is not None and d.is_current(state, edge.pid):
+        print(f"  -  serving    already serving 127.0.0.1:{edge.port} "
+              f"(pid {edge.pid}) on the current pairing and code")
+        return 0
     if edge is not None:
         if _refused_while_armed(state, args.force, "nakagai-edge setup"):
             return 3
+        owned = svc.supported and svc.unit_exists() and not _other_root(svc, state)
+        if owned and svc.installed() and svc.pid() == edge.pid:
+            if not svc.restart():
+                print("  x  serving    the login service would not restart; "
+                      "run `nakagai-edge restart`")
+                return 6
+            new_pid = d.wait_for_replacement(state, edge.port, edge.pid)
+            if not new_pid:
+                print(f"  x  serving    the login service restarted, but no new "
+                      f"edge answered. Look at {state.log_path}")
+                return 5
+            print(f"  v  restarted  the login service's edge (pid {new_pid}) "
+                  "onto the current pairing and code")
+            return 0
+        if owned:
+            print(f"  x  serving    the edge on 127.0.0.1:{edge.port} (pid "
+                  f"{edge.pid}) predates the current pairing or code and may "
+                  "belong to the login service, which this session cannot "
+                  "reach. Run `nakagai-edge restart` from your desktop session")
+            return 1
         if not d.stop(edge, timeout_s=10.0):
             print(f"  x  serving    pid {edge.pid} is still serving 127.0.0.1:"
                   f"{edge.port} ten seconds after SIGTERM; stop it by hand")

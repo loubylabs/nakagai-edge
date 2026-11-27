@@ -638,6 +638,58 @@ def test_setup_foreground_stops_our_edge_on_the_port_then_serves(
     assert order == ["stop", "serve"]
 
 
+def test_setup_foreground_leaves_a_current_edge_serving(
+        edge_root, tmp_path, monkeypatch, capsys):
+    """Over SSH, under --foreground, or from uvx, the edge already serving
+    may be the login service's own and current. Stopping it would leave
+    nothing up once this terminal closes."""
+    import nakagai_edge.edge.daemon as d
+    state, _, calls = _service_daemon(edge_root, tmp_path, monkeypatch)
+    live = d.RunningEdge(pid=99, port=8330, started_at=2e9, version="x")
+    monkeypatch.setattr(d, "find_running", lambda st: (live, ""))
+    monkeypatch.setattr(d, "stop", lambda edge, **kw: pytest.fail("stopped it"))
+    _must_not_serve_here(monkeypatch)
+
+    assert edge_main(["setup", "--platform", "http://platform.test",
+                      "--foreground"]) == 0
+    assert "already serving" in capsys.readouterr().out
+    assert _acts(calls) == []
+
+
+def test_setup_foreground_restarts_a_stale_service_daemon_through_its_manager(
+        edge_root, tmp_path, monkeypatch, capsys):
+    import nakagai_edge.edge.daemon as d
+    _, _, calls = _service_daemon(edge_root, tmp_path, monkeypatch, started_at=1.0)
+    live = d.RunningEdge(pid=99, port=8330, started_at=1.0, version="x")
+    monkeypatch.setattr(d, "find_running", lambda st: (live, ""))
+    monkeypatch.setattr(d, "stop", lambda edge, **kw: pytest.fail(
+        "SIGTERMed the service's daemon; nothing would restart it"))
+    monkeypatch.setattr(d, "wait_for_replacement", lambda *a, **kw: 5555)
+    _must_not_serve_here(monkeypatch)
+
+    assert edge_main(["setup", "--platform", "http://platform.test",
+                      "--foreground"]) == 0
+    assert ["launchctl", "kickstart"] in _acts(calls)
+
+
+def test_setup_foreground_will_not_stop_a_daemon_the_service_may_own(
+        edge_root, tmp_path, monkeypatch, capsys):
+    """Over SSH the manager cannot say whose daemon it is; a unit for this
+    root means it may well be the service's."""
+    import nakagai_edge.edge.daemon as d
+    _, svc, calls = _service_daemon(edge_root, tmp_path, monkeypatch, started_at=1.0)
+    unreachable = type(svc)(platform="darwin", home=svc.home, uid=501, user="x",
+                            runner=lambda cmd: (125, ""))
+    monkeypatch.setattr(type(svc), "here", classmethod(lambda cls: unreachable))
+    live = d.RunningEdge(pid=99, port=8330, started_at=1.0, version="x")
+    monkeypatch.setattr(d, "find_running", lambda st: (live, ""))
+    monkeypatch.setattr(d, "stop", lambda edge, **kw: pytest.fail("stopped it"))
+    _must_not_serve_here(monkeypatch)
+
+    assert edge_main(["setup", "--platform", "http://platform.test"]) == 1
+    assert "nakagai-edge restart" in capsys.readouterr().out
+
+
 def test_setup_foreground_refuses_a_port_it_cannot_prove(
         edge_root, tmp_path, monkeypatch, capsys):
     import nakagai_edge.edge.daemon as d
