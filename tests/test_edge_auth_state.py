@@ -32,11 +32,16 @@ PLAIN = {"id": "quotes", "kind": "mcp-http", "role": "data",
          "url": "https://quotes.test/mcp/", "enabled": True}
 
 
-def _tokens(root, connector_id="robinhood-trading"):
+def _tokens(root, connector_id="robinhood-trading", *, login=False, **extra):
+    """A token file. `login=True` is what `nakagai-edge login` writes: it
+    stamps `login_at`. Without it, this is the daemon's own write."""
+    import time
     path = token_path(root, connector_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"tokens": {"access_token": "a",
-                                           "token_type": "Bearer"}}))
+    doc = {"tokens": {"access_token": "a", "token_type": "Bearer"}, **extra}
+    if login:
+        doc["login_at"] = time.time()
+    path.write_text(json.dumps(doc))
 
 
 # ---- the classifier, on the real exception types ---------------------------
@@ -254,7 +259,7 @@ async def test_a_fresh_login_clears_needs_login_without_waiting_for_a_connect(
         hub._conns[OAUTH["id"]].error_until = 0.0
     assert hub.status()["connectors"][0]["auth_state"] == "needs_login"
 
-    _tokens(tmp_path)                       # the login wrote the file now
+    _tokens(tmp_path, login=True)           # the login wrote the file now
     assert hub.status()["connectors"][0]["auth_state"] == "ok"
 
 
@@ -312,7 +317,7 @@ async def test_a_login_after_the_mark_clears_it(tmp_path):
     os.utime(token_path(tmp_path, OAUTH["id"]), (old, old))
     _registry(tmp_path)
     await _trip(tmp_path)
-    _tokens(tmp_path)                        # `nakagai-edge login`, after it
+    _tokens(tmp_path, login=True)            # `nakagai-edge login`, after it
     restarted = ConnectorHub(tmp_path)
     assert restarted.status()["connectors"][0]["auth_state"] == "ok"
     assert not _mark(tmp_path).exists()
@@ -334,6 +339,40 @@ async def test_a_successful_connect_clears_the_mark(tmp_path):
         assert hub.status()["connectors"][0]["auth_state"] == "ok"
     finally:
         await hub.aclose()
+
+
+@pytest.mark.anyio
+async def test_the_daemons_own_refresh_write_is_not_a_login(tmp_path):
+    """After a restart with a mark, a connect refreshes (the file is
+    rewritten) and the broker then 401s the new token. In that gap the
+    report must not drop to ok: that would be a second crossing and a
+    second email."""
+    import os
+    import time
+    old = time.time() - 600
+    _tokens(tmp_path)
+    os.utime(token_path(tmp_path, OAUTH["id"]), (old, old))
+    _registry(tmp_path)
+    await _trip(tmp_path)
+    _tokens(tmp_path, expires_at=time.time() + 3600)   # the daemon's refresh
+    restarted = ConnectorHub(tmp_path)
+    assert restarted.status()["connectors"][0]["auth_state"] == "needs_login"
+    assert _mark(tmp_path).exists()
+
+
+def test_tokens_for_another_server_url_need_login(tmp_path):
+    _tokens(tmp_path, server_url="https://old.test/mcp/")
+    row = Connection(spec=ConnectorSpec(**OAUTH)).to_dict(root=tmp_path)
+    assert row["auth_state"] == "needs_login"
+
+
+def test_a_mark_for_a_connector_no_longer_registered_is_deleted(tmp_path):
+    _tokens(tmp_path)
+    _registry(tmp_path)
+    stale = token_path(tmp_path, "gone").with_name("gone.login-failed.json")
+    stale.write_text('{"at": 1.0}')
+    ConnectorHub(tmp_path).status()
+    assert not stale.exists()
 
 
 def test_a_connector_with_no_mark_is_unchanged(tmp_path):

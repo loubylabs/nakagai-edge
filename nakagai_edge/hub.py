@@ -182,7 +182,8 @@ class Connection:
         from nakagai_edge.auth import has_oauth_tokens
         if self.spec.auth.mode != "oauth":
             return "ok"
-        if self.login_failed or not has_oauth_tokens(root, self.spec.id):
+        if self.login_failed or not has_oauth_tokens(root, self.spec.id,
+                                                     self.spec.url or ""):
             return "needs_login"
         return "ok"
 
@@ -564,25 +565,33 @@ class ConnectorHub:
         except (OSError, ValueError, KeyError, TypeError):
             return None
 
+    def _forget_unregistered_marks(self, specs: dict) -> None:
+        """A mark for a connector the registry no longer carries says
+        nothing anyone will read."""
+        from nakagai_edge.auth import token_path
+        suffix = ".login-failed.json"
+        for mark in token_path(self.root, "x").parent.glob(f"*{suffix}"):
+            if mark.name[:-len(suffix)] not in specs:
+                mark.unlink(missing_ok=True)
+
     def _clear_login_failed(self, connector_id: str) -> None:
         self._oauth_failures.pop(connector_id, None)
         self._oauth_failed_at.pop(connector_id, None)
         self._login_failed_mark(connector_id).unlink(missing_ok=True)
 
     def _login_failed(self, connector_id: str) -> bool:
-        """The two-failure rule, in memory or remembered on disk. A token
-        file newer than the last failure (or the mark) is a login those
-        failures predate, so it clears them."""
-        from nakagai_edge.auth import token_path
+        """The two-failure rule, in memory or remembered on disk. A login
+        (`login_at` in the token file, which only `nakagai-edge login`
+        writes) newer than the last failure clears it. The file's mtime does
+        not: the daemon's own refresh rewrites the file too, and a refresh
+        the broker then refuses is not a login."""
+        from nakagai_edge.auth import login_at
         marked_at = self._read_login_failed_mark(connector_id)
         failed_at = max(self._oauth_failed_at.get(connector_id, 0.0),
                         marked_at or 0.0)
         if failed_at:
-            try:
-                written = token_path(self.root, connector_id).stat().st_mtime
-            except OSError:
-                written = 0.0
-            if written > failed_at:
+            logged_in = login_at(self.root, connector_id)
+            if logged_in is not None and logged_in > failed_at:
                 self._clear_login_failed(connector_id)
                 return False
         return (marked_at is not None
@@ -598,6 +607,7 @@ class ConnectorHub:
         """
         specs = self.load_specs()
         out = []
+        self._forget_unregistered_marks(specs)
         for cid, spec in specs.items():
             login_failed = self._login_failed(cid)
             conn = self._conns.get(cid)

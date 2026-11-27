@@ -340,27 +340,32 @@ def _cmd_login(args) -> int:
     return _gateway_run(login(default_root(), args.connector_id))
 
 
-def _broker_enabled(state, broker: str) -> bool:
+def _broker_entry(state, broker: str) -> dict:
+    """The broker's registry entry, {} when the registry lacks it."""
     import yaml as _yaml
 
     path = state.root / "config" / "connectors.yaml"
     if not path.exists():
-        return False
+        return {}
     doc = _yaml.safe_load(path.read_text()) or {}
     for entry in doc.get("connectors", []):
         if entry.get("id") == broker:
-            return bool(entry.get("enabled", False))
-    return False
+            return entry
+    return {}
 
 
 def _edge_facts(state, broker: str) -> dict:
-    """What the planner decides on, read fresh off disk each time it is asked."""
+    """What the planner decides on, read fresh off disk each time it is asked.
+    Tokens issued for another server than the registry names now do not
+    count: the login has to run again."""
     from nakagai_edge.auth import has_oauth_tokens
+    entry = _broker_entry(state, broker)
     return {
         "paired": state.agent() is not None,
         "synced": (state.root / "config" / "connectors.yaml").exists(),
-        "has_broker_tokens": has_oauth_tokens(state.root, broker),
-        "broker_enabled": _broker_enabled(state, broker),
+        "has_broker_tokens": has_oauth_tokens(state.root, broker,
+                                              entry.get("url") or ""),
+        "broker_enabled": bool(entry.get("enabled", False)),
     }
 
 
