@@ -375,7 +375,7 @@ requires-dist = [
     { name = "cryptography", specifier = ">=42" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "jsonschema", specifier = ">=4.26" },
-    { name = "mcp", specifier = ">=2" },
+    { name = "mcp", specifier = ">=2,<2.4" },
     { name = "pyyaml", specifier = ">=6" },
 ]
 

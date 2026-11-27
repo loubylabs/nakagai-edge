@@ -26,6 +26,13 @@ jobs:
           python-version: "3.12"
       - run: uv sync
       - run: uv run pytest
+      # The lock pins one mcp; a user's `uv tool install` takes the newest the
+      # cap allows. The OAuth refresh overrides private SDK methods, so its
+      # tests also run on the top of the allowed range.
+      - name: OAuth tests on the newest mcp the cap allows
+        run: >-
+          uv run --with 'mcp==2.3.*'
+          pytest tests/test_oauth_refresh.py tests/test_edge_auth_state.py
 
   wheel:
     name: the wheel stands alone

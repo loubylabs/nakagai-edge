@@ -31,17 +31,20 @@ dependencies = [
     # asserts the declared floor here and imports MCPServer, so a floor that
     # slips back below 2.0 reddens rather than ships.
     #
-    # No upper bound. The old `<2` existed because 1.x code was pinned under a
-    # 2.x break; that reason is spent. What a bound could not do anyway is
-    # protect `uv tool install nakagai-edge`, which resolves fresh while this
-    # repo and the platform both resolve through a lock: only a
-    # release cut against the new major ever proves that path.
+    # Capped below 2.4 because auth.py's StoredOAuthProvider overrides private
+    # OAuthClientProvider methods (_initialize, _handle_token_response,
+    # _handle_refresh_response) and sets OAuthContext.token_expiry_time and
+    # .oauth_metadata. `uv tool install nakagai-edge` resolves fresh, so an
+    # unbounded floor would hand users an SDK this code was never run
+    # against. The tested range is 2.x up to 2.3 (CI runs the OAuth tests on
+    # 2.3); raise the cap only after running them on the new minor. auth.py
+    # also checks the hooks at construction, so a rename fails loudly.
     #
     # httpx is this package's own client (PlatformClient, and every test's
     # MockTransport). mcp 2.x brings httpx2 as a separate distribution, and
     # auth.py builds its transport client through the SDK's own
     # create_mcp_http_client, so both live here on purpose.
-    "mcp>=2",
+    "mcp>=2,<2.4",
     "cryptography>=42",
     "httpx>=0.27",
     "jsonschema>=4.26",
