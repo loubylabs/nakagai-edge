@@ -190,6 +190,10 @@ If you set up 0.9.0 or earlier with `uvx`, `uv tool upgrade` answers that
 nakagai-edge is not installed: run the install line from the Agents page
 instead, which installs the durable tool and moves your edge onto it.
 
+Broker logins made on 0.9.0 keep working after the upgrade. The first new
+`nakagai-edge login` on 0.10.0 is the one that starts refreshing the broker's
+token by itself, so an expired access token is renewed without you.
+
 ### Connector report
 
 Every minute the edge tells the platform what it can reach, so the web app can
@@ -198,7 +202,9 @@ show it without ever holding a broker credential. Each connector carries
 and this edge holds no tokens for it, or its last two connects in a row failed
 on OAuth (a login that ended; one failure can be a passing hiccup at the
 broker's token endpoint). A network error or a timeout stays `"ok"`: logging
-in again does not fix those. When the broker's login ends, the platform emails you once
+in again does not fix those. A lost login is remembered on disk, so after a
+restart the edge reports `needs_login` at once rather than `ok` first, and it
+clears as soon as `nakagai-edge login` succeeds. When the broker's login ends, the platform emails you once
 with the command that fixes it:
 
 ```bash
