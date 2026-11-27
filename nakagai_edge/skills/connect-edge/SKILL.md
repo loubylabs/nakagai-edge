@@ -12,15 +12,21 @@ up), and the `nakagai-mcp` connector actually reaching the platform's `/mcp/`
 endpoint. Verify all four; the first three can be healthy while the fourth
 401s.
 
-Every command below runs from anywhere, with no checkout of anything. `uvx
-nakagai-edge ...` fetches the published package and runs it; if the package is
-already installed, the `nakagai-edge` entrypoint on PATH is the same binary and
-either form works.
+Every command below runs from anywhere, with no checkout of anything. The edge
+is installed as a durable `uv` tool, and `nakagai-edge` on PATH is that tool.
+When it is missing, install it first:
+
+```bash
+uv tool install --upgrade nakagai-edge && uv tool update-shell
+```
+
+A fresh shell picks up the PATH change; in the current one,
+`"$(uv tool dir --bin)/nakagai-edge"` is the same binary.
 
 ## 1. Establish current state
 
 ```bash
-uvx nakagai-edge status
+nakagai-edge status
 ```
 
 - `"paired": true` with the right `platform_url`: skip to step 3.
@@ -34,6 +40,8 @@ uvx nakagai-edge status
   (what is on PyPI, and `null`, only ever `null`, when the index did not
   answer) are the version picture. `upgrade` is the line for the install shape
   detected here, printed beside `install` so a wrong guess is visible.
+- `service` is `installed` when the edge runs as a login service (it starts by
+  itself at login), `not installed`, or `unsupported` on a platform with none.
 
 State lives in `~/.nakagai/edge/`: `agent.json` (platform URL + agent token),
 `config/connectors.yaml` (synced registry), `cache/meta.json` (bundle etag +
@@ -46,36 +54,44 @@ agent". A human must fetch it; there is no CLI path to mint one from the edge
 side.
 
 ```bash
-uvx nakagai-edge setup <code> --platform https://api.nakag.ai
+nakagai-edge setup <code> --platform https://api.nakag.ai
 ```
 
-`setup` is idempotent (pair, sync, optional broker login, serve). To drive
-the steps individually: `pair <code> --platform <url>`, then `sync`, then
-`login <broker-id>` if a broker needs OAuth, then `run`.
+`setup` is idempotent and asks nothing: pair, sync, the broker's browser login
+when it needs one (`--no-login` skips it), then it installs the edge as a login
+service and waits for the port. It returns with the edge running in the
+background, and the edge starts by itself at login. `--foreground` serves in
+the terminal instead; `--no-run` does neither. To drive the steps
+individually: `pair <code> --platform <url>`, then `sync`, then
+`login <broker-id>` if a broker needs OAuth, then `service install` (or `run`).
 
 ## 3. Sync, then serve
 
 ```bash
-uvx nakagai-edge sync
-uvx nakagai-edge run          # long-running; background it
+nakagai-edge sync
+nakagai-edge service install   # background, starts by itself at login
 ```
 
-`run` serves MCP on `http://127.0.0.1:8330/mcp/` and starts the sync,
-executor, portfolio, fills, and brake loops. Point the agent's MCP client at
-that one URL; it carries platform tools, broker tools, and approval polling.
+The service runs `nakagai-edge run`, which serves MCP on
+`http://127.0.0.1:8330/mcp/` and starts the sync, executor, portfolio, fills,
+and brake loops. Point the agent's MCP client at that one URL; it carries
+platform tools, broker tools, and approval polling. `service status` and
+`service uninstall` answer for the unit (a LaunchAgent on macOS, a systemd
+user unit on Linux). On a platform with no service, `nakagai-edge run` in a
+terminal serves instead.
 
 To bounce an edge that is already up, do not stop and `run` again by hand:
 
 ```bash
-uvx nakagai-edge@latest restart
+nakagai-edge restart
 ```
 
-`restart` stops the daemon it can prove is its own, relaunches it detached
-with output appended to `~/.nakagai/edge/edge.log`, and waits for the port to
-answer before reporting success. It comes back on whatever port the old daemon
-served and takes no `--port`. Run under `uvx nakagai-edge@latest` it is also
-the upgrade: the relaunch inherits the invocation, so latest is what ends up
-serving.
+With the login service installed, `restart` asks the service manager to
+restart it. Without one, it stops the daemon it can prove is its own and
+relaunches it detached with output appended to `~/.nakagai/edge/edge.log`.
+Either way it waits for the port to answer before reporting success, and comes
+back on whatever port the old daemon served (it takes no `--port`). The
+upgrade is `uv tool upgrade nakagai-edge && nakagai-edge restart`.
 
 It refuses rather than guessing, and each refusal names its own remedy:
 
@@ -97,7 +113,7 @@ only when the platform bundle changed. So a registry that looks stale after an
 edge upgrade has simply never been rewritten. Drop the cached etag to force it:
 
 ```bash
-rm ~/.nakagai/edge/cache/meta.json && uvx nakagai-edge sync
+rm ~/.nakagai/edge/cache/meta.json && nakagai-edge sync
 ```
 
 ## 4. Verify, in order
@@ -118,7 +134,7 @@ the proof.
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| `nakagai-mcp` fails with `401 Unauthorized for url .../mcp/` while the same token works on `/api/agent/*` | The connector URL lacks the trailing slash. The platform mounts at `/mcp/` and 307-redirects the bare path; behind a TLS-terminating proxy (Fly) the Location header says `http://`, and httpx drops the Authorization header on a redirect to an insecure origin. | The synced registry must carry `<platform>/mcp/` (trailing slash) so no redirect happens. Current releases write it that way, so upgrade the edge, force a registry rewrite (step 3) and `uvx nakagai-edge@latest restart`. Confirm the fix in `~/.nakagai/edge/config/connectors.yaml`: the `nakagai-mcp` url ends in a slash. |
+| `nakagai-mcp` fails with `401 Unauthorized for url .../mcp/` while the same token works on `/api/agent/*` | The connector URL lacks the trailing slash. The platform mounts at `/mcp/` and 307-redirects the bare path; behind a TLS-terminating proxy (Fly) the Location header says `http://`, and httpx drops the Authorization header on a redirect to an insecure origin. | The synced registry must carry `<platform>/mcp/` (trailing slash) so no redirect happens. Current releases write it that way, so upgrade the edge, force a registry rewrite (step 3) and `nakagai-edge restart`. Confirm the fix in `~/.nakagai/edge/config/connectors.yaml`: the `nakagai-mcp` url ends in a slash. |
 | Registry edits never appear in `config/connectors.yaml` | Etag-gated sync skipped the rewrite | `rm ~/.nakagai/edge/cache/meta.json` then `sync` |
 | Every connector call refused with "policy stale" | Edge cannot reach the platform and the policy TTL (15 min) expired | Restore connectivity, `sync`; this is fail-closed by design |
 | `edge is not paired` from `run` | No `agent.json` | Step 2 |
@@ -147,5 +163,7 @@ stripped headers), not in pairing.
 - `https://app.nakag.ai/docs/edge` (custody model, write path, the two distinct
   logins). The docs viewer is behind a login, so it needs the owner's session.
 - `https://app.nakag.ai/docs/agent-pairing` (token model, minting, revocation)
-- Broker OAuth is separate from platform pairing: `uvx nakagai-edge login <id>`
-  writes `secrets/tokens/<id>.json`; platform pairing never touches it.
+- Broker OAuth is separate from platform pairing: `nakagai-edge login <id>`
+  writes `secrets/tokens/<id>.json`; platform pairing never touches it. The
+  connector report's `auth_state` reads `needs_login` when that login is
+  missing or has ended.

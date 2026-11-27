@@ -2,7 +2,7 @@
 
 Run on the operator's machine, once per connector:
 
-    uv run nakagai-edge login robinhood-trading
+    nakagai-edge login robinhood-trading
 
 Opens the provider's consent page, catches the redirect on a throwaway
 localhost listener, and writes tokens to `secrets/tokens/<id>.json` under the

@@ -1,6 +1,6 @@
 [project]
 name = "nakagai-edge"
-version = "0.9.0"
+version = "0.10.0"
 description = "Nakagai edge: the connector runtime that holds your broker credentials"
 readme = "README.md"
 license = "MIT"
@@ -33,8 +33,8 @@ dependencies = [
     #
     # No upper bound. The old `<2` existed because 1.x code was pinned under a
     # 2.x break; that reason is spent. What a bound could not do anyway is
-    # protect `uvx nakagai-edge`, which resolves fresh at every invocation
-    # while this repo and the platform both resolve through a lock: only a
+    # protect `uv tool install nakagai-edge`, which resolves fresh while this
+    # repo and the platform both resolve through a lock: only a
     # release cut against the new major ever proves that path.
     #
     # httpx is this package's own client (PlatformClient, and every test's

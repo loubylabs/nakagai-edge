@@ -23,7 +23,7 @@ curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8330/mcp/
 `307` = up (that redirect is the healthy answer for a bare GET). Connection
 refused = not running: `connect-edge` step 3.
 
-`uvx nakagai-edge status` answers the same rung from the edge's own record:
+`nakagai-edge status` answers the same rung from the edge's own record:
 `daemon.running` with the pid, port, uptime and log path, and `daemon.note`
 when something holds the port that this edge cannot claim. Both are worth
 having. The curl proves the port answers; the record proves which process is
@@ -32,12 +32,12 @@ supposed to be on it.
 ## Rung 2: pairing and policy
 
 ```bash
-uvx nakagai-edge status
+nakagai-edge status
 ```
 
 Expect `paired: true`, the intended `platform_url`, and `policy_fresh:
 true`. Stale policy with the platform reachable means the sync loop is not
-running, so bounce the daemon with `uvx nakagai-edge@latest restart`; stale
+running, so bounce the daemon with `nakagai-edge restart`; stale
 with the platform unreachable is the fail-closed design doing its job.
 
 The same output carries the version picture: `version` against
@@ -80,7 +80,7 @@ These prove data flows OUT to the platform, not just that auth works:
 3. `refresh_portfolio()`: expect a portfolio document; it was also pushed
    to the owner's Portfolio page. A rate-limit echo (same snapshot within
    15s) still counts as green.
-4. `uvx nakagai-edge listen` in a scratch terminal: a `[listen] holding from
+4. `nakagai-edge listen` in a scratch terminal: a `[listen] holding from
    cursor N` line on stderr is green, and the owner's chat pane should read
    "Agent connected" while it runs. Ctrl-C to stop. The point is that the
    long-poll channel answers rather than errors.

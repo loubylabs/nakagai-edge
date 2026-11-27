@@ -238,9 +238,11 @@ def spawn(state: EdgeState, *, port: int) -> int:
     """Relaunch through argv[0], so the install shape is inherited.
 
     Whoever invoked `restart` invoked it from some install, and that install is
-    the one they want serving. `uvx nakagai-edge@latest restart` therefore
-    leaves latest running and `uv run nakagai-edge restart` leaves that
+    the one they want serving. The uv tool's `nakagai-edge restart` therefore
+    leaves the tool running and `uv run nakagai-edge restart` leaves that
     project's venv running, with nothing recorded and no ps output parsed.
+    The login service, when installed, is restarted by its manager instead
+    (cli._cmd_restart) and never reaches this.
 
     The log is the other half of the problem this solves: a daemon started
     from a terminal that later closes has been writing into a closed stream,
