@@ -33,6 +33,9 @@ from nakagai_edge.guardrails import annotate_tools, evaluate
 from nakagai_edge.response_schema import undeclared_properties
 
 RECONNECT_BACKOFF_S = 30.0
+# Consecutive OAuth connect failures (no success between) before a connector
+# with tokens on disk reports `needs_login`. No tokens at all is immediate.
+OAUTH_FAILURES_FOR_LOGIN = 2
 log = logging.getLogger("nakagai.edge")
 
 
@@ -158,7 +161,10 @@ class Connection:
     last_used: float = 0.0
     connected_at: float = 0.0
     error_until: float = 0.0          # backoff deadline after a failure
-    login_failed: bool = False        # the last connect failed on OAuth (needs_login)
+    # Set by the hub (ConnectorHub.status), which counts OAuth failures per
+    # connector id: a Connection is replaced on every reconnect, so a count
+    # kept here would reset before it could ever reach two.
+    login_failed: bool = False
     _session: Any = None
     _task: asyncio.Task | None = None
     _ready: asyncio.Future | None = None
@@ -264,6 +270,11 @@ class ConnectorHub:
     def __init__(self, root: Path, connect=None, approvals=None) -> None:
         self.root = Path(root)
         self._conns: dict[str, Connection] = {}
+        # OAuth connect failures per connector id since its last success. One
+        # is not yet a lost login: a token endpoint that answers 5xx once makes
+        # the SDK drop its tokens in memory and fail the full flow, and the
+        # next connect reloads the refresh token from disk and recovers.
+        self._oauth_failures: dict[str, int] = {}
         self._lock = asyncio.Lock()
         self._connect = connect or self._default_connect  # test seam
         self._approvals = approvals
@@ -357,6 +368,7 @@ class ConnectorHub:
                     conn.server_info = init.server_info.model_dump(
                         mode="json", by_alias=True)
                 conn.status, conn.last_error = "connected", ""
+                self._oauth_failures.pop(spec.id, None)
                 conn.connected_at = time.monotonic()
                 if conn._ready and not conn._ready.done():
                     conn._ready.set_result(True)
@@ -370,7 +382,11 @@ class ConnectorHub:
                 raise
             conn.status = "error"
             conn.last_error = describe_exception(e)
-            conn.login_failed = needs_login(e)
+            if needs_login(e):
+                # Only a success resets this; a network failure says nothing
+                # about the login either way.
+                self._oauth_failures[spec.id] = (
+                    self._oauth_failures.get(spec.id, 0) + 1)
             conn.error_until = time.monotonic() + RECONNECT_BACKOFF_S
             if conn._ready and not conn._ready.done():
                 conn._ready.set_exception(ConnectorError(
@@ -521,11 +537,14 @@ class ConnectorHub:
         specs = self.load_specs()
         out = []
         for cid, spec in specs.items():
+            login_failed = (self._oauth_failures.get(cid, 0)
+                            >= OAUTH_FAILURES_FOR_LOGIN)
             conn = self._conns.get(cid)
             if conn:
                 conn.spec = spec
+                conn.login_failed = login_failed
                 out.append(conn.to_dict(root=self.root, with_tools=with_tools))
             else:
-                out.append(Connection(spec=spec).to_dict(root=self.root,
-                                                         with_tools=with_tools))
+                out.append(Connection(spec=spec, login_failed=login_failed)
+                           .to_dict(root=self.root, with_tools=with_tools))
         return {"connectors": out}

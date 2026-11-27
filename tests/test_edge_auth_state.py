@@ -138,13 +138,102 @@ async def _status_after(tmp_path, exc, spec=OAUTH):
     return hub.status()["connectors"][0]
 
 
+class _Sequence:
+    """A connect that fails with each exception in turn, None meaning a
+    successful connect."""
+
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+
+    async def __call__(self, spec):
+        from contextlib import asynccontextmanager
+        outcome = self.outcomes.pop(0)
+
+        @asynccontextmanager
+        async def _open():
+            if outcome is not None:
+                raise outcome
+
+            class _Session:
+                initialize_result = None
+
+                async def list_tools(self):
+                    class _Listed:
+                        tools = []
+                    return _Listed()
+            yield _Session()
+
+        return _open()
+
+
+async def _attempts(tmp_path, outcomes):
+    """Drive the hub through one connect per outcome, the way the report loop
+    does after each backoff, and return auth_state after each one."""
+    import yaml
+    from nakagai_edge.hub import ConnectorError
+    (tmp_path / "config").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "config" / "connectors.yaml").write_text(
+        yaml.safe_dump({"connectors": [OAUTH]}))
+    hub = ConnectorHub(tmp_path, connect=_Sequence(outcomes))
+    states = []
+    for _ in outcomes:
+        try:
+            await hub._ensure_connected(hub.spec(OAUTH["id"]))
+        except ConnectorError:
+            pass
+        states.append(hub.status()["connectors"][0]["auth_state"])
+        conn = hub._conns[OAUTH["id"]]
+        conn.error_until = 0.0                   # the backoff has passed
+        if conn.status == "connected":
+            await hub.invalidate(OAUTH["id"])    # next cycle dials again
+    return states
+
+
+def _oauth_failure():
+    return BaseExceptionGroup("unhandled errors in a TaskGroup", [
+        OAuthFlowError("No redirect handler provided for authorization code grant")])
+
+
 @pytest.mark.anyio
-async def test_a_connect_that_fails_on_oauth_reports_needs_login(tmp_path):
+async def test_one_oauth_failure_is_not_yet_a_lost_login(tmp_path):
+    """The SDK path behind this: a token endpoint that answers 503 once makes
+    the SDK drop its tokens in memory, the next request 401s, and the full
+    flow raises OAuthFlowError for want of a browser. The next connect reloads
+    the refresh token from disk and recovers. One failure must not email the
+    owner to log in again."""
     _tokens(tmp_path)
-    row = await _status_after(tmp_path, BaseExceptionGroup(
-        "unhandled errors in a TaskGroup", [OAuthTokenError("invalid_grant")]))
-    assert row["status"] == "error"
-    assert row["auth_state"] == "needs_login"
+    assert await _attempts(tmp_path, [_oauth_failure(), None]) == ["ok", "ok"]
+
+
+@pytest.mark.anyio
+async def test_two_oauth_failures_in_a_row_need_a_login(tmp_path):
+    _tokens(tmp_path)
+    assert await _attempts(tmp_path, [_oauth_failure(), _oauth_failure()]) == [
+        "ok", "needs_login"]
+
+
+@pytest.mark.anyio
+async def test_a_success_between_failures_resets_the_count(tmp_path):
+    _tokens(tmp_path)
+    assert await _attempts(tmp_path, [
+        _oauth_failure(), None, _oauth_failure(), _oauth_failure()]) == [
+        "ok", "ok", "ok", "needs_login"]
+
+
+@pytest.mark.anyio
+async def test_a_network_failure_neither_counts_nor_resets(tmp_path):
+    """Only a success says the login works. A network failure says nothing
+    about the login either way."""
+    _tokens(tmp_path)
+    assert await _attempts(tmp_path, [
+        _oauth_failure(), httpx.ConnectError("down"), _oauth_failure()]) == [
+        "ok", "ok", "needs_login"]
+
+
+@pytest.mark.anyio
+async def test_no_tokens_on_disk_needs_login_at_once(tmp_path):
+    assert await _attempts(tmp_path, [NoTokensError("no tokens")]) == [
+        "needs_login"]
 
 
 @pytest.mark.anyio
