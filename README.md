@@ -5,7 +5,11 @@ the only place a broker credential is ever written to disk. Your agent talks to
 exactly one MCP endpoint, the edge, and never sees a token. The platform never
 sees one either.
 
-Version 0.9.0 is the current release. It reports each broker's own closed
+Version 0.10.0 is the current release. `setup` asks nothing and ends with the
+edge running in the background as a login service that starts by itself at
+login (see "Quickstart"), and each connector report says whether the broker
+needs a login again (`auth_state`, see "Connector report"). It reports each
+broker's own closed
 trades with the profit or loss the broker realized on them (see "Closed
 trades"), and sends history from before you connected only when you turn that
 on for the broker. Autopilot and execution candidates are
@@ -85,39 +89,127 @@ are called by name, not through a generic escape hatch.
 
 ## Quickstart
 
-```bash
-# In the Nakag.ai web app: Agents page -> "Add agent" -> get a 10-minute pairing code.
+You need [`uv`](https://docs.astral.sh/uv/). Then, with a pairing code from the
+Nakag.ai web app (Agents page, "Add agent", valid for 10 minutes), paste one
+line:
 
-# One command: pairs, syncs the registry, (after you confirm at the prompt)
-# opens a browser to log you into your broker, connects your agent, then serves.
-uvx nakagai-edge setup <code> --platform https://api.nakag.ai
+```bash
+uv tool install --upgrade nakagai-edge && uv tool update-shell && "$(uv tool dir --bin)/nakagai-edge" setup <code> --platform https://api.nakag.ai
 ```
 
-`setup` is idempotent: re-running it on a healthy edge just starts the server,
-and it is also the repair path when something has drifted. The individual steps
-remain available: `nakagai-edge pair`, then `nakagai-edge sync`, then
-`nakagai-edge login <id>`, then `nakagai-edge run`.
+That installs the edge as a durable `uv` tool, puts it on your PATH for the
+next shell, and runs `setup`, which asks nothing. It pairs, syncs the registry,
+opens a browser to log you into your broker when the broker needs it, connects
+your agent, and then installs the edge as a login service and waits until it
+answers. It is running in the background when the command returns, and it
+starts by itself at login: closing the terminal or restarting the machine does
+not stop it.
+
+The login service is a LaunchAgent on macOS
+(`~/Library/LaunchAgents/ai.nakag.edge.plist`) and a systemd user unit on Linux
+(`~/.config/systemd/user/nakagai-edge.service`). Both restart the edge after a
+crash (at most every 30 seconds) and append its output to
+`~/.nakagai/edge/edge.log`. An edge that finds itself unpaired, or another edge
+already on its port, exits cleanly and stays down instead of looping. Any other
+platform has no login service, and neither does a session that cannot reach the
+service manager (SSH with no login session, a container or WSL with no user
+bus); there `setup` serves in the foreground.
+
+The service starts with your `PATH` (existing absolute directories only) and
+none of your shell's other variables; nothing secret is copied into the unit.
+`setup` and `service install` print one warning per connector that needs
+something the service will not have: a bearer token or header read from an
+environment variable, a `${VAR}` reference, or a stdio command that is not an
+absolute path. On Linux, when lingering is off for your user, they also print
+the `loginctl enable-linger` command that keeps the edge running after you log
+out and starts it at boot.
+
+Flags change the defaults:
+
+- `--no-login` skips the broker's browser login and prints the command to run
+  it later, `nakagai-edge login <id>`.
+- `--foreground` serves in this terminal instead of installing the service.
+- `--no-run` stops after the login: no service and no server.
+- `--force` hands a running edge to the service even while the brake watches
+  an open position.
+
+`setup` is idempotent: re-running it on a healthy edge leaves the running
+service alone, and it is also the repair path when something has drifted. The individual steps remain available: `nakagai-edge pair`, then
+`nakagai-edge sync`, then `nakagai-edge login <id>`, then
+`nakagai-edge service install` (or `nakagai-edge run` to serve in a terminal).
+
+The service has its own commands:
+
+```bash
+nakagai-edge service install     # write the unit, stop any edge already serving, start it
+nakagai-edge service uninstall   # stop the edge and remove the unit
+nakagai-edge service status      # installed | not installed | unsupported, as JSON
+```
+
+`install` replaces a unit that is already there, so running it twice is safe.
+It refuses on an unpaired edge, while the brake watches an open position
+(`--force` overrides, on `uninstall` too), when something it cannot prove is
+its own holds the port, and when the installed unit belongs to a different
+edge root (`NAKAGAI_EDGE_ROOT`). If the service manager will not load the unit,
+it removes the unit and starts the edge detached again, so the edge keeps
+serving. `status` reads the manager's own answer, so `installed` means loaded
+and `running` means running.
 
 Two commands answer for the daemon once it is up:
 
 ```bash
-nakagai-edge status     # pairing, policy freshness, what is running, what is available
-nakagai-edge restart     # stop it and start a fresh one, detached, with a log
+nakagai-edge status     # pairing, policy freshness, the service, what is running, what is available
+nakagai-edge restart     # restart it, through the login service when there is one
 ```
 
 `status` does nothing but report. Its JSON goes to stdout, so a pipe into `jq`
-keeps working, and the upgrade advice goes to stderr when there is any.
+keeps working, and the upgrade advice goes to stderr when there is any. Its
+`service` key reads `installed`, `not installed` or `unsupported`.
 
-`restart` stops the daemon it can prove is its own, then relaunches through the
-same install you invoked it from, detached, with output appended to
-`~/.nakagai/edge/edge.log`. It comes back on the port the old daemon served,
-takes no `--port`, and waits for the port to answer before reporting success.
-It refuses rather than guessing: while the brake is watching an open position
-(`--force` overrides), and when something is on the port that this edge cannot
-prove is its own, which is what a daemon started before the pidfile existed
-looks like. That first restart on an existing machine is still done by hand.
-The stop is SIGTERM and only SIGTERM; a process holding your broker credentials
-is not something a convenience command escalates on.
+With the login service installed, `restart` asks the service manager to restart
+it (`launchctl kickstart -k`, `systemctl --user restart`), first stopping any
+hand-started edge on the port, and reports success only once a new pid serves. Without one, it stops
+the daemon it can prove is its own, then relaunches through the same install
+you invoked it from, detached, with output appended to
+`~/.nakagai/edge/edge.log`. Either way it comes back on the port the old daemon
+served, takes no `--port`, and waits for the port to answer before reporting
+success. It refuses rather than guessing: while the brake is watching an open
+position (`--force` overrides), and when something is on the port that this
+edge cannot prove is its own, which is what a daemon started before the pidfile
+existed looks like. That first restart on an existing machine is still done by
+hand. The stop is SIGTERM and only SIGTERM; a process holding your broker
+credentials is not something a convenience command escalates on.
+
+To upgrade:
+
+```bash
+uv tool upgrade nakagai-edge && nakagai-edge restart
+```
+
+If you set up 0.9.0 or earlier with `uvx`, `uv tool upgrade` answers that
+nakagai-edge is not installed: run the install line from the Agents page
+instead, which installs the durable tool and moves your edge onto it.
+
+Broker logins made on 0.9.0 keep working after the upgrade. The first new
+`nakagai-edge login` on 0.10.0 is the one that starts refreshing the broker's
+token by itself, so an expired access token is renewed without you.
+
+### Connector report
+
+Every minute the edge tells the platform what it can reach, so the web app can
+show it without ever holding a broker credential. Each connector carries
+`auth_state`: `"ok"`, or `"needs_login"` when the connector logs in with OAuth
+and this edge holds no tokens for it, or its last two connects in a row failed
+on OAuth (a login that ended; one failure can be a passing hiccup at the
+broker's token endpoint). A network error or a timeout stays `"ok"`: logging
+in again does not fix those. A lost login is remembered on disk, so after a
+restart the edge reports `needs_login` at once rather than `ok` first, and it
+clears as soon as `nakagai-edge login` succeeds. When the broker's login ends, the platform emails you once
+with the command that fixes it:
+
+```bash
+nakagai-edge login robinhood-trading
+```
 
 ## Connect your agent
 
@@ -126,7 +218,7 @@ it does not. Already set up? `nakagai-edge connect` does the wiring alone,
 without serving:
 
 ```bash
-uvx nakagai-edge connect
+nakagai-edge connect
 ```
 
 The one client recognized today is Claude Code, detected by `claude` being on
@@ -618,9 +710,9 @@ that order. A connector declaring no `list_closed_trades` is skipped.
   credentials, so replacing it is your decision, not a web index's. No network
   means `latest_version: null`, which is why that key is null rather than empty
   when the index says nothing: "you are current" and "nobody answered" must not
-  look the same. On the quickstart's uvx install the upgrade is one command,
-  `uvx nakagai-edge@latest restart`, which stops the old daemon and relaunches
-  from latest.
+  look the same. On the quickstart's `uv tool` install the upgrade is
+  `uv tool upgrade nakagai-edge && nakagai-edge restart`, and the restart goes
+  through the login service when it is installed.
 
 ## Development
 

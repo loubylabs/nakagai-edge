@@ -5,11 +5,11 @@ description: Hold the owner's Nakagai chat channel open for this session and ans
 
 # Live chat with the owner
 
-The edge must be paired and running. From the active Nakagai checkout, verify and start the listener:
+The edge must be paired and running. Verify and start the listener:
 
 ```bash
-uv run nakagai-edge listen --help
-uv run nakagai-edge listen
+nakagai-edge listen --help
+nakagai-edge listen
 ```
 
 Run the second command as the session's persistent monitor. It holds the

@@ -9,6 +9,13 @@ ever updates anything by itself. It tells the owner; the owner decides.
 
 import httpx
 
+# The one upgrade story: the durable uv tool, then a restart so the running
+# daemon (the login service, when installed) picks up the new code. Everything
+# that tells an owner how to upgrade says this line.
+UPGRADE = "uv tool upgrade nakagai-edge"
+RESTART = "nakagai-edge restart"
+UPGRADE_LINE = f"{UPGRADE} && {RESTART}"
+
 _INDEX = "https://pypi.org/simple/nakagai-edge/"
 _ACCEPT = "application/vnd.pypi.simple.v1+json"
 
@@ -27,7 +34,7 @@ def _is_stable(version: str) -> bool:
 
     The index carries pre-releases, and `_key` would rank 1.0.0rc1 above 1.0.0
     because it reads the chunk as the number 1. The deeper problem is that the
-    line we print tells the owner to run `uvx nakagai-edge@latest`, which
+    line we print tells the owner to run `uv tool upgrade nakagai-edge`, which
     resolves to the latest stable, so naming an rc would advise a version that
     command will not install.
     """

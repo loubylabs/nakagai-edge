@@ -84,7 +84,8 @@ def test_description_comes_from_frontmatter():
 def test_pair_agent_covers_direct_and_edge_onboarding():
     body = skills.read_skill("pair-agent")
     assert "codex mcp add" in body
-    assert "uv tool install nakagai-edge" in body
+    assert "uv tool install --upgrade nakagai-edge" in body
+    assert "uvx" not in body
     assert "Do not copy a direct-mode token" in body
     assert "list_connector_tools" in body
 

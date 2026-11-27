@@ -646,10 +646,10 @@ LISTED_TOOL = {
 }
 
 
-def test_to_dict_carries_each_tools_name_description_and_schema():
+def test_to_dict_carries_each_tools_name_description_and_schema(tmp_path):
     from nakagai_edge.hub import Connection
     row = Connection(spec=ConnectorSpec(**SPEC), status="connected",
-                     tools=[LISTED_TOOL]).to_dict(with_tools=True)
+                     tools=[LISTED_TOOL]).to_dict(root=tmp_path, with_tools=True)
     assert row["tool_count"] == 1
     # Exactly three keys: outputSchema, annotations and _meta are the
     # downstream's business, and shipping them would put bytes on the wire
@@ -661,26 +661,27 @@ def test_to_dict_carries_each_tools_name_description_and_schema():
                         "properties": {"account": {"type": "string"}}}}]
 
 
-def test_to_dict_leaves_the_schemas_out_unless_they_are_asked_for():
+def test_to_dict_leaves_the_schemas_out_unless_they_are_asked_for(tmp_path):
     from nakagai_edge.hub import Connection
     row = Connection(spec=ConnectorSpec(**SPEC), status="connected",
-                     tools=[LISTED_TOOL]).to_dict()
+                     tools=[LISTED_TOOL]).to_dict(root=tmp_path)
     assert "tools" not in row and row["tool_count"] == 1
 
 
-def test_to_dict_of_a_connector_that_never_connected_still_has_a_tool_list():
+def test_to_dict_of_a_connector_that_never_connected_still_has_a_tool_list(tmp_path):
     from nakagai_edge.hub import Connection
-    row = Connection(spec=ConnectorSpec(**SPEC)).to_dict(with_tools=True)
+    row = Connection(spec=ConnectorSpec(**SPEC)).to_dict(root=tmp_path, with_tools=True)
     assert row["status"] == "disconnected"
     assert row["tools"] == [] and row["tool_count"] == 0
 
 
-def test_a_tool_that_publishes_no_description_or_schema_still_reports_both_keys():
+def test_a_tool_that_publishes_no_description_or_schema_still_reports_both_keys(
+        tmp_path):
     # A predictable payload: the platform reads three keys off every entry
     # rather than three keys off some of them.
     from nakagai_edge.hub import Connection
     row = Connection(spec=ConnectorSpec(**SPEC), status="connected",
-                     tools=[{"name": "ping"}]).to_dict(with_tools=True)
+                     tools=[{"name": "ping"}]).to_dict(root=tmp_path, with_tools=True)
     assert row["tools"] == [{"name": "ping", "description": "", "inputSchema": {}}]
 
 

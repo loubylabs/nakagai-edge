@@ -57,6 +57,30 @@ def pytest_sessionstart(session):
     _runtime.start()
 
 
+@pytest.fixture(autouse=True)
+def no_real_service_manager(monkeypatch, tmp_path_factory):
+    """No test may load, restart or remove a real login service.
+
+    The machine running this suite may serve its own edge as a LaunchAgent or
+    a systemd unit, and `setup`, `restart` and `status` all consult the
+    service now. So the real command runner fails the test outright, and the
+    service's home is a fresh directory: an installed unit on this machine
+    must never read as installed to a test. A test that wants a service
+    passes its own fake runner.
+    """
+    from nakagai_edge.edge import install_shape, service
+
+    def refuse(cmd):
+        pytest.fail(f"a test reached the real service manager: {cmd}")
+
+    home = tmp_path_factory.mktemp("service-home")
+    monkeypatch.setattr(service, "run_command", refuse)
+    monkeypatch.setattr(service, "_home", lambda: home)
+    # The uvx check asks the real `uv cache dir`; tests that fake sys.prefix
+    # need the path-shape fallback, whatever uv says on this machine.
+    monkeypatch.setattr(install_shape, "_uv_cache_dir", lambda: "")
+
+
 def pytest_sessionfinish(session, exitstatus):
     """Drop only the sentinel-protected database resources this run created."""
     global _runtime

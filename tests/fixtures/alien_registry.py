@@ -164,8 +164,8 @@ ROBINHOOD_CONNECTOR = {
         # neither: the tool is `get_equity_orders` and the filter parameter is
         # `state`. The copy reached production, every fill-journal cycle failed
         # with "order history unreadable", and no fill the owner placed in the
-        # Robinhood app ever reached the platform (chrvsd/nakagai#327, fixed
-        # there by #328). These tests passed throughout, because a fixture that
+        # Robinhood app ever reached the platform until the platform's copy was
+        # corrected. These tests passed throughout, because a fixture that
         # invents a tool name and a hub that serves the invented name agree
         # with each other perfectly.
         #

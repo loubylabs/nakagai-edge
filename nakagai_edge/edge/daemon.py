@@ -238,9 +238,11 @@ def spawn(state: EdgeState, *, port: int) -> int:
     """Relaunch through argv[0], so the install shape is inherited.
 
     Whoever invoked `restart` invoked it from some install, and that install is
-    the one they want serving. `uvx nakagai-edge@latest restart` therefore
-    leaves latest running and `uv run nakagai-edge restart` leaves that
+    the one they want serving. The uv tool's `nakagai-edge restart` therefore
+    leaves the tool running and `uv run nakagai-edge restart` leaves that
     project's venv running, with nothing recorded and no ps output parsed.
+    The login service, when installed, is restarted by its manager instead
+    (cli._cmd_restart) and never reaches this.
 
     The log is the other half of the problem this solves: a daemon started
     from a terminal that later closes has been writing into a closed stream,
@@ -267,6 +269,45 @@ def spawn(state: EdgeState, *, port: int) -> int:
     finally:
         log.close()
     return proc.pid
+
+
+def is_current(state: EdgeState, pid: int) -> bool:
+    """Whether the daemon `pid` read today's pairing and runs today's code.
+
+    It reads the agent token and imports its code once, at start. So it is
+    current only when its own record names it, was written after agent.json
+    last changed (a re-pair), and carries this package's version (an
+    upgrade). A record missing either fact is not current.
+    """
+    doc = read_pidfile(state)
+    if doc is None or pid <= 0 or doc["pid"] != pid:
+        return False
+    try:
+        paired_at = state.agent_path.stat().st_mtime
+    except OSError:
+        return False
+    return (doc["started_at"] > paired_at
+            and bool(doc["version"]) and doc["version"] == package_version())
+
+
+def wait_for_replacement(state: EdgeState, port: int, old_pid: int, *,
+                         timeout_s: float = 20.0) -> int:
+    """The pid of a NEW daemon serving `port`, or 0 when none turned up.
+
+    A restart through a service manager is fire-and-forget: the port
+    answering proves nothing if the old process is still the one answering.
+    So success is a pidfile naming a live pid other than `old_pid`, with the
+    port up.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        doc = read_pidfile(state) or {}
+        pid = doc.get("pid", 0)
+        if pid and pid != old_pid and pid_alive(pid) and port_listening(port):
+            return pid
+        if time.monotonic() >= deadline:
+            return 0
+        time.sleep(0.3)
 
 
 def wait_until_serving(port: int, *, timeout_s: float = 20.0) -> bool:

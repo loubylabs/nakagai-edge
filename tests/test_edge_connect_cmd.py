@@ -142,11 +142,15 @@ def test_setup_connects_before_it_serves(monkeypatch, tmp_path, capsys):
                         lambda self, *a, **k: None)
 
     order = []
+    # This machine may run a real edge on 8330; setup must see nothing there.
+    monkeypatch.setattr("nakagai_edge.edge.daemon.find_running",
+                        lambda state: (None, ""))
     monkeypatch.setattr(clients, "detected", lambda: order.append("connect") or [])
     monkeypatch.setattr("nakagai_edge.edge.runtime.run",
                         lambda root, port: order.append("serve"))
 
-    assert cli.main(["setup", "--platform", "http://platform.test"]) == 0
+    assert cli.main(["setup", "--platform", "http://platform.test",
+                     "--foreground"]) == 0
     assert order == ["connect", "serve"]
     assert "mcpServers" in capsys.readouterr().out
 
@@ -162,10 +166,12 @@ def test_setup_no_register_prints_the_endpoint_and_touches_no_config(
                         lambda self, *a, **k: None)
 
     called = []
+    monkeypatch.setattr("nakagai_edge.edge.daemon.find_running",
+                        lambda state: (None, ""))
     monkeypatch.setattr(clients, "detected", lambda: called.append("detect") or [])
     monkeypatch.setattr("nakagai_edge.edge.runtime.run", lambda root, port: None)
 
     assert cli.main(["setup", "--platform", "http://platform.test",
-                     "--no-register"]) == 0
+                     "--no-register", "--foreground"]) == 0
     assert called == []
     assert "127.0.0.1:8330/mcp/" in capsys.readouterr().out

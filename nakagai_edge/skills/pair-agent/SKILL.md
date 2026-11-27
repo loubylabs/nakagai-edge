@@ -36,7 +36,7 @@ You cannot mint your own credential; the owner does it in the web app:
   code is not the credential; it is exchanged for one (step 2b).
 
 Self-hosters can also mint on the platform machine itself. This one is not an
-edge command and there is no `uvx` form of it: it is the platform's own CLI, run
+edge command: it is the platform's own CLI, run
 from a platform checkout with that checkout's environment loaded.
 
 ```bash
@@ -113,18 +113,17 @@ Two rules that prevent the two classic failures:
 ## Step 2b: edge connection (pairing code in hand)
 
 Install the published CLI as a user-level tool, then let `setup` perform the
-whole supported sequence: exchange the code, save both the token and real
-`agent_id` with private permissions, sync connector policy, register detected
-clients, and serve the local MCP endpoint.
+whole supported sequence without a prompt: exchange the code, save both the
+token and real `agent_id` with private permissions, sync connector policy, run
+the broker's browser login when it needs one, register detected clients, and
+start the local MCP endpoint as a login service that starts by itself at login.
 
 ```bash
-uv tool install nakagai-edge
-nakagai-edge --version
-nakagai-edge setup <code> --platform https://api.nakag.ai
+uv tool install --upgrade nakagai-edge && uv tool update-shell && "$(uv tool dir --bin)/nakagai-edge" setup <code> --platform https://api.nakag.ai
 ```
 
-Use `uv tool upgrade nakagai-edge` when it is already installed. `uvx
-nakagai-edge@latest setup ...` is the no-install equivalent.
+The same line upgrades an install that is already there. To upgrade later:
+`uv tool upgrade nakagai-edge && nakagai-edge restart`.
 
 Do not copy a direct-mode token into `~/.nakagai/edge/agent.json`. The edge
 also needs the matching `agent_id` for signed approvals and warrants; a blank,
@@ -138,7 +137,7 @@ If setup is intentionally driven in pieces:
 nakagai-edge pair <code> --platform https://api.nakag.ai
 nakagai-edge sync
 nakagai-edge connect
-nakagai-edge restart
+nakagai-edge service install
 nakagai-edge status
 ```
 
@@ -173,7 +172,7 @@ Once connected, in order:
    `account_equity` and `day_pnl` together or not at all.
 3. `get_signals(since="today")` on the very first call to bootstrap your
    cursor; afterwards call it bare, the cursor is keyed to your token.
-4. Run `uvx nakagai-edge listen`. It holds the channel for you, so there is no
+4. Run `nakagai-edge listen`. It holds the channel for you, so there is no
    `await_events` loop to write: one JSON object per eligible event, on stdout,
    with the `seq` you should dedupe on. Every emitted object includes `seq`, `kind`, `at`, and `cursor`, followed by server-authored routing metadata:
    `room_id`, `reply_to_seq`, `sender_agent_id`, `dispatch_mode`,

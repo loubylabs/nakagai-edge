@@ -5,7 +5,7 @@ import subprocess
 import sys
 
 
-def test_edge_release_version_is_090():
+def test_edge_release_version_is_0100():
     import tomllib
     from pathlib import Path
 
@@ -13,17 +13,17 @@ def test_edge_release_version_is_090():
     pyproject = tomllib.loads((root / "pyproject.toml").read_text())
     project = pyproject["project"]
 
-    assert project["version"] == "0.9.0"
+    assert project["version"] == "0.10.0"
 
     lock = (root / "uv.lock").read_text()
     readme = (root / "README.md").read_text()
-    assert 'name = "nakagai-edge"\nversion = "0.9.0"' in lock
-    assert "0.9.0" in readme
+    assert 'name = "nakagai-edge"\nversion = "0.10.0"' in lock
+    assert "0.10.0" in readme
     assert "canonical_order_required" in readme
 
     ci_path = root / ".github" / "workflows" / "ci.yml"
     if ci_path.exists():
-        assert "version('nakagai-edge') == '0.9.0'" in ci_path.read_text()
+        assert "version('nakagai-edge') == '0.10.0'" in ci_path.read_text()
     else:
         excluded = pyproject["tool"]["hatch"]["build"]["targets"]["sdist"]["exclude"]
         assert ".github" in excluded
@@ -118,9 +118,9 @@ def test_the_mcp_pin_declares_a_2x_floor():
 
     The guard is on the DECLARED constraint, not on the resolved version. Both
     this repo and the platform resolve through a lock, so the resolved version
-    here is always the one that already works; `uvx nakagai-edge`, which is
-    what a user runs, resolves fresh at every invocation and takes whatever the
-    floor allows. A floor that slipped back to 1.x would therefore ship an edge
+    here is always the one that already works; `uv tool install nakagai-edge`,
+    which is what a user runs, resolves fresh and takes whatever the floor
+    allows. A floor that slipped back to 1.x would therefore ship an edge
     that pairs and syncs and then dies starting its own MCP server, and this
     lockfile would never say so.
     """

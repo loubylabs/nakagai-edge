@@ -1,6 +1,6 @@
 """What nakagai_edge is allowed to weigh.
 
-This package exists so a stranger can `uvx nakagai-edge setup <code>` without
+This package exists so a stranger can `uv tool install nakagai-edge` without
 pulling pandas, numpy and pyarrow onto their laptop to place an order. That is a
 property of the import graph, and import graphs rot silently: one convenient
 `import pandas` at module scope in hub.py and the wheel still builds, the tests
@@ -69,7 +69,7 @@ def test_the_edge_carries_no_platform_weight():
     assert heavy == [], (
         f"nakagai_edge imports {heavy} at module scope. That weight ships to every "
         f"alpha user. If a platform-shaped question crept into the edge, it belongs "
-        f"on PlatformHub; see todos/edge-distribution-uvx-spec.md.")
+        f"on PlatformHub.")
 
 
 def test_the_edge_never_imports_the_platform():
