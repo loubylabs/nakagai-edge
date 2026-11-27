@@ -271,6 +271,26 @@ def spawn(state: EdgeState, *, port: int) -> int:
     return proc.pid
 
 
+def wait_for_replacement(state: EdgeState, port: int, old_pid: int, *,
+                         timeout_s: float = 20.0) -> int:
+    """The pid of a NEW daemon serving `port`, or 0 when none turned up.
+
+    A restart through a service manager is fire-and-forget: the port
+    answering proves nothing if the old process is still the one answering.
+    So success is a pidfile naming a live pid other than `old_pid`, with the
+    port up.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        doc = read_pidfile(state) or {}
+        pid = doc.get("pid", 0)
+        if pid and pid != old_pid and pid_alive(pid) and port_listening(port):
+            return pid
+        if time.monotonic() >= deadline:
+            return 0
+        time.sleep(0.3)
+
+
 def wait_until_serving(port: int, *, timeout_s: float = 20.0) -> bool:
     """Proof, not assertion. A command that prints "restarted" without
     checking the port is theater."""

@@ -21,10 +21,26 @@ def test_uvx_ephemeral_cache_moves_onto_the_durable_tool():
     assert "uvx" not in cmd + then
 
 
-def test_is_ephemeral_names_only_the_uvx_cache():
-    assert is_ephemeral(UVX) is True
-    assert is_ephemeral("/Users/x/.local/share/uv/tools/nakagai-edge") is False
-    assert is_ephemeral("/usr") is False
+def test_is_ephemeral_falls_back_to_the_path_shape_without_uv():
+    assert is_ephemeral(UVX, cache_dir="") is True
+    assert is_ephemeral("/Users/x/.local/share/uv/tools/nakagai-edge",
+                        cache_dir="") is False
+    assert is_ephemeral("/usr", cache_dir="") is False
+
+
+def test_is_ephemeral_asks_uv_where_its_cache_is():
+    """A cache moved with UV_CACHE_DIR has no `uv` segment at all, and a
+    project that happens to sit under a `uv` directory is not a cache."""
+    assert is_ephemeral("/data/cache/archive-v0/abc", cache_dir="/data/cache") is True
+    assert is_ephemeral(UVX, cache_dir="/data/cache") is False
+    assert is_ephemeral("/home/x/uv/archive-proj/.venv",
+                        cache_dir="/home/x/.cache/uv") is False
+
+
+def test_the_real_cache_lookup_answers_empty_without_uv(monkeypatch):
+    from nakagai_edge.edge import install_shape
+    monkeypatch.setattr(install_shape.shutil, "which", lambda name: None)
+    assert install_shape._ask_uv_cache_dir() == ""
 
 
 def test_uv_tool_install():

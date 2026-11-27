@@ -68,7 +68,7 @@ def no_real_service_manager(monkeypatch, tmp_path_factory):
     must never read as installed to a test. A test that wants a service
     passes its own fake runner.
     """
-    from nakagai_edge.edge import service
+    from nakagai_edge.edge import install_shape, service
 
     def refuse(cmd):
         pytest.fail(f"a test reached the real service manager: {cmd}")
@@ -76,6 +76,9 @@ def no_real_service_manager(monkeypatch, tmp_path_factory):
     home = tmp_path_factory.mktemp("service-home")
     monkeypatch.setattr(service, "run_command", refuse)
     monkeypatch.setattr(service, "_home", lambda: home)
+    # The uvx check asks the real `uv cache dir`; tests that fake sys.prefix
+    # need the path-shape fallback, whatever uv says on this machine.
+    monkeypatch.setattr(install_shape, "_uv_cache_dir", lambda: "")
 
 
 def pytest_sessionfinish(session, exitstatus):

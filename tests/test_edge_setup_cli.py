@@ -413,12 +413,18 @@ def _service_here(tmp_path, monkeypatch, platform="darwin", **rc_by_verb):
 
     def runner(cmd):
         calls.append(cmd)
-        return rc_by_verb.get(cmd[1], 0)
+        answer = rc_by_verb.get(cmd[1], 0)
+        return answer if isinstance(answer, tuple) else (answer, "")
 
     svc = service.Service(platform=platform, home=tmp_path / "home", uid=501,
-                          runner=runner)
+                          user="x", runner=runner, sleep=lambda s: None)
     monkeypatch.setattr(service.Service, "here", classmethod(lambda cls: svc))
     return svc, calls
+
+
+def _acts(calls):
+    """The commands that change something; `print` is only a question."""
+    return [c[:2] for c in calls if c[1] != "print"]
 
 
 def _nothing_running(monkeypatch):
@@ -451,7 +457,7 @@ def test_setup_hands_the_edge_to_the_login_service_and_returns(
     assert "starts by itself at login" in out
     assert waited == [8330]
     assert svc.installed()
-    assert [c[:2] for c in calls] == [["launchctl", "bootout"],
+    assert _acts(calls) == [["launchctl", "bootout"],
                                       ["launchctl", "bootstrap"]]
 
 
@@ -469,7 +475,7 @@ def test_setup_service_carries_the_port(edge_root, tmp_path, monkeypatch, capsys
                       "--port", "9999"]) == 0
     body = plistlib.loads(svc.path.read_bytes())
     assert body["ProgramArguments"][1:] == ["run", "--port", "9999"]
-    assert body["EnvironmentVariables"] == {"NAKAGAI_EDGE_ROOT": str(edge_root)}
+    assert body["EnvironmentVariables"]["NAKAGAI_EDGE_ROOT"] == str(edge_root)
 
 
 def test_setup_stops_a_detached_daemon_before_the_service_starts(
@@ -494,7 +500,7 @@ def test_setup_stops_a_detached_daemon_before_the_service_starts(
     monkeypatch.setattr(d, "wait_until_serving", lambda port, **kw: True)
 
     assert edge_main(["setup", "--platform", "http://platform.test"]) == 0
-    assert [c[:2] for c in calls] == [["launchctl", "bootout"], ["stop", 4242],
+    assert _acts(calls) == [["launchctl", "bootout"], ["stop", 4242],
                                       ["launchctl", "bootstrap"]]
 
 
@@ -511,15 +517,80 @@ def test_setup_reports_a_service_that_never_answers(
     assert "edge.log" in capsys.readouterr().out
 
 
-def test_setup_reports_a_manager_that_refuses_the_unit(
+def test_setup_reports_a_manager_that_refuses_the_unit_and_keeps_serving(
         edge_root, tmp_path, monkeypatch, capsys):
+    """By the time the manager refuses, any old daemon is stopped: the unit
+    is removed and the edge relaunched detached, so something still serves."""
+    import nakagai_edge.edge.daemon as d
     _ready_edge(edge_root, monkeypatch)
-    _service_here(tmp_path, monkeypatch, bootstrap=5)
+    svc, _ = _service_here(tmp_path, monkeypatch, bootstrap=5)
     _nothing_running(monkeypatch)
     _must_not_serve_here(monkeypatch)
+    spawned = []
+    monkeypatch.setattr(d, "spawn", lambda st, *, port: spawned.append(port) or 4242)
+    monkeypatch.setattr(d, "wait_until_serving", lambda port, **kw: True)
 
     assert edge_main(["setup", "--platform", "http://platform.test"]) != 0
-    assert "service" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "serving detached" in out
+    assert spawned == [8330] and not svc.path.exists()
+
+
+def test_setup_with_an_unreachable_manager_serves_in_the_foreground(
+        edge_root, tmp_path, monkeypatch, capsys):
+    """Over SSH there is no gui domain; in a container no user bus."""
+    _ready_edge(edge_root, monkeypatch)
+    svc, calls = _service_here(tmp_path, monkeypatch, print=(125, ""))
+    served = []
+    monkeypatch.setattr("nakagai_edge.edge.runtime.run",
+                        lambda root, port: served.append((root, port)))
+
+    assert edge_main(["setup", "--platform", "http://platform.test"]) == 0
+    assert served == [(edge_root, 8330)]
+    assert _acts(calls) == [] and not svc.path.exists()
+
+
+def test_setup_leaves_a_healthy_service_alone(
+        edge_root, tmp_path, monkeypatch, capsys):
+    """A re-run must not bounce the edge (and the brake) for nothing."""
+    import nakagai_edge.edge.daemon as d
+    from nakagai_edge.edge.service import unit_text
+    _ready_edge(edge_root, monkeypatch)
+    svc, calls = _service_here(tmp_path, monkeypatch,
+                               print=(0, "\tstate = running\n\tpid = 99\n"))
+    svc.path.parent.mkdir(parents=True)
+    svc.path.write_text(unit_text("darwin", d.relaunch_argv0(), 8330,
+                                  str(edge_root), path="/bin"))
+    _must_not_serve_here(monkeypatch)
+    monkeypatch.setattr(d, "find_running", lambda state: pytest.fail(
+        "touched the running edge"))
+
+    assert edge_main(["setup", "--platform", "http://platform.test"]) == 0
+    assert "service    already running" in capsys.readouterr().out
+    assert _acts(calls) == []
+
+
+def test_setup_brake_refusal_names_a_flag_setup_has(
+        edge_root, tmp_path, monkeypatch, capsys):
+    import shlex
+
+    import nakagai_edge.edge.daemon as d
+    from nakagai_edge.cli import _build_parser
+    state = _ready_edge(edge_root, monkeypatch)
+    state.supervised_path.parent.mkdir(parents=True, exist_ok=True)
+    state.supervised_path.write_text(json.dumps({"p1": {
+        "position_id": "p1", "symbol": "AAPL", "quantity": 1,
+        "stop_price": 1.0, "state": "armed", "blocked": ""}}))
+    _, calls = _service_here(tmp_path, monkeypatch)
+    _must_not_serve_here(monkeypatch)
+    live = d.RunningEdge(pid=4242, port=8330, started_at=1.0, version="x")
+    monkeypatch.setattr(d, "find_running", lambda st: (live, ""))
+
+    assert edge_main(["setup", "--platform", "http://platform.test"]) == 3
+    hint = capsys.readouterr().err.strip().splitlines()[-1].strip()
+    assert hint == "nakagai-edge setup --force"
+    assert _build_parser().parse_args(shlex.split(hint)[1:]).force is True
+    assert _acts(calls) == []
 
 
 def test_setup_foreground_serves_here_and_installs_nothing(

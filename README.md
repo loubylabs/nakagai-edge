@@ -107,9 +107,22 @@ not stop it.
 
 The login service is a LaunchAgent on macOS
 (`~/Library/LaunchAgents/ai.nakag.edge.plist`) and a systemd user unit on Linux
-(`~/.config/systemd/user/nakagai-edge.service`). Both restart the edge if it
-exits and append its output to `~/.nakagai/edge/edge.log`. Any other platform
-has no login service, and there `setup` serves in the foreground.
+(`~/.config/systemd/user/nakagai-edge.service`). Both restart the edge after a
+crash (at most every 30 seconds) and append its output to
+`~/.nakagai/edge/edge.log`. An edge that finds itself unpaired, or another edge
+already on its port, exits cleanly and stays down instead of looping. Any other
+platform has no login service, and neither does a session that cannot reach the
+service manager (SSH with no login session, a container or WSL with no user
+bus); there `setup` serves in the foreground.
+
+The service starts with your `PATH` (existing absolute directories only) and
+none of your shell's other variables; nothing secret is copied into the unit.
+`setup` and `service install` print one warning per connector that needs
+something the service will not have: a bearer token or header read from an
+environment variable, a `${VAR}` reference, or a stdio command that is not an
+absolute path. On Linux, when lingering is off for your user, they also print
+the `loginctl enable-linger` command that keeps the edge running after you log
+out and starts it at boot.
 
 Flags change the defaults:
 
@@ -117,10 +130,11 @@ Flags change the defaults:
   it later, `nakagai-edge login <id>`.
 - `--foreground` serves in this terminal instead of installing the service.
 - `--no-run` stops after the login: no service and no server.
+- `--force` hands a running edge to the service even while the brake watches
+  an open position.
 
-`setup` is idempotent: re-running it on a healthy edge reinstalls the service
-and leaves it running, and it is also the repair path when something has
-drifted. The individual steps remain available: `nakagai-edge pair`, then
+`setup` is idempotent: re-running it on a healthy edge leaves the running
+service alone, and it is also the repair path when something has drifted. The individual steps remain available: `nakagai-edge pair`, then
 `nakagai-edge sync`, then `nakagai-edge login <id>`, then
 `nakagai-edge service install` (or `nakagai-edge run` to serve in a terminal).
 
@@ -133,8 +147,13 @@ nakagai-edge service status      # installed | not installed | unsupported, as J
 ```
 
 `install` replaces a unit that is already there, so running it twice is safe.
-It refuses while the brake watches an open position (`--force` overrides) and
-when something it cannot prove is its own holds the port.
+It refuses on an unpaired edge, while the brake watches an open position
+(`--force` overrides, on `uninstall` too), when something it cannot prove is
+its own holds the port, and when the installed unit belongs to a different
+edge root (`NAKAGAI_EDGE_ROOT`). If the service manager will not load the unit,
+it removes the unit and starts the edge detached again, so the edge keeps
+serving. `status` reads the manager's own answer, so `installed` means loaded
+and `running` means running.
 
 Two commands answer for the daemon once it is up:
 
@@ -148,7 +167,8 @@ keeps working, and the upgrade advice goes to stderr when there is any. Its
 `service` key reads `installed`, `not installed` or `unsupported`.
 
 With the login service installed, `restart` asks the service manager to restart
-it (`launchctl kickstart -k`, `systemctl --user restart`). Without one, it stops
+it (`launchctl kickstart -k`, `systemctl --user restart`), first stopping any
+hand-started edge on the port, and reports success only once a new pid serves. Without one, it stops
 the daemon it can prove is its own, then relaunches through the same install
 you invoked it from, detached, with output appended to
 `~/.nakagai/edge/edge.log`. Either way it comes back on the port the old daemon
@@ -171,9 +191,10 @@ uv tool upgrade nakagai-edge && nakagai-edge restart
 Every minute the edge tells the platform what it can reach, so the web app can
 show it without ever holding a broker credential. Each connector carries
 `auth_state`: `"ok"`, or `"needs_login"` when the connector logs in with OAuth
-and this edge holds no tokens for it, or its last connect failed on OAuth (a
-login that ended). A network error or a timeout stays `"ok"`: logging in again
-does not fix those. When the broker's login ends, the platform emails you once
+and this edge holds no tokens for it, or its last two connects in a row failed
+on OAuth (a login that ended; one failure can be a passing hiccup at the
+broker's token endpoint). A network error or a timeout stays `"ok"`: logging
+in again does not fix those. When the broker's login ends, the platform emails you once
 with the command that fixes it:
 
 ```bash

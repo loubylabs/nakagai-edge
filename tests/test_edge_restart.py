@@ -282,42 +282,116 @@ def test_a_restart_after_a_clean_stop_comes_back_on_the_same_port(
 
 # --- an edge the login service owns is restarted by the service manager -----
 
-def _installed_service(tmp_path, monkeypatch, rc=0):
+def _installed_service(root, monkeypatch, rc=0, service_pid=0,
+                       unit_root=None):
+    """A loaded LaunchAgent for `unit_root` (default: this root) whose
+    manager reports `service_pid` as its running edge."""
     from nakagai_edge.edge import service
     calls = []
 
     def runner(cmd):
         calls.append(cmd)
-        return rc
+        if cmd[1] == "print":
+            return 0, f"\tstate = running\n\tpid = {service_pid}\n"
+        return rc, ""
 
-    svc = service.Service(platform="darwin", home=tmp_path / "home", uid=501,
-                          runner=runner)
+    svc = service.Service(platform="darwin", home=root / "home", uid=501,
+                          user="x", runner=runner)
     svc.path.parent.mkdir(parents=True)
-    svc.path.write_text("<plist/>")
+    svc.path.write_text(service.unit_text(
+        "darwin", "/bin/nakagai-edge", 8330, str(unit_root or root), path="/bin"))
     monkeypatch.setattr(service.Service, "here", classmethod(lambda cls: svc))
     return calls
 
 
+def _acts(calls):
+    """The commands that change something; `print` is only a question."""
+    return [c for c in calls if c[1] != "print"]
+
+
 def test_an_installed_service_is_restarted_by_its_manager(root, monkeypatch, capsys):
     """A detached spawn beside a KeepAlive agent would be two daemons racing
-    for one port, so the manager does the restart and nothing is spawned."""
+    for one port, so the manager does the restart and nothing is spawned.
+    Success is a NEW pid on the port, not merely the port answering."""
     import os
     sock, port = _listener()
     try:
         state = EdgeState(root)
         _pidfile(state, pid=os.getpid(), port=port)
-        calls = _installed_service(root, monkeypatch)
+        calls = _installed_service(root, monkeypatch, service_pid=os.getpid())
         import nakagai_edge.edge.daemon as d
         monkeypatch.setattr(d, "stop", lambda edge, **kw: pytest.fail(
             "signalled the daemon the service manager owns"))
         monkeypatch.setattr(d, "spawn", lambda st, *, port: pytest.fail(
             "spawned a detached daemon beside the login service"))
-        monkeypatch.setattr(d, "wait_until_serving", lambda p, **kw: p == port)
+        waited = []
+        monkeypatch.setattr(d, "wait_for_replacement",
+                            lambda st, p, old, **kw: waited.append((p, old)) or 5555)
         assert main(["restart"]) == 0
-        assert calls == [["launchctl", "kickstart", "-k", "gui/501/ai.nakag.edge"]]
-        assert f"127.0.0.1:{port}" in capsys.readouterr().out
+        assert _acts(calls) == [["launchctl", "kickstart", "-k",
+                                 "gui/501/ai.nakag.edge"]]
+        assert waited == [(port, os.getpid())]
+        out = capsys.readouterr().out
+        assert f"127.0.0.1:{port}" in out and "pid 5555" in out
     finally:
         sock.close()
+
+
+def test_a_detached_edge_on_the_port_is_stopped_before_the_manager_restarts(
+        root, monkeypatch):
+    """Left running, the hand-started daemon keeps the port and the service's
+    own daemon refuses and stays down: a "restart" that changes nothing."""
+    import os
+    sock, port = _listener()
+    try:
+        state = EdgeState(root)
+        _pidfile(state, pid=os.getpid(), port=port)
+        calls = _installed_service(root, monkeypatch, service_pid=777)
+        import nakagai_edge.edge.daemon as d
+        monkeypatch.setattr(d, "stop", lambda edge, **kw:
+                            calls.append(["stop", edge.pid]) or True)
+        monkeypatch.setattr(d, "wait_for_replacement", lambda *a, **kw: 5555)
+        assert main(["restart"]) == 0
+        assert [c[:2] for c in _acts(calls)] == [["stop", os.getpid()],
+                                                 ["launchctl", "kickstart"]]
+    finally:
+        sock.close()
+
+
+def test_a_service_restart_that_brings_no_new_pid_is_not_claimed(
+        root, monkeypatch, capsys):
+    import os
+    sock, port = _listener()
+    try:
+        state = EdgeState(root)
+        _pidfile(state, pid=os.getpid(), port=port)
+        _installed_service(root, monkeypatch, service_pid=os.getpid())
+        import nakagai_edge.edge.daemon as d
+        monkeypatch.setattr(d, "wait_for_replacement", lambda *a, **kw: 0)
+        assert main(["restart"]) == 5
+        assert "edge.log" in capsys.readouterr().err
+    finally:
+        sock.close()
+
+
+def test_restart_refuses_another_roots_service(root, tmp_path, monkeypatch, capsys):
+    import nakagai_edge.edge.daemon as d
+    monkeypatch.setattr(d, "DEFAULT_PORT", 1)
+    monkeypatch.setattr(d, "port_listening", lambda p, host="127.0.0.1": False)
+    calls = _installed_service(root, monkeypatch, unit_root="/elsewhere/edge")
+    assert main(["restart"]) == 2
+    assert "/elsewhere/edge" in capsys.readouterr().err
+    assert _acts(calls) == []
+
+
+def test_wait_for_replacement_wants_a_new_live_pid(root, monkeypatch):
+    import os
+    import nakagai_edge.edge.daemon as d
+    state = EdgeState(root)
+    monkeypatch.setattr(d, "port_listening", lambda p, host="127.0.0.1": True)
+    _pidfile(state, pid=os.getpid(), port=9)
+    assert d.wait_for_replacement(state, 9, os.getpid(), timeout_s=0) == 0
+    assert d.wait_for_replacement(state, 9, 4242, timeout_s=0) == os.getpid()
 
 
 def test_the_brake_gate_still_holds_with_a_service(root, monkeypatch, capsys):
@@ -331,7 +405,7 @@ def test_the_brake_gate_still_holds_with_a_service(root, monkeypatch, capsys):
              "stop_price": 224.10, "state": "armed", "blocked": ""}])
         calls = _installed_service(root, monkeypatch)
         assert main(["restart"]) == 3
-        assert calls == []
+        assert _acts(calls) == []
     finally:
         sock.close()
 

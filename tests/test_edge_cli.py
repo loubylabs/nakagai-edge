@@ -470,8 +470,9 @@ def test_status_reports_whether_the_login_service_is_installed(
     monkeypatch.setattr("nakagai_edge.edge.daemon.DEFAULT_PORT", 1)
     monkeypatch.setattr("nakagai_edge.edge.freshness.latest_release",
                         lambda **kw: None)
+    loaded = {"rc": 0}
     svc = service.Service(platform="darwin", home=tmp_path / "home", uid=501,
-                          runner=lambda cmd: pytest.fail(f"status ran {cmd}"))
+                          user="x", runner=lambda cmd: (loaded["rc"], ""))
     monkeypatch.setattr(service.Service, "here", classmethod(lambda cls: svc))
 
     assert main(["status"]) == 0
@@ -480,10 +481,15 @@ def test_status_reports_whether_the_login_service_is_installed(
     svc.path.write_text("<plist/>")
     assert main(["status"]) == 0
     assert json.loads(capsys.readouterr().out)["service"] == "installed"
+    # A unit file the manager does not have (what a failed load leaves) is
+    # not an installed service.
+    loaded["rc"] = 113
+    assert main(["status"]) == 0
+    assert json.loads(capsys.readouterr().out)["service"] == "not installed"
 
     monkeypatch.setattr(service.Service, "here", classmethod(
         lambda cls: service.Service(platform="win32", home=tmp_path, uid=0,
-                                    runner=svc.runner)))
+                                    user="x", runner=svc.runner)))
     assert main(["status"]) == 0
     assert json.loads(capsys.readouterr().out)["service"] == "unsupported"
 
