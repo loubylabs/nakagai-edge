@@ -410,6 +410,7 @@ def _cmd_setup(args) -> int:
     moment ago.
     """
     from nakagai_edge.edge import clients
+    from nakagai_edge.edge import daemon as d
     from nakagai_edge.edge.client import EdgeClientError, pair
     from nakagai_edge.edge.install_shape import is_ephemeral
     from nakagai_edge.edge.preflight import check_platform
@@ -503,13 +504,13 @@ def _cmd_setup(args) -> int:
     service_step, run_step = steps["service"], steps["run"]
     if service_step.run:
         # A re-run on a healthy edge leaves it alone: same binary, port and
-        # root, loaded and running. Not after a re-pair, though: the running
-        # daemon read the old agent token at start.
-        from nakagai_edge.edge import daemon as d
+        # root, loaded and running, and the daemon is current. It reads the
+        # agent token and its code once, at start, so one that predates the
+        # pairing (a re-pair) or runs older code (an upgrade) is restarted.
         wanted = {"argv0": d.relaunch_argv0(), "port": args.port,
                   "root": str(state.root)}
-        if (not pair_step.run and svc.installed_config() == wanted
-                and svc.installed() and svc.running()):
+        if (svc.installed_config() == wanted and svc.installed()
+                and svc.running() and d.is_current(state, svc.pid())):
             print("  -  service    already running")
             return 0
         print(f"  .  service    {service_step.reason}")
@@ -534,8 +535,26 @@ def _cmd_setup(args) -> int:
         print("  !  service    not from a uvx run, which lives in uv's cache. For "
               "an edge that starts by itself at login: uv tool install "
               "nakagai-edge, then run setup from it")
+    # An edge of ours already on the port would make run() refuse, leaving
+    # the old daemon (and its old token and code) serving while setup claims
+    # success. Stop it through the same brake gate, then serve.
+    edge, reason = d.find_running(state)
+    if reason:
+        print(f"  x  serving    {reason}")
+        return 2
+    if edge is not None:
+        if _refused_while_armed(state, args.force, "nakagai-edge setup"):
+            return 3
+        if not d.stop(edge, timeout_s=10.0):
+            print(f"  x  serving    pid {edge.pid} is still serving 127.0.0.1:"
+                  f"{edge.port} ten seconds after SIGTERM; stop it by hand")
+            return 4
+        print(f"  -  stopped    the edge that was serving (pid {edge.pid}), so "
+              "the new one reads the current pairing")
     print(f"  -> {run_step.reason} on {clients.url(args.port)} (Ctrl-C to stop)")
-    run(state.root, port=args.port)
+    if run(state.root, port=args.port) is False:
+        print("  x  serving    the edge did not start (the line above says why)")
+        return 1
     return 0
 
 

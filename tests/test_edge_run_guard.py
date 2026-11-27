@@ -28,7 +28,7 @@ def untouchable(monkeypatch):
 
 
 def test_an_unpaired_edge_exits_0_with_one_line(tmp_path, capsys, untouchable):
-    assert runtime.run(tmp_path, port=8331) is None
+    assert runtime.run(tmp_path, port=8331) is False
     err = capsys.readouterr().err
     assert "not paired" in err and len(err.strip().splitlines()) == 1
     assert not EdgeState(tmp_path).pid_path.exists()
@@ -45,7 +45,7 @@ def test_a_held_port_exits_0_and_leaves_the_live_record_alone(
     live = {"pid": 999999, "port": port, "started_at": 1.0, "version": "x"}
     state.pid_path.write_text(json.dumps(live))
     try:
-        assert runtime.run(tmp_path, port=port) is None
+        assert runtime.run(tmp_path, port=port) is False
     finally:
         sock.close()
     err = capsys.readouterr().err

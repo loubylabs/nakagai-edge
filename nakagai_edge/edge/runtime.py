@@ -1015,9 +1015,9 @@ async def _loops(state: EdgeState, hub, client: PlatformClient, audit: EdgeAudit
             asyncio.create_task(brake_loop(), name="brake_loop")]
 
 
-def run(root, port: int = 8330) -> None:
-    """Serve until stopped. Returns at once, touching nothing, when the edge
-    is not paired or the port is already served.
+def run(root, port: int = 8330) -> bool:
+    """Serve until stopped, then return True. Returns False at once, touching
+    nothing, when the edge is not paired or the port is already served.
 
     Those two refusals come first and are clean exits (status 0) on purpose.
     The login service restarts the daemon only after a failed exit, so a
@@ -1036,12 +1036,12 @@ def run(root, port: int = 8330) -> None:
         print("nakagai-edge: not serving: this edge is not paired. Run "
               "`nakagai-edge setup <code> --platform <url>` first",
               file=sys.stderr)
-        return
+        return False
     if port_listening(port):
         print(f"nakagai-edge: not serving: 127.0.0.1:{port} is already served "
               "(another edge is running); this one stays down",
               file=sys.stderr)
-        return
+        return False
     client = PlatformClient(agent["platform_url"], agent["token"])
     sync_once(state, client)                 # best-effort warm start
 
@@ -1089,3 +1089,4 @@ def run(root, port: int = 8330) -> None:
         # runs the server has already freed the port, so a `restart` may
         # already have a replacement serving and recorded.
         release_pidfile(state)
+    return True

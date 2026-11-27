@@ -27,6 +27,14 @@ def no_real_client_wiring(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def nothing_on_the_port(monkeypatch):
+    """This machine may run a real edge on 8330. Unless a test says
+    otherwise, setup sees nothing serving."""
+    monkeypatch.setattr("nakagai_edge.edge.daemon.find_running",
+                        lambda state: (None, ""))
+
+
+@pytest.fixture(autouse=True)
 def never_asks(monkeypatch):
     """`setup` asks nothing. Any prompt is a step someone can't be bothered
     with, so reaching input() fails the test."""
@@ -550,17 +558,36 @@ def test_setup_with_an_unreachable_manager_serves_in_the_foreground(
     assert _acts(calls) == [] and not svc.path.exists()
 
 
-def test_setup_leaves_a_healthy_service_alone(
-        edge_root, tmp_path, monkeypatch, capsys):
-    """A re-run must not bounce the edge (and the brake) for nothing."""
+def _service_daemon(edge_root, tmp_path, monkeypatch, *, started_at=None,
+                    version=None):
+    """A loaded, running service for this root, whose daemon (pid 99) wrote
+    the pidfile at `started_at` (default: a minute after the pairing) with
+    `version` (default: this package's)."""
+    import os
+
     import nakagai_edge.edge.daemon as d
     from nakagai_edge.edge.service import unit_text
-    _ready_edge(edge_root, monkeypatch)
+    from nakagai_edge.identity import package_version
+    state = _ready_edge(edge_root, monkeypatch)
+    paired_at = state.agent_path.stat().st_mtime
     svc, calls = _service_here(tmp_path, monkeypatch,
                                print=(0, "\tstate = running\n\tpid = 99\n"))
     svc.path.parent.mkdir(parents=True)
     svc.path.write_text(unit_text("darwin", d.relaunch_argv0(), 8330,
                                   str(edge_root), path="/bin"))
+    state.pid_path.write_text(json.dumps({
+        "pid": 99, "port": 8330,
+        "started_at": paired_at + 60 if started_at is None else started_at,
+        "version": package_version() if version is None else version}))
+    os.utime(state.agent_path, (paired_at, paired_at))
+    return state, svc, calls
+
+
+def test_setup_leaves_a_healthy_service_alone(
+        edge_root, tmp_path, monkeypatch, capsys):
+    """A re-run must not bounce the edge (and the brake) for nothing."""
+    import nakagai_edge.edge.daemon as d
+    _, _, calls = _service_daemon(edge_root, tmp_path, monkeypatch)
     _must_not_serve_here(monkeypatch)
     monkeypatch.setattr(d, "find_running", lambda state: pytest.fail(
         "touched the running edge"))
@@ -568,6 +595,71 @@ def test_setup_leaves_a_healthy_service_alone(
     assert edge_main(["setup", "--platform", "http://platform.test"]) == 0
     assert "service    already running" in capsys.readouterr().out
     assert _acts(calls) == []
+
+
+@pytest.mark.parametrize("why", ["older than the pairing", "older code",
+                                 "a record without a version"])
+def test_setup_restarts_a_service_daemon_that_is_not_current(
+        edge_root, tmp_path, monkeypatch, capsys, why):
+    """The daemon reads the agent token and its code once, at start. One
+    that started before the pairing (a re-pair, or the brake hint's
+    `setup --force` after one) or runs older code (`uv tool upgrade` then
+    `setup`) is not "already running": it is the wrong edge."""
+    import nakagai_edge.edge.daemon as d
+    over = {"older than the pairing": {"started_at": 1.0},
+            "older code": {"version": "0.0.1"},
+            "a record without a version": {"version": ""}}[why]
+    _, _, calls = _service_daemon(edge_root, tmp_path, monkeypatch, **over)
+    _must_not_serve_here(monkeypatch)
+    monkeypatch.setattr(d, "wait_until_serving", lambda port, **kw: True)
+
+    assert edge_main(["setup", "--platform", "http://platform.test"]) == 0
+    out = capsys.readouterr().out
+    assert "already running" not in out
+    assert ["launchctl", "bootstrap"] in _acts(calls)
+
+
+def test_setup_foreground_stops_our_edge_on_the_port_then_serves(
+        edge_root, tmp_path, monkeypatch, capsys):
+    """Otherwise run() refuses the held port and setup would exit 0 with the
+    old daemon, and its old token, still serving."""
+    import nakagai_edge.edge.daemon as d
+    _ready_edge(edge_root, monkeypatch)
+    _service_here(tmp_path, monkeypatch)
+    live = d.RunningEdge(pid=4242, port=8330, started_at=1.0, version="x")
+    order = []
+    monkeypatch.setattr(d, "find_running", lambda st: (live, ""))
+    monkeypatch.setattr(d, "stop", lambda edge, **kw: order.append("stop") or True)
+    monkeypatch.setattr("nakagai_edge.edge.runtime.run",
+                        lambda root, port: order.append("serve") or True)
+
+    assert edge_main(["setup", "--platform", "http://platform.test",
+                      "--foreground"]) == 0
+    assert order == ["stop", "serve"]
+
+
+def test_setup_foreground_refuses_a_port_it_cannot_prove(
+        edge_root, tmp_path, monkeypatch, capsys):
+    import nakagai_edge.edge.daemon as d
+    _ready_edge(edge_root, monkeypatch)
+    _service_here(tmp_path, monkeypatch)
+    monkeypatch.setattr(d, "find_running",
+                        lambda st: (None, "something is serving 127.0.0.1:8330"))
+    _must_not_serve_here(monkeypatch)
+
+    assert edge_main(["setup", "--platform", "http://platform.test",
+                      "--foreground"]) != 0
+    assert "something is serving" in capsys.readouterr().out
+
+
+def test_setup_foreground_fails_when_run_refuses(
+        edge_root, tmp_path, monkeypatch, capsys):
+    _ready_edge(edge_root, monkeypatch)
+    _service_here(tmp_path, monkeypatch)
+    monkeypatch.setattr("nakagai_edge.edge.runtime.run", lambda root, port: False)
+
+    assert edge_main(["setup", "--platform", "http://platform.test",
+                      "--foreground"]) != 0
 
 
 def test_setup_brake_refusal_names_a_flag_setup_has(

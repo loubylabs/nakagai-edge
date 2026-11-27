@@ -271,6 +271,25 @@ def spawn(state: EdgeState, *, port: int) -> int:
     return proc.pid
 
 
+def is_current(state: EdgeState, pid: int) -> bool:
+    """Whether the daemon `pid` read today's pairing and runs today's code.
+
+    It reads the agent token and imports its code once, at start. So it is
+    current only when its own record names it, was written after agent.json
+    last changed (a re-pair), and carries this package's version (an
+    upgrade). A record missing either fact is not current.
+    """
+    doc = read_pidfile(state)
+    if doc is None or pid <= 0 or doc["pid"] != pid:
+        return False
+    try:
+        paired_at = state.agent_path.stat().st_mtime
+    except OSError:
+        return False
+    return (doc["started_at"] > paired_at
+            and bool(doc["version"]) and doc["version"] == package_version())
+
+
 def wait_for_replacement(state: EdgeState, port: int, old_pid: int, *,
                          timeout_s: float = 20.0) -> int:
     """The pid of a NEW daemon serving `port`, or 0 when none turned up.
