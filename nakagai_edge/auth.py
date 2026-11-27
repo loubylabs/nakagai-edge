@@ -162,21 +162,25 @@ def build_oauth_provider(spec: ConnectorSpec, root: Path,
         built from disk (the hub builds one per connect) therefore never
         refreshed: it sent an expired token, took the 401 into the full
         browser flow, and failed without a browser. So the expiry is restored
-        here, and a file that never recorded one (0.9.0) reads as expired, so
-        a refresh is tried first. The authorization server metadata is kept
-        too: without it the refresh goes to `<host>/token`, which is not
-        every server's token endpoint.
+        here. The authorization server metadata is kept too: without it the
+        refresh goes to `<host>/token`, which is not every server's token
+        endpoint.
+
+        A file that never recorded an expiry (written by 0.9.0) is used as
+        it is, exactly as before: forcing a refresh would mean guessing the
+        token endpoint, and a wrong guess ends a login that still works. It
+        reaches needs_login only if the broker rejects the token, and the
+        next `nakagai-edge login` writes the new format. A recorded
+        `expires_at: null` is the server saying the token does not expire.
         """
 
         async def _initialize(self) -> None:
             await super()._initialize()
             storage = self.context.storage
             recorded, expires_at = storage.get_expiry()
-            if self.context.current_tokens is not None:
-                if not recorded:
-                    self.context.token_expiry_time = 1.0      # long expired
-                elif expires_at is not None:
-                    self.context.token_expiry_time = float(expires_at)
+            if (self.context.current_tokens is not None and recorded
+                    and expires_at is not None):
+                self.context.token_expiry_time = float(expires_at)
             if self.context.oauth_metadata is None:
                 self.context.oauth_metadata = storage.get_oauth_metadata()
 

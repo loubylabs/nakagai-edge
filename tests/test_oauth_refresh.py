@@ -5,6 +5,8 @@ never sets `token_expiry_time`, and `is_token_valid()` treats a missing
 expiry as valid forever. So a provider built from disk skipped the refresh,
 sent the expired token, took the 401 into the full browser flow, and failed
 for want of a browser: every connect after expiry, until a manual login.
+The fix records the expiry and the token endpoint when tokens are saved, so
+it applies from the first login on 0.10.0; a 0.9.0 file is used as before.
 
 These run the REAL SDK provider over an httpx2 MockTransport: nothing here
 stubs the flow under test.
@@ -96,14 +98,47 @@ async def test_an_expired_stored_token_is_refreshed_and_the_file_rewritten(tmp_p
 
 
 @pytest.mark.anyio
-async def test_a_legacy_file_with_no_recorded_expiry_is_refreshed_first(tmp_path):
-    """Files written by 0.9.0 carry no expiry. Treating that as "valid
-    forever" is the bug; treating it as expired costs one refresh."""
+async def test_a_legacy_file_is_used_as_it_is(tmp_path):
+    """A 0.9.0 file records neither an expiry nor the token endpoint. A
+    forced refresh would have to guess the endpoint (`<host>/token`), and a
+    wrong guess would end a login that works: every upgrading owner logged
+    out and emailed. So the stored token is sent as before; it reaches
+    needs_login only if the broker really rejects it, and the next login
+    writes the new format."""
     _store(tmp_path, metadata=False)                 # 0.9.0 wrote neither
-    broker = Broker()
+    broker = Broker(accept="old")
     response = await _get(tmp_path, broker)
     assert response.status_code == 200
-    assert broker.seen[0] == "POST https://broker.test/token"
+    assert broker.seen == [f"GET {URL}"]
+
+
+@pytest.mark.anyio
+async def test_a_legacy_file_with_metadata_but_no_expiry_is_not_forced(tmp_path):
+    _store(tmp_path)                                 # metadata, no expires_at
+    broker = Broker(accept="old")
+    assert (await _get(tmp_path, broker)).status_code == 200
+    assert broker.seen == [f"GET {URL}"]
+
+
+@pytest.mark.anyio
+async def test_a_recorded_no_expiry_is_used_as_it_is(tmp_path):
+    """`expires_at: null` is the server saying the token does not expire."""
+    _store(tmp_path, expires_at=None)
+    broker = Broker(accept="old")
+    assert (await _get(tmp_path, broker)).status_code == 200
+    assert broker.seen == [f"GET {URL}"]
+
+
+@pytest.mark.anyio
+async def test_a_failed_refresh_leaves_the_token_file_alone(tmp_path):
+    """The SDK drops a refused token only in memory. The file on disk is
+    what the next connect (and the next login check) reads, so it must come
+    through a failed refresh byte for byte."""
+    path = _store(tmp_path, expires_at=time.time() - 60)
+    before = path.read_bytes()
+    with pytest.raises(Exception):
+        await _get(tmp_path, Broker(token_status=400))
+    assert path.read_bytes() == before
 
 
 @pytest.mark.anyio
