@@ -35,6 +35,14 @@ from pathlib import Path
 LABEL = "ai.nakag.edge"
 UNIT = "nakagai-edge.service"
 THROTTLE_S = 30
+# How long the manager waits after SIGTERM before it SIGKILLs. The daemon
+# holds broker credentials and may have an exit order in flight, and
+# `daemon.stop` never escalates past SIGTERM (it gives a clean stop 10
+# seconds and then hands the call to a human). The manager's defaults
+# (launchd 20 s, systemd 90 s) are not a decision anyone made here, so this
+# is set explicitly at well over three times that bound: a SIGKILL only for a
+# daemon that has genuinely hung.
+STOP_TIMEOUT_S = 60
 BOOTSTRAP_RETRY_S = 1.0
 
 # (exit code, stdout). Output matters: `launchctl print` exits 0 for a job
@@ -94,6 +102,7 @@ def unit_text(platform: str, argv0: str, port: int, root: str | Path, *,
                "RunAtLoad": True,
                "KeepAlive": {"SuccessfulExit": False},
                "ThrottleInterval": THROTTLE_S,
+               "ExitTimeOut": STOP_TIMEOUT_S,
                "WorkingDirectory": root,
                "EnvironmentVariables": env,
                "StandardOutPath": log, "StandardErrorPath": log}
@@ -113,6 +122,7 @@ def unit_text(platform: str, argv0: str, port: int, root: str | Path, *,
                 f"{env}"
                 "Restart=on-failure\n"
                 f"RestartSec={THROTTLE_S}\n"
+                f"TimeoutStopSec={STOP_TIMEOUT_S}\n"
                 f"StandardOutput=append:{_sd_pct(log)}\n"
                 f"StandardError=append:{_sd_pct(log)}\n"
                 "\n"
@@ -322,8 +332,12 @@ class Service:
         removes it.
         """
         self._require()
-        body = unit_text(self.platform, argv0, port, root, path=service_path(),
-                         env_root=os.environ.get("NAKAGAI_EDGE_ROOT", ""))
+        # Absolute, both: a relative NAKAGAI_EDGE_ROOT would make the working
+        # directory and the log path relative to wherever the manager starts.
+        env_root = os.environ.get("NAKAGAI_EDGE_ROOT", "")
+        body = unit_text(self.platform, argv0, port, os.path.abspath(root),
+                         path=service_path(),
+                         env_root=os.path.abspath(env_root) if env_root else "")
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.path.write_text(body)
         if self.manager == "launchd":

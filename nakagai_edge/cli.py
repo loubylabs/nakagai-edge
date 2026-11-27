@@ -219,7 +219,7 @@ def _other_root(svc, state) -> str:
     for another edge root. One label serves one root per user; acting on the
     other root's unit would also read the wrong brake ledger."""
     cfg = svc.installed_config()
-    if cfg is None or Path(cfg["root"]) == Path(state.root):
+    if cfg is None or Path(cfg["root"]) == Path(state.root).absolute():
         return ""
     return (f"the login service on this machine runs the edge at {cfg['root']}, "
             f"not {state.root}; manage it with "
@@ -507,7 +507,7 @@ def _cmd_setup(args) -> int:
         # agent token and its code once, at start, so one that predates the
         # pairing (a re-pair) or runs older code (an upgrade) is restarted.
         wanted = {"argv0": d.relaunch_argv0(), "port": args.port,
-                  "root": str(state.root)}
+                  "root": str(Path(state.root).absolute())}
         if (svc.installed_config() == wanted and svc.installed()
                 and svc.running() and d.is_current(state, svc.pid())):
             print("  -  service    already running")

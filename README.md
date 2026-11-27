@@ -186,6 +186,10 @@ To upgrade:
 uv tool upgrade nakagai-edge && nakagai-edge restart
 ```
 
+If you set up 0.9.0 or earlier with `uvx`, `uv tool upgrade` answers that
+nakagai-edge is not installed: run the install line from the Agents page
+instead, which installs the durable tool and moves your edge onto it.
+
 ### Connector report
 
 Every minute the edge tells the platform what it can reach, so the web app can

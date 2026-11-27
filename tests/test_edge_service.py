@@ -77,6 +77,8 @@ MAC_PLIST = f"""\
 		<key>PATH</key>
 		<string>{PATH}</string>
 	</dict>
+	<key>ExitTimeOut</key>
+	<integer>60</integer>
 	<key>KeepAlive</key>
 	<dict>
 		<key>SuccessfulExit</key>
@@ -133,6 +135,7 @@ WorkingDirectory=/home/x/.nakagai/edge
 Environment="PATH=/home/x/.local/bin:/usr/bin:/bin"
 Restart=on-failure
 RestartSec=30
+TimeoutStopSec=60
 StandardOutput=append:/home/x/.nakagai/edge/edge.log
 StandardError=append:/home/x/.nakagai/edge/edge.log
 
@@ -170,6 +173,32 @@ def test_systemd_escapes_specifiers_dollars_quotes_and_backslashes():
     # and it reads back as the same root
     svc_root = Service._systemd_value(body, "WorkingDirectory")
     assert svc_root == weird
+
+
+def test_the_stop_timeout_outlasts_the_daemons_own_shutdown_bound():
+    """Past these the manager SIGKILLs, and the daemon holds broker
+    credentials and maybe an exit order in flight: `daemon.stop` never
+    escalates, so the manager must not either, short of a real hang."""
+    import inspect
+
+    from nakagai_edge.edge import daemon
+    from nakagai_edge.edge.service import STOP_TIMEOUT_S
+    bound = inspect.signature(daemon.stop).parameters["timeout_s"].default
+    assert STOP_TIMEOUT_S >= 3 * bound
+
+
+def test_install_writes_an_absolute_root(tmp_path, monkeypatch):
+    """A relative NAKAGAI_EDGE_ROOT would make WorkingDirectory and the log
+    path relative to whatever directory the manager starts in."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("NAKAGAI_EDGE_ROOT", "rel/edge")
+    svc = _svc(tmp_path / "home")
+    svc.install(argv0=ARGV0, port=8330, root="rel/edge")
+    doc = plistlib.loads(svc.path.read_bytes())
+    want = str(tmp_path / "rel" / "edge")
+    assert doc["WorkingDirectory"] == want
+    assert doc["StandardOutPath"] == f"{want}/edge.log"
+    assert doc["EnvironmentVariables"]["NAKAGAI_EDGE_ROOT"] == want
 
 
 def test_no_unit_for_a_platform_with_no_service():
