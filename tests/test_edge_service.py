@@ -577,6 +577,26 @@ def test_service_uninstall_refuses_while_the_brake_watches(cli, monkeypatch, cap
     assert not holder["svc"].path.exists()
 
 
+def test_uninstall_judges_the_brake_by_the_daemon_it_would_stop(
+        cli, monkeypatch, capsys):
+    """A hand-started edge keeps watching through an uninstall, which never
+    touches it: refusing over its positions would be refusing for nothing,
+    and "the edge is stopped" would be false."""
+    import nakagai_edge.edge.daemon as d
+    from nakagai_edge.cli import main
+    holder, r = cli
+    main(["service", "install"])
+    _armed(holder["root"])
+    r.by_verb["print"] = (0, LAUNCHCTL_PRINT_LOADED)      # service runs no pid
+    detached = d.RunningEdge(pid=999, port=8330, started_at=1.0, version="x")
+    monkeypatch.setattr(d, "find_running", lambda state: (detached, ""))
+    capsys.readouterr()
+    assert main(["service", "uninstall"]) == 0
+    out = capsys.readouterr().out
+    assert "pid 999" in out and "still serves" in out
+    assert "the edge is stopped" not in out
+
+
 def test_service_uninstall_removes_it(cli, capsys):
     from nakagai_edge.cli import main
     holder, r = cli

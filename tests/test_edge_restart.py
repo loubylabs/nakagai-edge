@@ -374,13 +374,18 @@ def test_a_service_restart_that_brings_no_new_pid_is_not_claimed(
         sock.close()
 
 
-def test_restart_refuses_another_roots_service(root, tmp_path, monkeypatch, capsys):
+def test_another_roots_service_is_no_service_for_this_root(root, monkeypatch):
+    """The unit belongs to a different edge root, so for this root there is
+    no service: restart its own daemon detached, and leave the unit alone."""
     import nakagai_edge.edge.daemon as d
     monkeypatch.setattr(d, "DEFAULT_PORT", 1)
     monkeypatch.setattr(d, "port_listening", lambda p, host="127.0.0.1": False)
+    spawned = []
+    monkeypatch.setattr(d, "spawn", lambda st, *, port: spawned.append(port) or 4242)
+    monkeypatch.setattr(d, "wait_until_serving", lambda p, **kw: True)
     calls = _installed_service(root, monkeypatch, unit_root="/elsewhere/edge")
-    assert main(["restart"]) == 2
-    assert "/elsewhere/edge" in capsys.readouterr().err
+    assert main(["restart"]) == 0
+    assert spawned == [1]
     assert _acts(calls) == []
 
 

@@ -283,10 +283,9 @@ def _cmd_restart(args) -> int:
         return 3
 
     svc = Service.here()
-    if (other := _other_root(svc, state)):
-        print(f"refused: {other}", file=sys.stderr)
-        return 2
-    if svc.installed():
+    # A unit written for another edge root is no service for this one: this
+    # root's daemon, if any, was started by hand, so it restarts detached.
+    if not _other_root(svc, state) and svc.installed():
         # A proven edge on the port that is not the service's own (a detached
         # one, started by hand) would keep the port while the manager's
         # daemon refuses and stays down. Stop it first; the brake gate above
@@ -585,15 +584,23 @@ def _cmd_service(args) -> int:
         if (other := _other_root(svc, state)):
             print(f"refused: {other}", file=sys.stderr)
             return 1
-        edge, _ = d.find_running(state)
-        if edge is not None and _refused_while_armed(
+        # The brake question is about the process this would stop: the
+        # service's own daemon. A hand-started edge is never touched here.
+        service_pid = svc.pid() if svc.installed() else 0
+        if service_pid and _refused_while_armed(
                 state, args.force, "nakagai-edge service uninstall"):
             return 3
         if not svc.uninstall():
             print(f"refused: could not remove {svc.path}", file=sys.stderr)
             return 1
-        print(f"removed {svc.path}; the edge is stopped. "
-              "`nakagai-edge service install` brings it back")
+        edge, _ = d.find_running(state)
+        if edge is not None and edge.pid != service_pid:
+            print(f"removed {svc.path}; the login service is gone, but pid "
+                  f"{edge.pid} (started by hand) still serves 127.0.0.1:"
+                  f"{edge.port}")
+        else:
+            print(f"removed {svc.path}; the edge is stopped. "
+                  "`nakagai-edge service install` brings it back")
         return 0
     if is_ephemeral(sys.prefix):
         print("refused: this is a uvx run, from uv's cache, which uv deletes "
