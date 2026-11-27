@@ -231,6 +231,34 @@ async def test_a_network_failure_neither_counts_nor_resets(tmp_path):
 
 
 @pytest.mark.anyio
+async def test_a_fresh_login_clears_needs_login_without_waiting_for_a_connect(
+        tmp_path):
+    """`nakagai-edge login` rewrites the token file. The page must not keep
+    saying "log in again" until the next successful connect, minutes later."""
+    import os
+    import time
+    import yaml
+    from nakagai_edge.hub import ConnectorError
+    path = token_path(tmp_path, OAUTH["id"])
+    _tokens(tmp_path)
+    old = time.time() - 600
+    os.utime(path, (old, old))
+    (tmp_path / "config").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "config" / "connectors.yaml").write_text(
+        yaml.safe_dump({"connectors": [OAUTH]}))
+    hub = ConnectorHub(tmp_path, connect=_Sequence(
+        [_oauth_failure(), _oauth_failure()]))
+    for _ in range(2):
+        with pytest.raises(ConnectorError):
+            await hub._ensure_connected(hub.spec(OAUTH["id"]))
+        hub._conns[OAUTH["id"]].error_until = 0.0
+    assert hub.status()["connectors"][0]["auth_state"] == "needs_login"
+
+    _tokens(tmp_path)                       # the login wrote the file now
+    assert hub.status()["connectors"][0]["auth_state"] == "ok"
+
+
+@pytest.mark.anyio
 async def test_no_tokens_on_disk_needs_login_at_once(tmp_path):
     assert await _attempts(tmp_path, [NoTokensError("no tokens")]) == [
         "needs_login"]

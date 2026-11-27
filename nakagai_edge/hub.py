@@ -275,6 +275,9 @@ class ConnectorHub:
         # the SDK drop its tokens in memory and fail the full flow, and the
         # next connect reloads the refresh token from disk and recovers.
         self._oauth_failures: dict[str, int] = {}
+        # When the last of those failures happened. A token file written
+        # after it (`nakagai-edge login`) clears the count at once.
+        self._oauth_failed_at: dict[str, float] = {}
         self._lock = asyncio.Lock()
         self._connect = connect or self._default_connect  # test seam
         self._approvals = approvals
@@ -369,6 +372,7 @@ class ConnectorHub:
                         mode="json", by_alias=True)
                 conn.status, conn.last_error = "connected", ""
                 self._oauth_failures.pop(spec.id, None)
+                self._oauth_failed_at.pop(spec.id, None)
                 conn.connected_at = time.monotonic()
                 if conn._ready and not conn._ready.done():
                     conn._ready.set_result(True)
@@ -387,6 +391,7 @@ class ConnectorHub:
                 # about the login either way.
                 self._oauth_failures[spec.id] = (
                     self._oauth_failures.get(spec.id, 0) + 1)
+                self._oauth_failed_at[spec.id] = time.time()
             conn.error_until = time.monotonic() + RECONNECT_BACKOFF_S
             if conn._ready and not conn._ready.done():
                 conn._ready.set_exception(ConnectorError(
@@ -527,6 +532,21 @@ class ConnectorHub:
                 "tools": [t.get("name") for t in conn.tools],
                 "server_info": conn.server_info}
 
+    def _forget_failures_before_a_login(self, connector_id: str) -> None:
+        """A token file newer than the last OAuth failure is a login the
+        failures predate, so they no longer say anything."""
+        failed_at = self._oauth_failed_at.get(connector_id)
+        if failed_at is None:
+            return
+        from nakagai_edge.auth import token_path
+        try:
+            written = token_path(self.root, connector_id).stat().st_mtime
+        except OSError:
+            return
+        if written > failed_at:
+            self._oauth_failures.pop(connector_id, None)
+            self._oauth_failed_at.pop(connector_id, None)
+
     def status(self, *, with_tools: bool = False) -> dict:
         """Runtime view of every registered connector (no connection attempted).
 
@@ -537,6 +557,7 @@ class ConnectorHub:
         specs = self.load_specs()
         out = []
         for cid, spec in specs.items():
+            self._forget_failures_before_a_login(cid)
             login_failed = (self._oauth_failures.get(cid, 0)
                             >= OAUTH_FAILURES_FOR_LOGIN)
             conn = self._conns.get(cid)
